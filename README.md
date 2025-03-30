@@ -27,13 +27,13 @@ Project contains:
 - **Simple Transactional Support:** Ensures data consistency.
 - **Memory-mapped Storage:** Uses Unix `mmap` for efficient access and dynamically expands the storage file.
 - **Dynamic Freelist Management:** Automatic allocation and reuse of storage pages.
-- **Collection Management:** Tools for organizing and managing data collections.
+- **Bucket Management:** Tools for organizing and managing buckets.
 - **Basic Cursor and Range Scanning:** Provides mechanisms to iterate over data ranges efficiently.
 - **View/Update Syntax Sugar:** Convenient API methods to simplify database interactions.
 - [x] **Blob Storage:** Supports for BLOBs.
 - [ ] **Copy on-write:** Support for copy-on-write for data consistency and recovery.
 - [ ] **Simple ORM:** Basic object-relational mapping layer for data structures.
-- [ ] **Statistics:** Built-in statistics.
+- [x] **Statistics:** Built-in statistics.
 
 **Database server:**
 
@@ -50,10 +50,10 @@ Project contains:
 as a production-grade database. Instead, it's a playground for those interested in learning and  
 exploring the inner workings of database management systems.
 
-[!WARNING]
-The current implementation does **not** include copy-on-write (COW) mechanisms.  
-If a transaction fails during the process of writing pages or updating the freelist, it may lead 
-to data corruption.
+> [!WARNING]
+> The current implementation does **not** include copy-on-write (COW) mechanisms.  
+> If a transaction fails during the process of writing pages or updating the freelist, it may lead 
+> to data corruption.
 
 ## Quick Start
 You need Go 1.22 or later to build PirinDB.
@@ -135,8 +135,8 @@ db.View(func(tx *pirindb.Tx) error {)
     return nil
 })
 ```
-[!NOTE]
-If key value exceed the 1024 bytes, if automatically stored as a blob.
+> [!NOTE]
+> If key value exceed the 1024 bytes, if automatically stored as a blob.
 
 
 ### Manual transaction management
@@ -182,9 +182,9 @@ db.View(func(tx *pirindb.Tx) error {
 })
 ```
 
-[!NOTE]
-Next() and Prev() methods works correctly only if the cursor is positioned on a valid key-value pair using 
-First(), Last() or Seek().
+> [!NOTE]
+> Next() and Prev() methods works correctly only if the cursor is positioned on a valid key-value pair using 
+> First(), Last() or Seek().
 
 ### Bucket Management
 
