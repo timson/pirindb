@@ -1,8 +1,10 @@
 test:
 	go test -v ./...
 
-build:
-build:
+deps:
+	go mod tidy
+
+build: deps
 	go build -o bin/pirindb ./cmd/pirindb
 	go build -o bin/pirin-cli ./cmd/pirin-cli
 vet:
