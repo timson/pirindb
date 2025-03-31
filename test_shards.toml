@@ -1,0 +1,7 @@
+[[shards]]
+name = "aleph"
+index = 1
+
+[[shards]]
+name = "bet"
+index = 2

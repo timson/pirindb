@@ -12,6 +12,7 @@ import (
 func runServer(cfgFile string) {
 	printLogo(version)
 	printSystemInfo()
+	cfgFile = "test_shards.toml"
 
 	config, err := loadConfig(cfgFile)
 	if err != nil {
@@ -26,7 +27,7 @@ func runServer(cfgFile string) {
 		fmt.Printf("Error opening database:\n  %v\n", DBErr)
 		os.Exit(1)
 	}
-
+	
 	server := NewServer(config, db, logger)
 
 	go func() {

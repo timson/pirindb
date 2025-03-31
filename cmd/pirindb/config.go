@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"github.com/go-playground/validator/v10"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
@@ -61,7 +62,9 @@ func loadConfig(cfgFile string) (*Config, error) {
 		viper.SetConfigType("toml")
 	}
 
-	_ = viper.ReadInConfig()
+	if err := viper.ReadInConfig(); err != nil {
+		fmt.Println("Error loading config:", err)
+	}
 
 	var cfg Config
 	if err := viper.Unmarshal(&cfg); err != nil {

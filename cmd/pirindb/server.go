@@ -14,7 +14,8 @@ import (
 )
 
 var (
-	DBBucket = []byte("main")
+	DBBucket    = []byte("main")
+	ShardBucket = []byte("sharding")
 )
 
 type Server struct {
