@@ -106,7 +106,7 @@ import (
 )
 
 func main() {
-	db, err := pirindb.Open("test.db")
+	db, err := pirindb.Open("test.db", 0600)
 	if err != nil {
 		log.Fatal(err)
 	}
