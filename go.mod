@@ -12,6 +12,7 @@ require (
 	github.com/go-chi/render v1.0.3
 	github.com/go-playground/validator/v10 v10.26.0
 	github.com/gofrs/flock v0.12.1
+	github.com/google/go-cmp v0.7.0
 	github.com/google/uuid v1.6.0
 	github.com/mattn/go-colorable v0.1.13
 	github.com/mattn/go-isatty v0.0.20
@@ -21,6 +22,7 @@ require (
 	github.com/spf13/cobra v1.9.1
 	github.com/spf13/viper v1.20.1
 	github.com/stretchr/testify v1.10.0
+	golang.org/x/exp v0.0.0-20250305212735-054e65f0b394
 	golang.org/x/sys v0.31.0
 )
 

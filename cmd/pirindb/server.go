@@ -23,6 +23,9 @@ type Server struct {
 	Logger *slog.Logger
 	Config *Config
 	Server *http.Server
+	Shard  *Shard
+	RingV1 *ConsistentHash
+	RingV2 *ConsistentHash
 }
 
 func NewServer(cfg *Config, db *storage.DB, logger *slog.Logger) *Server {
@@ -31,6 +34,10 @@ func NewServer(cfg *Config, db *storage.DB, logger *slog.Logger) *Server {
 		DB:     db,
 		Logger: logger,
 	}
+}
+
+func (srv *Server) IsShard() bool {
+	return srv.Shard != nil
 }
 
 func RequestLogger(logger *slog.Logger) func(next http.Handler) http.Handler {
@@ -88,7 +95,7 @@ func (srv *Server) Start() error {
 }
 
 func (srv *Server) Stop() error {
-	srv.Logger.Info("Stopping HTTP server")
+	srv.Logger.Info("stopping HTTP server")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -99,4 +106,11 @@ func (srv *Server) Stop() error {
 
 	srv.Logger.Info("HTTP server stopped")
 	return nil
+}
+
+func (srv *Server) IsLocal(shard *Shard) bool {
+	if !srv.IsShard() {
+		return true
+	}
+	return shard.Name == srv.Shard.Name
 }

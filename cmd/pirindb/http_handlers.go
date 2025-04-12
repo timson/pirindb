@@ -31,15 +31,29 @@ func (srv *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func (srv *Server) handleGet(w http.ResponseWriter, r *http.Request) {
+	var value string
+	var isFound bool
 	select {
 	case <-r.Context().Done():
 		_ = render.Render(w, r, ErrRequestTimeout())
 		return
 	default:
 		key := chi.URLParam(r, "key")
-		value, isFound := Get(srv.DB, key)
-		if isFound != true {
-			_ = render.Render(w, r, ErrNotFound())
+		shard := srv.RingV1.GetShard(key)
+		if srv.IsLocal(shard) {
+			value, isFound = Get(srv.DB, key)
+			if isFound != true {
+				_ = render.Render(w, r, ErrNotFound())
+				return
+			}
+		} else {
+			resp, err := RemoteGet(shard.URL(), key)
+			if err != nil {
+				_ = render.Render(w, r, ErrInternalServerError())
+				return
+			}
+			defer resp.Body.Close()
+			io.Copy(w, resp.Body)
 			return
 		}
 		render.JSON(w, r, &GetResponse{Value: value, Status: "ok"})
@@ -82,10 +96,19 @@ func (srv *Server) handlePut(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	value := string(body)
-	err = Put(srv.DB, key, value)
-	if err != nil {
-		_ = render.Render(w, r, ErrInternalServerError())
-		return
+	shard := srv.RingV1.GetShard(key)
+	if srv.IsLocal(shard) {
+		err = Put(srv.DB, key, value)
+		if err != nil {
+			_ = render.Render(w, r, ErrInternalServerError())
+			return
+		}
+	} else {
+		// Remote Put
+		err = RemotePut(shard.URL(), key, value)
+		if err != nil {
+			_ = render.Render(w, r, ErrInternalServerError())
+		}
 	}
 
 	render.Status(r, http.StatusCreated)

@@ -6,6 +6,7 @@ import (
 	"github.com/timson/pirindb/storage"
 	"os"
 	"os/signal"
+	"slices"
 	"syscall"
 )
 
@@ -27,12 +28,25 @@ func runServer(cfgFile string) {
 		fmt.Printf("Error opening database:\n  %v\n", DBErr)
 		os.Exit(1)
 	}
-	
+
 	server := NewServer(config, db, logger)
+	if config.Server.ShardName != "" {
+		shardIdx := slices.IndexFunc(config.Shards, func(shardConfig *ShardConfig) bool {
+			return shardConfig.Name == config.Server.ShardName
+		})
+		// Run sharding mode
+		if shardIdx != -1 {
+			runShard(config, server, shardIdx)
+		} else {
+			logger.Error("shard not found in config", "name", config.Server.ShardName)
+		}
+	} else {
+		logger.Info("running in single mode")
+	}
 
 	go func() {
 		if err = server.Start(); err != nil {
-			logger.Error("Failed to start HTTP server", "error", err)
+			logger.Error("failed to start HTTP server", "error", err)
 		}
 	}()
 
@@ -40,13 +54,26 @@ func runServer(cfgFile string) {
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	<-sig
-	logger.Info("Shutting down...")
+	logger.Info("shutting down...")
 
 	if err = server.Stop(); err != nil {
-		logger.Error("Failed to stop HTTP server", "error", err)
+		logger.Error("failed to stop HTTP server", "error", err)
 	}
 
-	logger.Info("Shutdown complete")
+	logger.Info("shutdown complete")
+}
+
+func runShard(config *Config, server *Server, shardIdx int) {
+	shardConfig := config.Shards[shardIdx]
+	server.Shard = NewShard(shardConfig.Name, shardConfig.Host, shardConfig.Port)
+	ch := NewConsistentHash()
+	for _, sc := range config.Shards {
+		shard := NewShard(sc.Name, sc.Host, sc.Port)
+		ch.AddShard(shard)
+	}
+	server.RingV1 = ch
+	server.Logger.Info("running as shard:", "name", shardConfig.Name, "host", shardConfig.Host, "port", shardConfig.Port)
+	ch.Sync(server.DB)
 }
 
 func main() {

@@ -9,18 +9,20 @@ import (
 )
 
 type ServerConfig struct {
-	Host     string `mapstructure:"host" validate:"required,hostname|ip"`
-	Port     int    `mapstructure:"port" validate:"required,min=1,max=65535"`
-	LogLevel string `mapstructure:"log_level" validate:"required,oneof=INFO WARNING DEBUG ERROR"`
+	Host      string `mapstructure:"host" validate:"required,hostname|ip"`
+	Port      int    `mapstructure:"port" validate:"required,min=1,max=65535"`
+	LogLevel  string `mapstructure:"log_level" validate:"required,oneof=INFO WARNING DEBUG ERROR"`
+	ShardName string `mapstructure:"shard_name"`
 }
 
 type ShardConfig struct {
-	Name  string
-	Index int
+	Name string
+	Host string `mapstructure:"host" validate:"required,hostname|ip"`
+	Port int    `mapstructure:"port" validate:"required,min=1,max=65535"`
 }
 
 type DatabaseConfig struct {
-	Filename string `mapstructure:"filename" validate:"required,file"`
+	Filename string `mapstructure:"filename" validate:"required,filepath"`
 }
 
 type Config struct {
@@ -39,6 +41,7 @@ func initDefaults() {
 func setupFlags(cmd *cobra.Command) {
 	cmd.PersistentFlags().String("config", "", "Config file (TOML)")
 	cmd.PersistentFlags().String("host", "", "Server host")
+	cmd.PersistentFlags().String("shard", "", "shard name")
 	cmd.PersistentFlags().Int("port", 0, "Server port")
 	cmd.PersistentFlags().String("db", "", "Database filename")
 	cmd.PersistentFlags().String("log", "", "log level")
@@ -47,6 +50,7 @@ func setupFlags(cmd *cobra.Command) {
 	_ = viper.BindPFlag("server.port", cmd.PersistentFlags().Lookup("port"))
 	_ = viper.BindPFlag("db.filename", cmd.PersistentFlags().Lookup("db"))
 	_ = viper.BindPFlag("server.log_level", cmd.PersistentFlags().Lookup("log"))
+	_ = viper.BindPFlag("server.shard_name", cmd.PersistentFlags().Lookup("shard"))
 
 	viper.SetEnvPrefix("pirindb")
 	viper.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))

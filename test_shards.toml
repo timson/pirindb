@@ -1,7 +1,9 @@
 [[shards]]
 name = "aleph"
-index = 1
+host = "127.0.0.1"
+port = 4321
 
 [[shards]]
 name = "bet"
-index = 2
+host = "127.0.0.1"
+port = 4322

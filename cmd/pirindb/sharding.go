@@ -5,8 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"github.com/OneOfOne/xxhash"
+	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/timson/pirindb/storage"
-	"reflect"
 	"sort"
 )
 
@@ -23,6 +24,18 @@ type Shard struct {
 	Status int
 	Host   string
 	Port   int
+}
+
+func NewShard(name string, host string, port int) *Shard {
+	return &Shard{
+		Name: name,
+		Host: host,
+		Port: port,
+	}
+}
+
+func (s *Shard) URL() string {
+	return fmt.Sprintf("http://%s:%d", s.Host, s.Port)
 }
 
 type ConsistentHash struct {
@@ -62,16 +75,7 @@ func (ch *ConsistentHash) AddShard(shard *Shard) {
 	})
 }
 
-//func (ch *ConsistentHash) Shards() []*Shard {
-//	values := make([]*Shard, 0, len(ch.HashMap))
-//	idx := 0
-//	for _, shard := range ch.HashMap {
-//		values[idx] = shard
-//		idx++
-//	}
-//	return values
-//}
-
+// GetShard return shard which serves given key
 func (ch *ConsistentHash) GetShard(key string) *Shard {
 	if len(ch.Ring) == 0 {
 		return nil
@@ -118,6 +122,7 @@ func (ch *ConsistentHash) load(db *storage.DB) (*ConsistentHash, error) {
 			return err
 		}
 		data, found := bucket.Get([]byte("consistent_hash"))
+		fmt.Println(string(data))
 		if !found {
 			return ErrConsistentHashNotFound
 		}
@@ -140,11 +145,15 @@ func (ch *ConsistentHash) Sync(db *storage.DB) error {
 		if err != nil {
 			return err
 		}
+		return nil
 	} else if err != nil {
 		return err
 	}
-	if reflect.DeepEqual(ch, storedConsistentHash) {
-		
+	equal := cmp.Equal(storedConsistentHash, ch, cmpopts.IgnoreFields(ConsistentHash{}, "Shards", "Timestamp"))
+	if equal {
+		return nil
+	} else {
+		fmt.Println("they are not equal")
 	}
-
+	return nil
 }
