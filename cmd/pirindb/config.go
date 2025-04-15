@@ -19,7 +19,7 @@ type ShardConfig struct {
 }
 
 type DatabaseConfig struct {
-	Filename string `mapstructure:"filename" validate:"required,file"`
+	Filename string `mapstructure:"filename" validate:"required"`
 }
 
 type Config struct {

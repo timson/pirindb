@@ -1,7 +1,7 @@
 package main
 
 const (
-	version = "0.0.1"
+	version = "0.0.2"
 	logo    = `
     ____   _        _         ____   ____ 
    / __ \ (_)_____ (_)____   / __ \ / __ )
