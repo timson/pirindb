@@ -25,7 +25,6 @@ Project contains:
 - **BoltDB like API:** Easy to integrate and experiment with.
 - **Persistence:** Data is stored on disk.
 - **Simple Transactional Support:** Ensures data consistency.
-- **Memory-mapped Storage:** Uses Unix `mmap` for efficient access and dynamically expands the storage file.
 - **Dynamic Freelist Management:** Automatic allocation and reuse of storage pages.
 - **Bucket Management:** Tools for organizing and managing buckets.
 - **Basic Cursor and Range Scanning:** Provides mechanisms to iterate over data ranges efficiently.
