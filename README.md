@@ -31,7 +31,7 @@ Project contains:
 - **Basic Cursor and Range Scanning:** Provides mechanisms to iterate over data ranges efficiently.
 - **View/Update Syntax Sugar:** Convenient API methods to simplify database interactions.
 - [x] **Blob Storage:** Supports for BLOBs.
-- [ ] **Copy on-write:** Support for copy-on-write for data consistency and recovery.
+- [x] ~~**Copy on-write:** Support for copy-on-write~~ **Double write** (last transaction log) for data consistency and recovery.
 - [ ] **Simple ORM:** Basic object-relational mapping layer for data structures.
 - [x] **Statistics:** Built-in statistics.
 

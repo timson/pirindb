@@ -83,15 +83,18 @@ func (tx *Tx) Rollback() {
 		})
 		return
 	}
+	defer func() {
+		tx.allocatedPageNums = nil
+		tx.once.Do(func() {
+			tx.db.lock.Unlock()
+		})
+	}()
+
 	tx.dirtyNodes = nil
 	tx.pagesToDelete = nil
 	for _, pageNum := range tx.allocatedPageNums {
 		tx.db.dal.freelist.ReleasePage(pageNum)
 	}
-	tx.allocatedPageNums = nil
-	tx.once.Do(func() {
-		tx.db.lock.Unlock()
-	})
 }
 
 func (tx *Tx) Commit() error {
@@ -102,6 +105,15 @@ func (tx *Tx) Commit() error {
 		})
 		return nil
 	}
+	defer func() {
+		tx.once.Do(func() {
+			tx.db.lock.Unlock()
+		})
+		tx.dirtyNodes = nil
+		tx.dirtyPages = nil
+		tx.pagesToDelete = nil
+		tx.allocatedPageNums = nil
+	}()
 
 	root := tx.getRootBucket()
 	for _, bucket := range tx.dirtyBuckets {
@@ -112,25 +124,58 @@ func (tx *Tx) Commit() error {
 		}
 	}
 
+	// First write to physical log
+	err := tx.db.dal.txLog.With(func() error {
+		for _, node := range tx.dirtyNodes {
+			_, err := tx.db.dal.setNode(node)
+			if err != nil {
+				return err
+			}
+		}
+		for _, page := range tx.dirtyPages {
+			err := tx.db.dal.SetPage(page)
+			if err != nil {
+				return err
+			}
+		}
+		for _, pageNum := range tx.pagesToDelete {
+			tx.db.dal.freelist.ReleasePage(pageNum)
+		}
+
+		err := WriteFreelist(tx.db.dal, tx.db.dal.freelist)
+		if err != nil {
+			return err
+		}
+		err = WriteMeta(tx.db.dal, tx.db.dal.meta)
+		if err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+
+	// Second write to the Database storage
 	for _, node := range tx.dirtyNodes {
-		_, err := tx.db.dal.setNode(node)
+		_, err = tx.db.dal.setNode(node)
 		if err != nil {
 			return err
 		}
 	}
 
 	for _, page := range tx.dirtyPages {
-		err := tx.db.dal.SetPage(page)
+		err = tx.db.dal.SetPage(page)
 		if err != nil {
 			return err
 		}
 	}
 
-	for _, pageNum := range tx.pagesToDelete {
-		tx.db.dal.freelist.ReleasePage(pageNum)
-	}
+	//for _, pageNum := range tx.pagesToDelete {
+	//	tx.db.dal.freelist.ReleasePage(pageNum)
+	//}
 
-	err := WriteFreelist(tx.db.dal, tx.db.dal.freelist)
+	err = WriteFreelist(tx.db.dal, tx.db.dal.freelist)
 	if err != nil {
 		return err
 	}
@@ -138,13 +183,7 @@ func (tx *Tx) Commit() error {
 	if err != nil {
 		return err
 	}
-	tx.dirtyNodes = nil
-	tx.dirtyPages = nil
-	tx.pagesToDelete = nil
-	tx.allocatedPageNums = nil
-	tx.once.Do(func() {
-		tx.db.lock.Unlock()
-	})
+
 	return nil
 }
 
@@ -192,10 +231,12 @@ func (tx *Tx) CreateBucket(name []byte) (*Bucket, error) {
 		return nil, ErrBucketExists
 	}
 	node := NewBNode()
-	page, setNodeErr := tx.db.dal.setNode(node)
-	if setNodeErr != nil {
-		return nil, setNodeErr
+	page, allocatePageErr := tx.db.dal.AllocatePage()
+	if allocatePageErr != nil {
+		return nil, allocatePageErr
 	}
+	node.PageNum = page.PageNumber
+	tx.setNode(node)
 	bucket = newBucket([]byte{})
 	bucket.name = name
 	bucket.root = page.PageNumber

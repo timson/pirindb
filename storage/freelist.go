@@ -42,6 +42,7 @@ type Freelist struct {
 	freelistPages       []uint64
 	entriesPerFirstPage int
 	entriesPerExtraPage int
+	dirty               bool
 }
 
 func NewFreelist(pageSize uint64, maxPages uint64) *Freelist {
@@ -53,10 +54,12 @@ func NewFreelist(pageSize uint64, maxPages uint64) *Freelist {
 		freelistPages:       make([]uint64, 0),
 		entriesPerFirstPage: entriesPerFirstPage,
 		entriesPerExtraPage: entriesPerExtraPage,
+		dirty:               false,
 	}
 }
 
 func (f *Freelist) GetNextPageNumber() (uint64, error) {
+	f.dirty = true
 	if len(f.releasedPages) > 0 {
 		pageNum := f.releasedPages[len(f.releasedPages)-1]
 		f.releasedPages = f.releasedPages[:len(f.releasedPages)-1]
@@ -71,6 +74,7 @@ func (f *Freelist) GetNextPageNumber() (uint64, error) {
 }
 
 func (f *Freelist) ReleasePage(pageNum uint64) {
+	f.dirty = true
 	logger.Debug("releasing pageNum", "pageNumber", pageNum)
 	f.releasedPages = append(f.releasedPages, pageNum)
 }
@@ -158,6 +162,9 @@ func ReadFreelist(dal *Dal) (*Freelist, error) {
 }
 
 func WriteFreelist(dal *Dal, freelist *Freelist) error {
+	if !freelist.dirty {
+		return nil
+	}
 	pagesNeeded := calculatePagesNeeded(
 		len(freelist.releasedPages),
 		freelist.entriesPerFirstPage,
@@ -241,6 +248,7 @@ func WriteFreelist(dal *Dal, freelist *Freelist) error {
 		"releasedPages", len(freelist.releasedPages),
 		"pagesUsed", pagesNeeded)
 
+	freelist.dirty = false
 	return nil
 }
 

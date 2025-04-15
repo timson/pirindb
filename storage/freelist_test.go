@@ -18,18 +18,20 @@ func TestFreelistWriteRead(t *testing.T) {
 		freelist.releasedPages[i] = uint64(i)
 	}
 	// Flush it to the disk
+	freelist.dirty = true
 	err := WriteFreelist(db.dal, freelist)
 	closeTestDB(t, db)
 
-	db = openTestDB(t, filename)
+	db = openTestDB(t, filename, nil)
 	// Truncated releasedPages
 	freelist.releasedPages = db.dal.freelist.releasedPages[:3000]
 	// Flush to the disk once again
+	freelist.dirty = true
 	err = WriteFreelist(db.dal, freelist)
 	require.NoError(t, err)
 	closeTestDB(t, db)
 
-	db = openTestDB(t, filename)
+	db = openTestDB(t, filename, nil)
 	require.NoError(t, err)
 	require.True(t, reflect.DeepEqual(freelist.freelistPages, db.dal.freelist.freelistPages))
 	require.True(t, reflect.DeepEqual(freelist.releasedPages, db.dal.freelist.releasedPages))
