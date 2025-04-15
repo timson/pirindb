@@ -1,7 +1,6 @@
 package storage
 
 import (
-	"os"
 	"sync"
 	"sync/atomic"
 )
@@ -31,8 +30,11 @@ type DBStat struct {
 	TxN           int                    // total number of started read transactions
 }
 
-func Open(path string, mode os.FileMode) (*DB, error) {
-	dal, err := NewDal(path, mode, 4096)
+func Open(path string, opts *Options) (*DB, error) {
+	if opts == nil {
+		opts = DefaultOptions()
+	}
+	dal, err := NewDal(path, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -113,4 +115,8 @@ func (db *DB) Stat() *DBStat {
 		TxN:           int(db.TxN.Load()),
 	}
 	return stat
+}
+
+func (db *DB) GetOptions() *Options {
+	return db.dal.opts
 }

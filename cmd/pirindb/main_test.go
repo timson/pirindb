@@ -12,7 +12,7 @@ import (
 	"github.com/timson/pirindb/storage"
 )
 
-func setupTestServer(t *testing.T) (*Server, string) {
+func setupTestServer(t *testing.T) (*Server, string, string) {
 	t.Helper()
 	filename := "test.db"
 
@@ -29,18 +29,19 @@ func setupTestServer(t *testing.T) (*Server, string) {
 	storage.SetLogger(logger)
 
 	_ = os.Remove("test.db")
-	db, err := storage.Open("test.db", 0600)
+	db, err := storage.Open("test.db", nil)
 	if err != nil {
 		t.Fatalf("failed to open DB: %v", err)
 	}
 
-	return NewServer(cfg, db, logger), filename
+	return NewServer(cfg, db, logger), filename, db.GetOptions().TxLogPath
 }
 
 func TestCRUD(t *testing.T) {
-	srv, filename := setupTestServer(t)
+	srv, filename, txLogPath := setupTestServer(t)
 	t.Cleanup(func() {
 		_ = os.Remove(filename)
+		_ = os.Remove(txLogPath)
 	})
 
 	router := srv.buildRouter()
@@ -89,9 +90,10 @@ func TestCRUD(t *testing.T) {
 }
 
 func TestHealthCheck(t *testing.T) {
-	srv, filename := setupTestServer(t)
+	srv, filename, txLogPath := setupTestServer(t)
 	t.Cleanup(func() {
 		_ = os.Remove(filename)
+		_ = os.Remove(txLogPath)
 	})
 
 	router := srv.buildRouter()
