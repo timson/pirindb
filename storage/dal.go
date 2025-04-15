@@ -4,9 +4,10 @@ import (
 	"errors"
 	"fmt"
 	"github.com/gofrs/flock"
-	"golang.org/x/sys/unix"
 	"io/fs"
 	"os"
+	"path/filepath"
+	"strings"
 )
 
 const (
@@ -15,20 +16,27 @@ const (
 )
 
 type Dal struct {
-	file           *os.File
-	data           []byte
-	osPageSize     uint64
-	maxPages       uint64
-	size           uint64
-	MinFillPercent float32
-	MaxFillPercent float32
-	freelist       *Freelist
-	meta           *Meta
-	fileLock       *flock.Flock
+	file              *os.File
+	osPageSize        uint64
+	maxPages          uint64
+	size              uint64
+	MinFillPercent    float32
+	MaxFillPercent    float32
+	freelist          *Freelist
+	meta              *Meta
+	fileLock          *flock.Flock
+	txLog             *TxLog
+	opts              *Options
+	beforeSetPageHook func(p *Page) error
 }
 
-func NewDal(path string, mode os.FileMode, pageSize uint64) (*Dal, error) {
+func NewDal(path string, opts *Options) (*Dal, error) {
 	var fileExists bool
+
+	if opts.TxLogPath == "" {
+		ext := filepath.Ext(path)
+		opts.TxLogPath = strings.TrimSuffix(path, ext) + ".tlog"
+	}
 
 	if _, statErr := os.Stat(path); statErr == nil {
 		fileExists = true
@@ -46,7 +54,7 @@ func NewDal(path string, mode os.FileMode, pageSize uint64) (*Dal, error) {
 		return nil, fmt.Errorf("could not lock database file: %s", path)
 	}
 
-	file, openErr := os.OpenFile(path, os.O_RDWR|os.O_CREATE, mode)
+	file, openErr := os.OpenFile(path, os.O_RDWR|os.O_CREATE, opts.FileMode)
 	if openErr != nil {
 		return nil, fmt.Errorf("could not open dal: %v", openErr)
 	}
@@ -62,20 +70,40 @@ func NewDal(path string, mode os.FileMode, pageSize uint64) (*Dal, error) {
 		fileSize = minFileSize
 	}
 
-	logger.Info("open database file", "path", path, "size", fileSize)
+	tlog := NewTxLog(opts.TxLogPath, 0600)
+	logger.Info("open database file", "path", path, "size", fileSize,
+		"tx_log", opts.TxLogPath)
 
 	dal := &Dal{
 		fileLock:       fileLock,
 		file:           file,
-		meta:           NewMeta(pageSize),
+		meta:           NewMeta(opts.PageSize),
 		osPageSize:     uint64(os.Getpagesize()),
 		freelist:       NewFreelist(BTreePageSize, 0),
 		MinFillPercent: 0.45,
 		MaxFillPercent: 0.95,
+		txLog:          tlog,
+		opts:           opts,
 	}
-	dal.mmap(uint64(fileSize))
+	dal.allocateFile(uint64(fileSize))
 
 	if fileExists {
+		if opts.EnableRecovery {
+			recoveredPages := 0
+			err = tlog.Recover(func(offset uint64, page *Page) error {
+				err = dal.SetPage(page)
+				if err != nil {
+					return err
+				}
+				recoveredPages++
+				return nil
+			})
+			if err != nil {
+				logger.Error("unable to apply tx log", "error", err)
+			} else {
+				logger.Info("tx log applied", "recovered_pages", recoveredPages)
+			}
+		}
 		meta, readMetaErr := ReadMeta(dal)
 		if readMetaErr != nil {
 			_ = dal.file.Close()
@@ -104,38 +132,26 @@ func NewDal(path string, mode os.FileMode, pageSize uint64) (*Dal, error) {
 	return dal, nil
 }
 
-func (dal *Dal) mmap(size uint64) {
-	if dal.size != 0 {
-		logger.Info("unmapping dal", "old_size", dal.size, "addr", fmt.Sprintf("%p", dal.data), "new_size", size)
-		err := unix.Munmap(dal.data)
-		if err != nil {
-			panic(err)
-		}
-	}
+func (dal *Dal) allocateFile(size uint64) {
 	err := dal.file.Truncate(int64(size))
 	if err != nil {
 		panic(err)
 	}
-	data, mmapErr := unix.Mmap(int(dal.file.Fd()), 0, int(size), unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED)
-	if mmapErr != nil {
-		panic(mmapErr)
-	}
-	dal.data = data
 	dal.size = size
 	dal.maxPages = size / dal.meta.pageSize
 	dal.freelist.maxPages = dal.maxPages
-	logger.Info("mmap", "size", dal.size, "max_pages", dal.maxPages, "addr", fmt.Sprintf("%p", dal.data))
+	logger.Info("allocateFile", "size", dal.size, "max_pages", dal.maxPages)
 }
 
-func (dal *Dal) expandMapping() {
+func (dal *Dal) expandAllocation() {
 	var newSize uint64
 	if dal.size < OneGigabyte {
 		newSize = dal.size * 2
 	} else {
 		newSize = dal.size + OneGigabyte
 	}
-	logger.Info("expand mmap", "size", newSize)
-	dal.mmap(newSize)
+	logger.Info("expand allocateFile", "size", newSize)
+	dal.allocateFile(newSize)
 }
 
 func (dal *Dal) AllocatePage() (*Page, error) {
@@ -146,7 +162,7 @@ func (dal *Dal) AllocatePage() (*Page, error) {
 			logger.Debug("trying allocate new pageNum, but no pages left")
 			// if no free pages left, we should allocate new pages
 			// by expand database file and expand mapping
-			dal.expandMapping()
+			dal.expandAllocation()
 			newPageNum, err = dal.freelist.GetNextPageNumber()
 			if err != nil {
 				return nil, err
@@ -178,14 +194,11 @@ func (dal *Dal) Close() error {
 	if dal.file == nil {
 		return nil
 	}
-	err := unix.Munmap(dal.data)
-	if err != nil {
-		fmt.Printf("failed to unmap file: %v\n", err)
-	}
-	if err = dal.file.Close(); err != nil && !errors.Is(err, fs.ErrClosed) {
+
+	if err := dal.file.Close(); err != nil && !errors.Is(err, fs.ErrClosed) {
 		return fmt.Errorf("failed to close file: %w", err)
 	}
-	err = dal.fileLock.Unlock()
+	err := dal.fileLock.Unlock()
 	if err != nil {
 		return fmt.Errorf("failed to unlock db file: %w", err)
 	}
@@ -195,26 +208,45 @@ func (dal *Dal) Close() error {
 
 func (dal *Dal) GetPage(pageNumber uint64) (*Page, error) {
 	if pageNumber >= dal.maxPages {
-		return nil, fmt.Errorf("pageNum number %d is greater than max pageNum number %d", pageNumber, dal.maxPages)
+		return nil, fmt.Errorf("page number %d is greater than max page number %d", pageNumber, dal.maxPages)
 	}
 
-	offset := pageNumber * dal.meta.pageSize
-	end := offset + dal.meta.pageSize
+	pageSize := dal.meta.pageSize
+	offset := int64(pageNumber * pageSize)
 
-	page := Page{
+	data := make([]byte, pageSize)
+	_, err := dal.file.ReadAt(data, offset)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read page %d: %w", pageNumber, err)
+	}
+
+	page := &Page{
 		PageNumber: pageNumber,
-		Data:       dal.data[offset:end],
+		Data:       data,
 	}
 
-	return &page, nil
+	return page, nil
 }
 
 func (dal *Dal) SetPage(page *Page) error {
+	if dal.beforeSetPageHook != nil {
+		if err := dal.beforeSetPageHook(page); err != nil {
+			return err
+		}
+	}
+
 	offset := page.PageNumber * dal.meta.pageSize
-	alignedOffset := offset - (offset % dal.osPageSize)
-	err := unix.Msync(dal.data[alignedOffset:alignedOffset+dal.osPageSize], unix.MS_SYNC)
+
+	if dal.txLog.active {
+		if err := dal.txLog.writePage(offset, page); err != nil {
+			return fmt.Errorf("failed to write pageNum %d to recovery log: %w", page.PageNumber, err)
+		}
+		return nil
+	}
+
+	_, err := dal.file.WriteAt(page.Data, int64(offset))
 	if err != nil {
-		return fmt.Errorf("failed to sync pageNum %d: %w", page.PageNumber, err)
+		return fmt.Errorf("failed to write pageNum %d to file: %w", page.PageNumber, err)
 	}
 
 	return nil

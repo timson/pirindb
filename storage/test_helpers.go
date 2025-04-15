@@ -27,7 +27,7 @@ func TempFileName(suffix string) string {
 func createTestDB(t *testing.T) (*DB, string) {
 	tempFilename := TempFileName(".db")
 
-	db, err := Open(tempFilename, 0644)
+	db, err := Open(tempFilename, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -37,12 +37,13 @@ func createTestDB(t *testing.T) (*DB, string) {
 			t.Fatal(err)
 		}
 		_ = os.Remove(tempFilename)
+		_ = os.Remove(db.dal.opts.TxLogPath)
 	})
 	return db, tempFilename
 }
 
-func openTestDB(t *testing.T, filename string) *DB {
-	db, err := Open(filename, 0644)
+func openTestDB(t *testing.T, filename string, opts *Options) *DB {
+	db, err := Open(filename, opts)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 	return db

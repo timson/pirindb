@@ -17,3 +17,22 @@ func (p *Page) Clear() {
 		p.Data[i] = 0
 	}
 }
+
+func (p *Page) GetPageType() string {
+	if len(p.Data) == 0 {
+		return "Unknown"
+	}
+
+	switch p.Data[0] {
+	case MetaPage:
+		return "Meta"
+	case FreeListPage:
+		return "Freelist"
+	case NodePage:
+		return "Node"
+	case BlobPage:
+		return "Blob"
+	default:
+		return "Unknown"
+	}
+}

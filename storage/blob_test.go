@@ -27,7 +27,7 @@ func TestNewBlob(t *testing.T) {
 	closeTestDB(t, db)
 
 	// Now open created database
-	db = openTestDB(t, filename)
+	db = openTestDB(t, filename, nil)
 	tx = db.Begin(true)
 
 	existingBlob, errRead := GetBlob(tx, pageNum)

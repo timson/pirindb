@@ -10,27 +10,29 @@ func TestDAL(t *testing.T) {
 	testFileName := "test_data.db"
 	testPattern := "Hello, world!"
 
+	opts := DefaultOptions()
 	// Open or create the DAL
-	dal, err := NewDal(testFileName, 0644, 4096)
+	dal, err := NewDal(testFileName, opts)
 	require.NoError(t, err)
 	defer func() {
 		_ = os.Remove(testFileName)
+		_ = os.Remove(dal.opts.TxLogPath)
 	}()
 
-	// Test writing to a pageNum
-	pageNum, allocatePageErr := dal.AllocatePage()
+	// Test writing to a page
+	page, allocatePageErr := dal.AllocatePage()
 	require.NoError(t, allocatePageErr)
-	pageNumber := pageNum.PageNumber
+	pageNumber := page.PageNumber
 
-	copy(pageNum.Data, []byte(testPattern))
-	err = dal.Sync()
+	copy(page.Data, []byte(testPattern))
+	dal.SetPage(page)
 	require.NoError(t, err)
 	err = dal.Close()
 	require.NoError(t, err)
 
-	// Re-open the DAL and verify the pageNum data
+	// Re-open the DAL and verify the page data
 	// This is to ensure that the data was written to disk
-	newDal, reOpenDalErr := NewDal(testFileName, 0644, 4096)
+	newDal, reOpenDalErr := NewDal(testFileName, opts)
 	if reOpenDalErr != nil {
 		t.Fatalf("Failed to re-open DAL: %v", reOpenDalErr)
 	}
@@ -44,17 +46,18 @@ func TestDAL(t *testing.T) {
 
 func TestDALMetadata(t *testing.T) {
 	testFileName := "test_data.db"
-
-	dal, err := NewDal(testFileName, 0644, BTreePageSize)
+	opts := DefaultOptions()
+	dal, err := NewDal(testFileName, opts)
 	require.NoError(t, err)
 	defer func() {
 		_ = os.Remove(testFileName)
+		_ = os.Remove(dal.opts.TxLogPath)
 	}()
 
 	err = dal.Close()
 	require.NoError(t, err)
 
-	dal, err = NewDal(testFileName, 0644, BTreePageSize)
+	dal, err = NewDal(testFileName, opts)
 	require.NoError(t, err)
 	meta := dal.meta
 	require.Equal(t, meta.GetDbName(), dbName)
@@ -66,11 +69,13 @@ func TestDALMetadata(t *testing.T) {
 
 func TestDALFreelist(t *testing.T) {
 	testFileName := "test_data.db"
+	opts := DefaultOptions()
 
-	dal, err := NewDal(testFileName, 0644, BTreePageSize)
+	dal, err := NewDal(testFileName, opts)
 	require.NoError(t, err)
 	defer func() {
 		_ = os.Remove(testFileName)
+		_ = os.Remove(dal.opts.TxLogPath)
 	}()
 
 	pageNum, _ := dal.AllocatePage()
@@ -86,7 +91,7 @@ func TestDALFreelist(t *testing.T) {
 	err = dal.Close()
 	require.NoError(t, err)
 
-	dal, err = NewDal(testFileName, 0644, BTreePageSize)
+	dal, err = NewDal(testFileName, opts)
 	require.NoError(t, err)
 	require.Equal(t, releasedPages, dal.freelist.releasedPages)
 	err = dal.Close()

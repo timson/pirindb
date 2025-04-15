@@ -33,7 +33,7 @@ func TestBucketInsertFindRemoveRandom(t *testing.T) {
 	closeTestDB(t, db)
 
 	// Reopen DB
-	db = openTestDB(t, filename)
+	db = openTestDB(t, filename, nil)
 	var keysToRemove [][]byte
 
 	t.Log("test of all inserted items, and randomly choose items to remove")
@@ -80,7 +80,7 @@ func TestBucketInsertFindRemoveRandom(t *testing.T) {
 	closeTestDB(t, db)
 
 	// Reopen once again
-	db = openTestDB(t, filename)
+	db = openTestDB(t, filename, nil)
 	err = db.View(func(tx *Tx) error {
 		bucket, _ := tx.GetBucket([]byte("foo"))
 		for _, k := range keysToRemove {
@@ -127,11 +127,13 @@ func BenchmarkBucketOperations(b *testing.B) {
 	const numEntries = 100_000
 	keys := make([][]byte, numEntries)
 	values := make([][]byte, numEntries)
+
+	db, err := Open(path, nil)
 	b.Cleanup(func() {
 		_ = os.Remove(path)
+		_ = os.Remove(db.dal.opts.TxLogPath)
 	})
 
-	db, err := Open(path, 0644)
 	require.NoError(b, err)
 	defer func() {
 		_ = db.Close()
@@ -209,7 +211,8 @@ func TestBucketInsertRandom(t *testing.T) {
 	require.NoError(t, err)
 	closeTestDB(t, db)
 
-	db = openTestDB(t, filename)
+	db = openTestDB(t, filename, nil)
+	require.NoError(t, err)
 
 	err = db.View(func(tx *Tx) error {
 		bucket, _ := tx.GetBucket([]byte("foo"))
