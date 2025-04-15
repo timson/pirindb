@@ -17,7 +17,7 @@ const (
 	freelistPageNumber = 1
 	rootPageNumber     = 2
 	dbName             = "pirindb"
-	dbVersionMinor     = 1
+	dbVersionMinor     = 2
 	dbVersionMajor     = 0
 
 	metaPageSize               = UInt8Size
