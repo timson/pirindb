@@ -49,11 +49,6 @@ Project contains:
 as a production-grade database. Instead, it's a playground for those interested in learning and  
 exploring the inner workings of database management systems.
 
-> [!WARNING]
-> The current implementation does **not** include copy-on-write (COW) mechanisms.  
-> If a transaction fails during the process of writing pages or updating the freelist, it may lead 
-> to data corruption.
-
 ## Quick Start
 You need Go 1.22 or later to build PirinDB.
 
