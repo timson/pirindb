@@ -25,7 +25,6 @@ Project contains:
 - **BoltDB like API:** Easy to integrate and experiment with.
 - **Persistence:** Data is stored on disk.
 - **Simple Transactional Support:** Ensures data consistency.
-- **Memory-mapped Storage:** Uses Unix `mmap` for efficient access and dynamically expands the storage file.
 - **Dynamic Freelist Management:** Automatic allocation and reuse of storage pages.
 - **Bucket Management:** Tools for organizing and managing buckets.
 - **Basic Cursor and Range Scanning:** Provides mechanisms to iterate over data ranges efficiently.
@@ -49,11 +48,6 @@ Project contains:
 **PirinDB** is intended purely as a hobby and educational project. It is not designed to be used  
 as a production-grade database. Instead, it's a playground for those interested in learning and  
 exploring the inner workings of database management systems.
-
-> [!WARNING]
-> The current implementation does **not** include copy-on-write (COW) mechanisms.  
-> If a transaction fails during the process of writing pages or updating the freelist, it may lead 
-> to data corruption.
 
 ## Quick Start
 You need Go 1.22 or later to build PirinDB.
@@ -106,7 +100,7 @@ import (
 )
 
 func main() {
-	db, err := pirindb.Open("test.db", 0600)
+	db, err := pirindb.Open("test.db", pirindb.DefaultOptions())
 	if err != nil {
 		log.Fatal(err)
 	}
