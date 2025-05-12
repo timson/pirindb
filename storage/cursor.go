@@ -93,6 +93,9 @@ func traverseToItem(tx *Tx, node *BNode, key []byte, exact bool, stack *[]cursor
 		}
 		return pos, node, true
 	}
+	if pos < 0 || pos >= len(node.childNodes) {
+		return -1, nil, false
+	}
 	*stack = append(*stack, cursorFrame{pageNum: node.PageNum, children: node.childNodes, childIndex: pos, itemIndex: pos})
 	child, err := tx.getNode(node.childNodes[pos])
 	if err != nil {
@@ -134,6 +137,10 @@ func (cursor *Cursor) Seek(key []byte) ([]byte, []byte) {
 	}
 	cursor.node = foundNode
 	cursor.itemIndex = pos
+	
+	if pos < 0 || pos >= len(foundNode.items) {
+		return nil, nil
+	}
 
 	value, _ := foundNode.items[pos].getValue(cursor.tx)
 	return foundNode.items[pos].Key, value

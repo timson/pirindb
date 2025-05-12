@@ -18,6 +18,25 @@ func DefaultOptions() *Options {
 	}
 }
 
+func (o *Options) MergeOptions(other *Options) *Options {
+	if other == nil {
+		return o
+	}
+
+	if other.FileMode != 0 {
+		o.FileMode = other.FileMode
+	}
+	if other.PageSize != 0 {
+		o.PageSize = other.PageSize
+	}
+	o.EnableRecovery = other.EnableRecovery // always override
+	if other.TxLogPath != "" {
+		o.TxLogPath = other.TxLogPath
+	}
+
+	return o
+}
+
 func (o *Options) WithRecovery(enable bool) *Options {
 	o.EnableRecovery = enable
 	return o

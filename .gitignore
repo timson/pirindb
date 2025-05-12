@@ -12,6 +12,7 @@
 *.so
 *.dylib
 *.db
+*.tlog
 .DS_Store
 
 # Test binary, built with `go test -c`

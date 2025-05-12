@@ -15,14 +15,14 @@ func (e *ErrResponse) Render(w http.ResponseWriter, r *http.Request) error {
 	return nil
 }
 
-func ErrInvalidRequest() render.Renderer {
+func RenderErrInvalidRequest() render.Renderer {
 	return &ErrResponse{
 		HTTPStatusCode: http.StatusBadRequest,
 		Status:         "Invalid request",
 	}
 }
 
-func ErrNotFound() render.Renderer {
+func RenderErrNotFound() render.Renderer {
 	return &ErrResponse{
 		HTTPStatusCode: http.StatusNotFound,
 		Status:         "Key not found",
@@ -36,9 +36,16 @@ func ErrRequestTimeout() render.Renderer {
 	}
 }
 
-func ErrInternalServerError() render.Renderer {
+func RenderErrInternalServerError() render.Renderer {
 	return &ErrResponse{
 		HTTPStatusCode: http.StatusInternalServerError,
 		Status:         "Internal Server Error",
+	}
+}
+
+func RenderErrServiceUnavailable() render.Renderer {
+	return &ErrResponse{
+		HTTPStatusCode: http.StatusServiceUnavailable,
+		Status:         "Service Unavailable",
 	}
 }

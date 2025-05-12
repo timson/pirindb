@@ -245,10 +245,13 @@ func WriteFreelist(dal *Dal, freelist *Freelist) error {
 	}
 
 	logger.Debug("write freelist",
+		"currentPage", freelist.currentPage,
 		"releasedPages", len(freelist.releasedPages),
 		"pagesUsed", pagesNeeded)
 
-	freelist.dirty = false
+	if !dal.txLog.active {
+		freelist.dirty = false
+	}
 	return nil
 }
 

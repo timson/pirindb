@@ -6,19 +6,45 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 	"strings"
+	"time"
 )
 
 type ServerConfig struct {
-	Host      string `mapstructure:"host" validate:"required,hostname|ip"`
-	Port      int    `mapstructure:"port" validate:"required,min=1,max=65535"`
-	LogLevel  string `mapstructure:"log_level" validate:"required,oneof=INFO WARNING DEBUG ERROR"`
-	ShardName string `mapstructure:"shard_name"`
+	Host                 string `mapstructure:"host" validate:"required,hostname|ip"`
+	Port                 int    `mapstructure:"port" validate:"required,min=1,max=65535"`
+	LogLevel             string `mapstructure:"log_level" validate:"required,oneof=INFO WARNING DEBUG ERROR"`
+	ShardName            string `mapstructure:"shard_name"`
+	RemoteTimeoutSeconds int    `mapstructure:"remote_timeout_seconds" validate:"required,min=1,max=300"`
 }
 
 type ShardConfig struct {
-	Name string
-	Host string `mapstructure:"host" validate:"required,hostname|ip"`
-	Port int    `mapstructure:"port" validate:"required,min=1,max=65535"`
+	Name       string
+	Host       string `mapstructure:"host" validate:"required,hostname|ip"`
+	Port       int    `mapstructure:"port" validate:"required,min=1,max=65535"`
+	GossipPort int    `mapstructure:"gossipport" validate:"required,,min=1,max=65535"`
+	Scheme     string `mapstructure:"scheme" validate:"omitempty,oneof=http https"`
+	Skip       bool   `mapstructure:"skip" validate:"omitempty"`
+}
+
+type ReshardingConfig struct {
+	RetryTimeout int `mapstructure:"retry_timeout" validate:"required,min=1"`
+	Retries      int `mapstructure:"retries" validate:"required,min=1,max=65536"`
+	BatchSize    int `mapstructure:"batch_size" validate:"required,min=1,max=65536"`
+	BatchDelay   int `mapstructure:"batch_delay" validate:"required,min=1,max=65536"`
+}
+
+func (rc *ReshardingConfig) GetRetryTimeout() time.Duration {
+	return time.Duration(rc.RetryTimeout) * time.Second
+}
+
+func (rc *ReshardingConfig) GetBatchDelay() time.Duration {
+	return time.Duration(rc.BatchDelay) * time.Millisecond
+}
+
+func (s *ShardConfig) setDefaults() {
+	if s.Scheme == "" {
+		s.Scheme = "http"
+	}
 }
 
 type DatabaseConfig struct {
@@ -26,9 +52,10 @@ type DatabaseConfig struct {
 }
 
 type Config struct {
-	Server *ServerConfig
-	Shards []*ShardConfig
-	DB     *DatabaseConfig
+	Server     *ServerConfig
+	Shards     []*ShardConfig
+	DB         *DatabaseConfig
+	Resharding *ReshardingConfig
 }
 
 func initDefaults() {
@@ -36,6 +63,12 @@ func initDefaults() {
 	viper.SetDefault("server.port", 4321)
 	viper.SetDefault("db.filename", "pirin.db")
 	viper.SetDefault("server.log_level", "INFO")
+	viper.SetDefault("resharding.retry_timeout", 5)
+	viper.SetDefault("resharding.retries", 10)
+	viper.SetDefault("resharding.batch_size", 1000)
+	viper.SetDefault("resharding.batch_delay", 100)
+	viper.SetDefault("server.remote_timeout_seconds", 5)
+
 }
 
 func setupFlags(cmd *cobra.Command) {

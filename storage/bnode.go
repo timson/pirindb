@@ -189,7 +189,7 @@ func (node *BNode) numItems() int {
 }
 
 func (node *BNode) elemSize(item *Item) int {
-	// Len of key + key, len of value + value + child node
+	// Len of a key + key, len of value + value + child node
 	return UInt16Size + len(item.Key) + UInt16Size + len(item.Value) + UInt64Size
 }
 
@@ -215,9 +215,9 @@ func (node *BNode) findKeyPosition(key []byte) (int, bool) {
 
 		if res == 0 {
 			return middle, true
-		} else if res < 0 { // Key is greater than middle item
+		} else if res < 0 { // Key is greater than the middle item
 			left = middle + 1
-		} else { // Key is smaller than middle item
+		} else { // Key is smaller than the middle item
 			right = middle - 1
 		}
 	}
@@ -276,7 +276,7 @@ func (node *BNode) splitChild(tx *Tx, fullNode *BNode, fullNodeIndex int) {
 	// determine splitChild index
 	splitIndex := getSplitIndex(fullNode, tx.db.dal.minThreshold())
 
-	// this element will go to parent node
+	// this element will go to the parent node
 	middleItem := fullNode.items[splitIndex]
 	var newNode *BNode
 
@@ -294,7 +294,7 @@ func (node *BNode) splitChild(tx *Tx, fullNode *BNode, fullNodeIndex int) {
 	// insert middle item to parent node
 	node.insertItemAt(middleItem, fullNodeIndex)
 
-	if len(node.childNodes) == fullNodeIndex+1 { // If middle of list, then move items forward
+	if len(node.childNodes) == fullNodeIndex+1 { // If middle of the list, then move items forward
 		node.childNodes = append(node.childNodes, newNode.PageNum)
 	} else { // otherwise move items right
 		node.childNodes = append(node.childNodes[:fullNodeIndex+1], node.childNodes[fullNodeIndex:]...)
@@ -312,7 +312,7 @@ func (node *BNode) removeItemAtLeaf(index int) {
 }
 
 // removeItemFromInternal removes an item from an internal (non-leaf) node.
-// The item is replaced by its in-order predecessor (largest value in the left subtree).
+// The item is replaced by its in-order predecessor (the largest value in the left subtree).
 // It also removes the predecessor from its original position and updates the affected nodes.
 func (node *BNode) removeItemFromInternal(tx *Tx, index int) ([]int, error) {
 	affectedNodes := make([]int, 0)
@@ -347,7 +347,7 @@ func isFirstItem(index int) bool {
 	return index == 0
 }
 
-// rotateRight shifts an item from the right end of leftNode to parentNode,
+// rotateRight shifts an item from the right end of the leftNode to parentNode,
 // and moves the parentNode's item down to the leftmost position in rightNode.
 //
 // leftNode: The left sibling (giving an item)
@@ -367,7 +367,7 @@ func rotateRight(leftNode, parentNode, rightNode *BNode, rightNodeIndex int) {
 	parentSwapItem := parentNode.items[parentItemIndex]
 	parentNode.items[parentItemIndex] = movedItem
 
-	// Move parentSwapItem to the start of rightNode
+	// Move parentSwapItem to the start of the rightNode
 	rightNode.items = append(rightNode.items, nil) // Extend slice by 1
 	copy(rightNode.items[1:], rightNode.items[:])  // Shift items right
 	rightNode.items[0] = parentSwapItem
@@ -397,7 +397,7 @@ func rotateLeft(leftNode, parentNode, rightNode *BNode, rightNodeIndex int) {
 	parentSwapItem := parentNode.items[parentItemIndex]
 	parentNode.items[parentItemIndex] = movedItem
 
-	// Move parentSwapItem to the end of leftNode
+	// Move parentSwapItem to the end of the leftNode
 	leftNode.items = append(leftNode.items, parentSwapItem)
 
 	// If nodes have children, move the first child from rightNode to leftNode
@@ -428,7 +428,7 @@ func (node *BNode) merge(tx *Tx, rightNode *BNode, rightNodeIndex int) error {
 	parentItem := node.items[rightNodeIndex-1]
 	leftNode.items = append(leftNode.items, parentItem)
 
-	// Remove the separator item from parent
+	// Remove the separator item from the parent
 	copy(node.items[rightNodeIndex-1:], node.items[rightNodeIndex:])
 	node.items = node.items[:len(node.items)-1]
 
@@ -493,7 +493,7 @@ func (node *BNode) rebalanceRemove(tx *Tx, unbalancedNode *BNode, nodeIndexInPar
 	}
 	// The merge function merges a given node with its node to the right. So by default, we merge an unbalanced node
 	// with its right sibling. In the case where the unbalanced node is the leftmost, we have to replace the merge
-	// parameters, so the unbalanced node right sibling, will be merged into the unbalanced node.
+	// parameters, so the unbalanced node's right sibling will be merged into the unbalanced node.
 	if nodeIndexInParent == 0 {
 		rightNode, err := tx.getNode(node.childNodes[nodeIndexInParent+1])
 		if err != nil {

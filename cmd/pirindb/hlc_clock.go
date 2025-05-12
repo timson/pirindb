@@ -1,7 +1,10 @@
 package main
 
 import (
+	"fmt"
 	"golang.org/x/exp/constraints"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -95,4 +98,31 @@ func (hlc HLC) Compare(other HLC) int {
 		return 1
 	}
 	return 0
+}
+
+func (hlc HLC) String() string {
+	return fmt.Sprintf("%d.%d", hlc.PhysicalTime, hlc.LogicalCounter)
+}
+
+func (hlc HLC) Serialize() string {
+	return fmt.Sprintf("%d.%d", hlc.PhysicalTime, hlc.LogicalCounter)
+}
+
+func ParseHLC(s string) (HLC, error) {
+	var hlc HLC
+	parts := strings.Split(s, ".")
+	if len(parts) != 2 {
+		return HLC{}, fmt.Errorf("invalid HLC string: %s", s)
+	}
+	physicalTime, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil {
+		return HLC{}, fmt.Errorf("invalid physical time: %w", err)
+	}
+	logicalCounter, err := strconv.ParseUint(parts[1], 10, 32)
+	if err != nil {
+		return HLC{}, fmt.Errorf("invalid logical counter: %w", err)
+	}
+	hlc.PhysicalTime = physicalTime
+	hlc.LogicalCounter = uint32(logicalCounter)
+	return hlc, nil
 }

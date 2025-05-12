@@ -26,7 +26,7 @@ func TestNewBlob(t *testing.T) {
 	require.NoError(t, err)
 	closeTestDB(t, db)
 
-	// Now open created database
+	// Now open the created database
 	db = openTestDB(t, filename, nil)
 	tx = db.Begin(true)
 
