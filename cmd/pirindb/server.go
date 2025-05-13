@@ -159,6 +159,7 @@ func (srv *Server) Delete(key string) error {
 
 	for _, shard := range srv.getShardCandidatesByKey(key) {
 		err := srv.deleteFromShard(shard, key)
+		fmt.Println(err)
 		if err != nil {
 			return err
 		}
@@ -279,7 +280,7 @@ func (srv *Server) deleteFromShard(shard *Shard, key string) error {
 		return ErrKeyNotFound
 	}
 
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode != http.StatusNoContent {
 		return ErrInternalServerError
 	}
 

@@ -141,18 +141,6 @@ func (c *Cluster) LocalShard() *Shard {
 func (c *Cluster) initRing() {
 	localShard := c.LocalShard()
 	previousRing, err := LoadRingHash(c.db, c.shards)
-
-	//if localShard.skip {
-	//	if err != nil {
-	//		c.Logger.Warn("unable to load previous ring hash, and shard marked for eviction, unable to continue")
-	//		panic(err)
-	//	}
-	//	localShard.SetCurrentRingHash(previousRing)
-	//	localShard.SetPreviousRingHash(previousRing)
-	//	localShard.SetStatus(ShardMarkedForEviction)
-	//	return
-	//}
-
 	localShard.SetCurrentRingHash(NewRingHash(c.shards))
 
 	if err != nil {

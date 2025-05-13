@@ -1,7 +1,6 @@
 package main
 
 import (
-	"fmt"
 	"github.com/stretchr/testify/require"
 	"github.com/timson/pirindb/storage"
 	"log/slog"
@@ -72,13 +71,4 @@ func TestConsistentHash_AddShard(t *testing.T) {
 		t.Logf("Key %-12s → %s (%s:%d)", key, shard.Name, shard.Host, shard.Port)
 		require.Equal(t, originalShards[key], shard.Name, "shard assignment for key %q changed", key)
 	}
-
-	db.View(func(tx *storage.Tx) error {
-		bucket, err := tx.GetBucket([]byte("test"))
-		require.NoError(t, err)
-		value, found := bucket.Get([]byte("test1"))
-		require.True(t, found)
-		fmt.Println(string(value))
-		return nil
-	})
 }

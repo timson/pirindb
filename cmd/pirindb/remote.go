@@ -85,13 +85,5 @@ func RemoteDelete(client *http.Client, shardURL string, key string, clock *HLClo
 		return nil, fmt.Errorf("performing request: %w", err)
 	}
 
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		if resp.StatusCode == http.StatusNotFound {
-			return nil, ErrKeyNotFound
-		}
-		return nil, fmt.Errorf("remote delete failed: %s", string(body))
-	}
-
 	return resp, nil
 }

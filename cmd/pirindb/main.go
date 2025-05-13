@@ -12,7 +12,6 @@ import (
 func runServer(cfgFile string) {
 	printLogo(version)
 	printSystemInfo()
-	cfgFile = "test_shards.toml"
 
 	config, err := loadConfig(cfgFile)
 	if err != nil {
