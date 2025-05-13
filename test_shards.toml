@@ -1,9 +1,0 @@
-[[shards]]
-name = "aleph"
-host = "127.0.0.1"
-port = 4321
-
-[[shards]]
-name = "bet"
-host = "127.0.0.1"
-port = 4322
