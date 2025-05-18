@@ -183,7 +183,7 @@ func TestBNodeSerialize(t *testing.T) {
 
 	data := make([]byte, BTreePageSize)
 	err := node.Serialize(data)
-	require.NoError(t, err, "unable to Serialize")
+	require.NoError(t, err, "unable to serialize")
 
 	nodeDst := NewBNode()
 	nodeDst.Deserialize(data)
@@ -241,7 +241,7 @@ func TestSplitChild(t *testing.T) {
 		}
 	}
 
-	// Verify that parentNode now has two child nodes
+	// Verify that the parentNode now has two child nodes
 	if len(parentNode.childNodes) != 2 {
 		t.Errorf("Expected 2 child nodes, but got %d", len(parentNode.childNodes))
 	}

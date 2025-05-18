@@ -32,7 +32,6 @@ const (
 
 	blobExtraPageTypeOffset     = 0
 	blobExtraPageNextPageOffset = blobExtraPageTypeOffset + blobPageTypeSize
-	blobExtraPageDataOffset     = blobExtraPageNextPageOffset + blobNextPageNumSize
 
 	firstPageHeaderSize = blobTotalPagesSize + blobDataSizeBytes + blobNextPageNumSize + blobPageTypeSize
 	pageHeaderSize      = blobNextPageNumSize + blobPageTypeSize

@@ -12,7 +12,9 @@
 *.so
 *.dylib
 *.db
+*.tlog
 .DS_Store
+test_shards.toml
 
 # Test binary, built with `go test -c`
 *.test

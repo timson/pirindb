@@ -31,10 +31,11 @@ type DBStat struct {
 }
 
 func Open(path string, opts *Options) (*DB, error) {
-	if opts == nil {
-		opts = DefaultOptions()
+	finalOpts := DefaultOptions()
+	if opts != nil {
+		finalOpts = finalOpts.MergeOptions(opts)
 	}
-	dal, err := NewDal(path, opts)
+	dal, err := NewDal(path, finalOpts)
 	if err != nil {
 		return nil, err
 	}
