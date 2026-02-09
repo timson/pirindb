@@ -1,3 +1,4 @@
+// Package storage
 package storage
 
 import (
@@ -32,7 +33,6 @@ const (
 
 	blobExtraPageTypeOffset     = 0
 	blobExtraPageNextPageOffset = blobExtraPageTypeOffset + blobPageTypeSize
-	blobExtraPageDataOffset     = blobExtraPageNextPageOffset + blobNextPageNumSize
 
 	firstPageHeaderSize = blobTotalPagesSize + blobDataSizeBytes + blobNextPageNumSize + blobPageTypeSize
 	pageHeaderSize      = blobNextPageNumSize + blobPageTypeSize
@@ -80,7 +80,7 @@ func GetBlob(tx *Tx, startPageNum uint64) (*Blob, error) {
 	dataOffset := 0
 	bytesRemaining := dataLen
 
-	for pageIdx := 0; pageIdx < pageCount; pageIdx++ {
+	for pageIdx := range pageCount {
 		var page *Page
 		if pageIdx == 0 {
 			page = startPage
@@ -119,8 +119,12 @@ func DeleteBlob(tx *Tx, startPageNum uint64) (int, error) {
 	dataLen := int(binary.LittleEndian.Uint32(page.Data[blobDataSizeBytes:]))
 	pages := make([]uint64, pageCount)
 	for pageIndex := 0; pageIndex < int(pageCount); pageIndex++ {
-		var nextPageNum uint64
 		pages[pageIndex] = page.PageNumber
+		if pageIndex == int(pageCount)-1 {
+			break
+		}
+
+		var nextPageNum uint64
 		if pageIndex == 0 {
 			nextPageNum = binary.LittleEndian.Uint64(page.Data[blobFirstPageNextPageOffset:])
 		} else {
@@ -144,7 +148,7 @@ func (blob *Blob) Save(tx *Tx) (uint64, error) {
 
 	pages := make([]*Page, blob.pageCount)
 	for pageIndex := 0; pageIndex < blob.pageCount; pageIndex++ {
-		page, err := tx.db.dal.AllocatePage()
+		page, err := tx.allocatePage()
 		if err != nil {
 			return 0, err
 		}

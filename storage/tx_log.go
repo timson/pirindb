@@ -171,7 +171,7 @@ func (txlog *TxLog) Recover(callback PageRecoveryCallback) error {
 
 	// Process each (offset, page)
 	cursor := 0
-	for i := 0; i < numPages; i++ {
+	for range numPages {
 		offset := binary.LittleEndian.Uint64(data[cursor : cursor+txLogPageOffsetSize])
 		cursor += txLogPageOffsetSize
 		pageNum := binary.LittleEndian.Uint64(data[cursor : cursor+txLogPageNumberSize])

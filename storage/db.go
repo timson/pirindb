@@ -78,11 +78,14 @@ func (db *DB) Update(fn func(tx *Tx) error) error {
 }
 
 func (db *DB) Stat() *DBStat {
-	freePages := int(db.dal.freelist.maxPages-db.dal.freelist.currentPage) + len(db.dal.freelist.releasedPages)
+	freePages := db.dal.freelist.availablePageN()
 	freelistPages := len(db.dal.freelist.freelistPages)
-	usedPages := int(db.dal.freelist.currentPage) + freelistPages
 	releasedPages := len(db.dal.freelist.releasedPages)
 	totalPages := int(db.dal.freelist.maxPages)
+	usedPages := totalPages - freePages
+	if usedPages < 0 {
+		usedPages = 0
+	}
 
 	bucketStats := make(map[string]*BucketStat)
 

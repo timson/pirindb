@@ -24,7 +24,7 @@ func TempFileName(suffix string) string {
 	return filepath.Join(os.TempDir(), uuid.New().String()+suffix)
 }
 
-func createTestDB(t *testing.T) (*DB, string) {
+func CreateTestDB(t *testing.T) (*DB, string) {
 	tempFilename := TempFileName(".db")
 
 	db, err := Open(tempFilename, nil)
@@ -42,14 +42,14 @@ func createTestDB(t *testing.T) (*DB, string) {
 	return db, tempFilename
 }
 
-func openTestDB(t *testing.T, filename string, opts *Options) *DB {
+func OpenTestDB(t *testing.T, filename string, opts *Options) *DB {
 	db, err := Open(filename, opts)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 	return db
 }
 
-func closeTestDB(t *testing.T, db *DB) {
+func CloseTestDB(t *testing.T, db *DB) {
 	err := db.Close()
 	require.NoError(t, err)
 }

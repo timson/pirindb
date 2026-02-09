@@ -97,3 +97,32 @@ func TestDALFreelist(t *testing.T) {
 	err = dal.Close()
 	require.NoError(t, err)
 }
+
+func TestDALReleasePageValidation(t *testing.T) {
+	testFileName := "test_data.db"
+	opts := DefaultOptions()
+
+	dal, err := NewDal(testFileName, opts)
+	require.NoError(t, err)
+	defer func() {
+		_ = os.Remove(testFileName)
+		_ = os.Remove(dal.opts.TxLogPath)
+	}()
+
+	require.Error(t, dal.ReleasePage(metaPageNumber))
+	require.Error(t, dal.ReleasePage(freelistPageNumber))
+
+	page, err := dal.AllocatePage()
+	require.NoError(t, err)
+	require.NoError(t, dal.ReleasePage(page.PageNumber))
+	require.NoError(t, dal.ReleasePage(page.PageNumber)) // idempotent duplicate release
+
+	dupCount := 0
+	for _, pageNum := range dal.freelist.releasedPages {
+		if pageNum == page.PageNumber {
+			dupCount++
+		}
+	}
+	require.Equal(t, 1, dupCount)
+	require.Error(t, dal.ReleasePage(dal.freelist.currentPage+1))
+}

@@ -56,9 +56,10 @@ func (item *Item) setValue(tx *Tx) error {
 }
 
 func (item *Item) getValue(tx *Tx) ([]byte, error) {
-	if item.Value[0] == ValueSimple {
+	switch item.Value[0] {
+	case ValueSimple:
 		return item.Value[1:], nil
-	} else if item.Value[0] == ValueBlob {
+	case ValueBlob:
 		pageNum := binary.LittleEndian.Uint64(item.Value[1:])
 		blob, err := GetBlob(tx, pageNum)
 		if err != nil {
@@ -150,13 +151,13 @@ func (node *BNode) Deserialize(data []byte) {
 	pos += UInt16Size
 
 	if isLeaf == 0 {
-		for idx := 0; idx < numbChildren; idx++ {
+		for range numbChildren {
 			childNode := binary.LittleEndian.Uint64(data[pos:])
 			pos += UInt64Size
 			node.childNodes = append(node.childNodes, childNode)
 		}
 	}
-	for idx := 0; idx < numItems; idx++ {
+	for range numItems {
 		keyLen := binary.LittleEndian.Uint16(data[pos:])
 		pos += UInt16Size
 		valueLen := binary.LittleEndian.Uint16(data[pos:])
@@ -202,7 +203,7 @@ func (node *BNode) size() int {
 }
 
 func (node *BNode) findKeyPosition(key []byte) (int, bool) {
-	if node.items == nil || len(node.items) == 0 {
+	if len(node.items) == 0 {
 		return 0, false
 	}
 
@@ -451,10 +452,7 @@ func (node *BNode) merge(tx *Tx, rightNode *BNode, rightNodeIndex int) error {
 // hasExtraElement checks if a node has more elements than the minimum allowed threshold.
 func (node *BNode) hasExtraElement(minThreshold float32) bool {
 	splitIndex := getSplitIndex(node, minThreshold)
-	if splitIndex == -1 {
-		return false
-	}
-	return true
+	return splitIndex != -1
 }
 
 // rebalanceRemove balances a B-tree node after a deletion operation.
@@ -519,7 +517,6 @@ func traverse(tx *Tx, node *BNode, pages *[]uint64) {
 			traverse(tx, childNode, pages)
 		}
 	}
-	return
 }
 
 func getSplitIndex(node *BNode, minThreshold float32) int {

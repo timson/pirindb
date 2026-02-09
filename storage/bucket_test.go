@@ -14,7 +14,7 @@ import (
 func TestBucketInsertFindRemoveRandom(t *testing.T) {
 	iterations := 1_000_000
 
-	db, filename := createTestDB(t)
+	db, filename := CreateTestDB(t)
 	t.Logf("opened db at %s", filename)
 	t.Logf("going to insert %d items", iterations)
 
@@ -30,10 +30,10 @@ func TestBucketInsertFindRemoveRandom(t *testing.T) {
 		}
 		return nil
 	})
-	closeTestDB(t, db)
+	CloseTestDB(t, db)
 
 	// Reopen DB
-	db = openTestDB(t, filename, nil)
+	db = OpenTestDB(t, filename, nil)
 	var keysToRemove [][]byte
 
 	t.Log("test of all inserted items, and randomly choose items to remove")
@@ -59,10 +59,7 @@ func TestBucketInsertFindRemoveRandom(t *testing.T) {
 
 	chunkSize := 10000
 	for idx := 0; idx < len(keysToRemove); idx += chunkSize {
-		end := idx + chunkSize
-		if end > len(keysToRemove) {
-			end = len(keysToRemove)
-		}
+		end := min(idx+chunkSize, len(keysToRemove))
 		chunk := keysToRemove[idx:end]
 		err = db.Update(func(tx *Tx) error {
 			bucket, _ := tx.GetBucket([]byte("foo"))
@@ -77,10 +74,10 @@ func TestBucketInsertFindRemoveRandom(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	closeTestDB(t, db)
+	CloseTestDB(t, db)
 
 	// Reopen once again
-	db = openTestDB(t, filename, nil)
+	db = OpenTestDB(t, filename, nil)
 	err = db.View(func(tx *Tx) error {
 		bucket, _ := tx.GetBucket([]byte("foo"))
 		for _, k := range keysToRemove {
@@ -95,7 +92,7 @@ func TestBucketInsertFindRemoveRandom(t *testing.T) {
 }
 
 func TestBucketInsertRemove(t *testing.T) {
-	db, _ := createTestDB(t)
+	db, _ := CreateTestDB(t)
 	err := db.Update(func(tx *Tx) error {
 		bucket, _ := tx.CreateBucket([]byte("foo"))
 		err := bucket.Put([]byte("foo"), []byte("bar"))
@@ -139,7 +136,7 @@ func BenchmarkBucketOperations(b *testing.B) {
 		_ = db.Close()
 	}()
 
-	for i := 0; i < numEntries; i++ {
+	for i := range numEntries {
 		key := fmt.Sprintf("%016d", i)   // 16 byte string
 		value := fmt.Sprintf("%016d", i) // 16 byte string
 		keys[i] = []byte(key)
@@ -151,7 +148,7 @@ func BenchmarkBucketOperations(b *testing.B) {
 		err = db.Update(func(tx *Tx) error {
 			bucket, _ := tx.CreateBucket([]byte("foo"))
 			start := time.Now()
-			for i := 0; i < numEntries; i++ {
+			for i := range numEntries {
 				err = bucket.Put(keys[i], values[i])
 				if err != nil {
 					b.Fatal(err)
@@ -174,7 +171,7 @@ func BenchmarkBucketOperations(b *testing.B) {
 		err = db.View(func(tx *Tx) error {
 			bucket, _ := tx.GetBucket([]byte("foo"))
 			start := time.Now()
-			for i := 0; i < numEntries; i++ {
+			for i := range numEntries {
 				val, found := bucket.Get(keys[i])
 				if !found {
 					b.Fatalf("Key not found: %s", keys[i])
@@ -195,12 +192,12 @@ func BenchmarkBucketOperations(b *testing.B) {
 }
 
 func TestBucketInsertRandom(t *testing.T) {
-	db, filename := createTestDB(t)
+	db, filename := CreateTestDB(t)
 	iterations := 1_000_000
 	keys := make([][]byte, 0)
 	err := db.Update(func(tx *Tx) error {
 		bucket, _ := tx.CreateBucket([]byte("foo"))
-		for _ = range iterations {
+		for range iterations {
 			key := randSeq(8)
 			err := bucket.Put([]byte(key), []byte(strings.Repeat("a", 32)))
 			require.NoError(t, err)
@@ -209,9 +206,9 @@ func TestBucketInsertRandom(t *testing.T) {
 		return nil
 	})
 	require.NoError(t, err)
-	closeTestDB(t, db)
+	CloseTestDB(t, db)
 
-	db = openTestDB(t, filename, nil)
+	db = OpenTestDB(t, filename, nil)
 	require.NoError(t, err)
 
 	err = db.View(func(tx *Tx) error {
@@ -228,9 +225,9 @@ func TestBucketInsertRandom(t *testing.T) {
 }
 
 func TestBucketInsertBlob(t *testing.T) {
-	db, _ := createTestDB(t)
+	db, _ := CreateTestDB(t)
 	testValue := make([]byte, 15012)
-	for idx := 0; idx < len(testValue); idx++ {
+	for idx := range testValue {
 		testValue[idx] = byte(rand.Intn(255))
 	}
 
@@ -253,11 +250,11 @@ func TestBucketInsertBlob(t *testing.T) {
 }
 
 func TestCreateBuckets(t *testing.T) {
-	db, _ := createTestDB(t)
+	db, _ := CreateTestDB(t)
 	nBuckets := 1000
 	originalBuckets := make([][]byte, nBuckets)
 	err := db.Update(func(tx *Tx) error {
-		for i := 0; i < nBuckets; i++ {
+		for i := range nBuckets {
 			bucketName := fmt.Sprintf("bucket_%03d", i)
 			originalBuckets[i] = []byte(bucketName)
 			_, err := tx.CreateBucket([]byte(bucketName))
@@ -277,7 +274,7 @@ func TestCreateBuckets(t *testing.T) {
 }
 
 func TestBucketsForEach(t *testing.T) {
-	db, _ := createTestDB(t)
+	db, _ := CreateTestDB(t)
 	iterations := 10_000
 	originalKeys := make([][]byte, iterations)
 
@@ -313,16 +310,16 @@ func TestBucketsForEach(t *testing.T) {
 }
 
 func TestBucketNextSequence(t *testing.T) {
-	db, _ := createTestDB(t)
+	db, _ := CreateTestDB(t)
 	iterations := 100
 	err := db.Update(func(tx *Tx) error {
 		bucket, _ := tx.CreateBucket([]byte("foo"))
-		for i := 0; i < iterations; i++ {
+		for range iterations {
 			pk, err := bucket.NextSequence()
 			if err != nil {
 				return err
 			}
-			err = bucket.Put(itob(pk), []byte(fmt.Sprintf("value_%d", pk)))
+			err = bucket.Put(itob(pk), fmt.Appendf(nil, "value_%d", pk))
 			if err != nil {
 				return err
 			}

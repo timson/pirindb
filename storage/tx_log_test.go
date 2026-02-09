@@ -27,7 +27,7 @@ func Test_Recovery_AfterSimulatedCrash(t *testing.T) {
 		})
 	}
 
-	db, filename := createTestDB(t)
+	db, filename := CreateTestDB(t)
 	tx := db.Begin(true)
 	bucket, err := tx.CreateBucketIfNotExists([]byte("users"))
 	require.NoError(t, err)
@@ -49,14 +49,14 @@ func Test_Recovery_AfterSimulatedCrash(t *testing.T) {
 	db.Close()
 
 	t.Log("reopen DB without recovery")
-	db = openTestDB(t, filename, DefaultOptions().WithRecovery(false))
+	db = OpenTestDB(t, filename, DefaultOptions().WithRecovery(false))
 	err = checkFunc(db)
 	t.Log(err)
 	require.Error(t, err)
 	db.Close()
 
 	t.Log("reopen DB with recovery")
-	db = openTestDB(t, filename, DefaultOptions().WithRecovery(true))
+	db = OpenTestDB(t, filename, DefaultOptions().WithRecovery(true))
 	err = checkFunc(db)
 	require.NoError(t, err)
 }

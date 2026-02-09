@@ -89,7 +89,7 @@ func TestRemoveAtLeaf(t *testing.T) {
 
 // TestRemoveItemFromInternal tests removing an item from an internal node in a B-tree.
 func TestRemoveItemFromInternal(t *testing.T) {
-	db, _ := createTestDB(t)
+	db, _ := CreateTestDB(t)
 
 	// 1. Internal node with left and right children
 	// Structure:
@@ -196,7 +196,7 @@ func TestBNodeSerialize(t *testing.T) {
 }
 
 func TestSplitChild(t *testing.T) {
-	db, _ := createTestDB(t)
+	db, _ := CreateTestDB(t)
 	tx := db.Begin(false)
 
 	// Create a full node (before splitting) with 5 keys

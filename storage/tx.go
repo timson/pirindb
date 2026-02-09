@@ -14,6 +14,7 @@ type Tx struct {
 	write             bool
 	once              sync.Once
 	db                *DB
+	buckets           sync.Map
 }
 
 func newTx(db *DB, write bool) *Tx {
@@ -26,7 +27,17 @@ func newTx(db *DB, write bool) *Tx {
 		write,
 		sync.Once{},
 		db,
+		sync.Map{},
 	}
+}
+
+func (tx *Tx) allocatePage() (*Page, error) {
+	page, err := tx.db.dal.AllocatePage()
+	if err != nil {
+		return nil, err
+	}
+	tx.allocatedPageNums = append(tx.allocatedPageNums, page.PageNumber)
+	return page, nil
 }
 
 func (tx *Tx) newNode(items []*Item, childNodes []uint64) *BNode {
@@ -34,9 +45,8 @@ func (tx *Tx) newNode(items []*Item, childNodes []uint64) *BNode {
 	node.items = make([]*Item, len(items))
 	copy(node.items, items)
 	node.childNodes = append([]uint64{}, childNodes...)
-	page, _ := tx.db.dal.AllocatePage()
+	page, _ := tx.allocatePage()
 	node.PageNum = page.PageNumber
-	tx.allocatedPageNums = append(tx.allocatedPageNums, page.PageNumber)
 	return node
 }
 
@@ -93,7 +103,9 @@ func (tx *Tx) Rollback() {
 	tx.dirtyNodes = nil
 	tx.pagesToDelete = nil
 	for _, pageNum := range tx.allocatedPageNums {
-		tx.db.dal.freelist.ReleasePage(pageNum)
+		if err := tx.db.dal.ReleasePage(pageNum); err != nil {
+			logger.Error("failed to release allocated page on rollback", "page_num", pageNum, "error", err)
+		}
 	}
 }
 
@@ -139,7 +151,9 @@ func (tx *Tx) Commit() error {
 			}
 		}
 		for _, pageNum := range tx.pagesToDelete {
-			tx.db.dal.freelist.ReleasePage(pageNum)
+			if err := tx.db.dal.ReleasePage(pageNum); err != nil {
+				return err
+			}
 		}
 
 		err := WriteFreelist(tx.db.dal, tx.db.dal.freelist)
@@ -207,6 +221,9 @@ func (tx *Tx) createOrUpdateBucket(bucket *Bucket) (*Bucket, error) {
 }
 
 func (tx *Tx) GetBucket(name []byte) (*Bucket, error) {
+	if bucket, ok := tx.buckets.Load(string(name)); ok {
+		return bucket.(*Bucket), nil
+	}
 	rootBucket := tx.getRootBucket()
 	value, found := rootBucket.Get(name)
 	if !found || value == nil {
@@ -219,6 +236,7 @@ func (tx *Tx) GetBucket(name []byte) (*Bucket, error) {
 	if tx.write {
 		tx.dirtyBuckets[string(name)] = bucket
 	}
+	tx.buckets.Store(string(name), bucket)
 	return bucket, nil
 }
 
@@ -231,7 +249,7 @@ func (tx *Tx) CreateBucket(name []byte) (*Bucket, error) {
 		return nil, ErrBucketExists
 	}
 	node := NewBNode()
-	page, allocatePageErr := tx.db.dal.AllocatePage()
+	page, allocatePageErr := tx.allocatePage()
 	if allocatePageErr != nil {
 		return nil, allocatePageErr
 	}

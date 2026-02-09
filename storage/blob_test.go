@@ -7,7 +7,7 @@ import (
 )
 
 func TestNewBlob(t *testing.T) {
-	db, filename := createTestDB(t)
+	db, filename := CreateTestDB(t)
 
 	data := make([]byte, 18000)
 	for idx := 0; idx < len(data); idx++ {
@@ -24,10 +24,10 @@ func TestNewBlob(t *testing.T) {
 
 	err = tx.Commit()
 	require.NoError(t, err)
-	closeTestDB(t, db)
+	CloseTestDB(t, db)
 
 	// Now open created database
-	db = openTestDB(t, filename, nil)
+	db = OpenTestDB(t, filename, nil)
 	tx = db.Begin(true)
 
 	existingBlob, errRead := GetBlob(tx, pageNum)

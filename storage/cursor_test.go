@@ -10,7 +10,7 @@ import (
 )
 
 func TestCursorFirstNext(t *testing.T) {
-	db, _ := createTestDB(t)
+	db, _ := CreateTestDB(t)
 
 	iterations := 5000
 	sourceKeys := make(map[string][]byte)
@@ -45,7 +45,7 @@ func TestCursorFirstNext(t *testing.T) {
 }
 
 func TestCursorPrefixScan(t *testing.T) {
-	db, _ := createTestDB(t)
+	db, _ := CreateTestDB(t)
 
 	iterations := 5000
 	err := db.Update(func(tx *Tx) error {
@@ -75,7 +75,7 @@ func TestCursorPrefixScan(t *testing.T) {
 }
 
 func TestCursorLastPrev(t *testing.T) {
-	db, _ := createTestDB(t)
+	db, _ := CreateTestDB(t)
 
 	iterations := 500
 	original := make([]string, iterations)

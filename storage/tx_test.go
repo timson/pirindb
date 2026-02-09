@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"sync"
@@ -11,7 +12,7 @@ import (
 )
 
 func TestTxRollbackCreateBucket(t *testing.T) {
-	db, _ := createTestDB(t)
+	db, _ := CreateTestDB(t)
 	tx := db.Begin(true)
 	bucket, err := tx.CreateBucket([]byte("test"))
 	require.NoError(t, err)
@@ -31,7 +32,7 @@ func TestTxRollbackCreateBucket(t *testing.T) {
 }
 
 func TestTxRollbackMultiInserts(t *testing.T) {
-	db, _ := createTestDB(t)
+	db, _ := CreateTestDB(t)
 	tx := db.Begin(true)
 	bucket, err := tx.CreateBucket([]byte("test"))
 	require.NoError(t, err)
@@ -68,7 +69,7 @@ func TestTxRollbackMultiInserts(t *testing.T) {
 }
 
 func TestTxIsolation(t *testing.T) {
-	db, _ := createTestDB(t)
+	db, _ := CreateTestDB(t)
 
 	// Insert initial key-value pair
 	err := db.Update(func(tx *Tx) error {
@@ -132,7 +133,7 @@ func TestTxIsolation(t *testing.T) {
 }
 
 func TestTxConcurrencyIsolation(t *testing.T) {
-	db, _ := createTestDB(t)
+	db, _ := CreateTestDB(t)
 
 	// Set up initial data
 	err := db.Update(func(tx *Tx) error {
@@ -231,4 +232,32 @@ func TestTxConcurrencyIsolation(t *testing.T) {
 		return nil
 	})
 	require.NoError(t, err)
+}
+
+func TestTxRollbackReleasesCreateBucketAllocatedPages(t *testing.T) {
+	db, _ := CreateTestDB(t)
+	before := db.dal.freelist.availablePageN()
+
+	tx := db.Begin(true)
+	_, err := tx.CreateBucket([]byte("rollback_bucket"))
+	require.NoError(t, err)
+	tx.Rollback()
+
+	after := db.dal.freelist.availablePageN()
+	require.Equal(t, before, after)
+}
+
+func TestTxRollbackReleasesBlobAllocatedPages(t *testing.T) {
+	db, _ := CreateTestDB(t)
+	before := db.dal.freelist.availablePageN()
+
+	tx := db.Begin(true)
+	bucket, err := tx.CreateBucket([]byte("blob_rollback"))
+	require.NoError(t, err)
+	err = bucket.Put([]byte("k"), bytes.Repeat([]byte("x"), MaxValueSize+512))
+	require.NoError(t, err)
+	tx.Rollback()
+
+	after := db.dal.freelist.availablePageN()
+	require.Equal(t, before, after)
 }

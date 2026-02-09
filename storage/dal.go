@@ -65,10 +65,7 @@ func NewDal(path string, opts *Options) (*Dal, error) {
 		return nil, fmt.Errorf("could not stat dal: %v", fileStatErr)
 	}
 
-	fileSize := fileInfo.Size()
-	if fileSize < minFileSize {
-		fileSize = minFileSize
-	}
+	fileSize := max(fileInfo.Size(), minFileSize)
 
 	tlog := NewTxLog(opts.TxLogPath, 0600)
 	logger.Info("open database file", "path", path, "size", fileSize,
@@ -79,7 +76,7 @@ func NewDal(path string, opts *Options) (*Dal, error) {
 		file:           file,
 		meta:           NewMeta(opts.PageSize),
 		osPageSize:     uint64(os.Getpagesize()),
-		freelist:       NewFreelist(BTreePageSize, 0),
+		freelist:       NewFreelist(opts.PageSize, 0),
 		MinFillPercent: 0.45,
 		MaxFillPercent: 0.95,
 		txLog:          tlog,
@@ -116,12 +113,20 @@ func NewDal(path string, opts *Options) (*Dal, error) {
 			return nil, fmt.Errorf("could not read freelist: %v", readFreelistErr)
 		}
 		dal.freelist = freelist
+		if dal.freelist.dirty {
+			writeFreelistErr := WriteFreelist(dal, dal.freelist)
+			if writeFreelistErr != nil {
+				_ = dal.file.Close()
+				return nil, fmt.Errorf("could not repair freelist: %v", writeFreelistErr)
+			}
+		}
 	} else {
 		writeMetaErr := WriteMeta(dal, dal.meta)
 		if writeMetaErr != nil {
 			_ = dal.file.Close()
 			return nil, fmt.Errorf("could not write meta: %v", writeMetaErr)
 		}
+		dal.freelist.dirty = true
 		writeFreelistErr := WriteFreelist(dal, dal.freelist)
 		if writeFreelistErr != nil {
 			_ = dal.file.Close()
@@ -183,8 +188,17 @@ func (dal *Dal) AllocatePage() (*Page, error) {
 }
 
 func (dal *Dal) ReleasePage(pageNumber uint64) error {
-	if pageNumber == 0 {
-		return fmt.Errorf("cannot release pageNum 0")
+	if pageNumber == metaPageNumber || pageNumber == dal.meta.freelistPageNumber {
+		return fmt.Errorf("cannot release reserved page %d", pageNumber)
+	}
+	if pageNumber >= dal.maxPages {
+		return fmt.Errorf("page number %d is greater than max page number %d", pageNumber, dal.maxPages)
+	}
+	if pageNumber > dal.freelist.currentPage {
+		return fmt.Errorf("cannot release non-allocated page %d (current page %d)", pageNumber, dal.freelist.currentPage)
+	}
+	if dal.freelist.isFreelistStoragePage(pageNumber) {
+		return fmt.Errorf("cannot release active freelist page %d", pageNumber)
 	}
 	dal.freelist.ReleasePage(pageNumber)
 	return nil
@@ -288,12 +302,12 @@ func (dal *Dal) setNode(node *BNode) (*Page, error) {
 	return page, dal.SetPage(page)
 }
 
-func (dal *Dal) deletePage(pageNumber uint64) {
-	err := dal.ReleasePage(pageNumber)
-	if err != nil {
-		return
-	}
-}
+// func (dal *Dal) deletePage(pageNumber uint64) {
+// 	err := dal.ReleasePage(pageNumber)
+// 	if err != nil {
+// 		return
+// 	}
+// }
 
 func (dal *Dal) maxThreshold() float32 {
 	return dal.MaxFillPercent * float32(dal.meta.pageSize)

@@ -149,7 +149,7 @@ func (bucket *Bucket) Put(key, value []byte) error {
 	}
 
 	// If the key already exists, update the value
-	if nodeToInsertIn.items != nil && insertionIndex < len(nodeToInsertIn.items) && bytes.Compare(nodeToInsertIn.items[insertionIndex].Key, key) == 0 {
+	if nodeToInsertIn.items != nil && insertionIndex < len(nodeToInsertIn.items) && bytes.Equal(nodeToInsertIn.items[insertionIndex].Key, key) {
 		nodeToInsertIn.items[insertionIndex] = &item
 		keyExists = true
 	} else {

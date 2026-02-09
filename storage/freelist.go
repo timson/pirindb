@@ -39,6 +39,7 @@ type Freelist struct {
 	currentPage         uint64
 	maxPages            uint64
 	releasedPages       []uint64
+	releasedPagesSet    map[uint64]struct{}
 	freelistPages       []uint64
 	entriesPerFirstPage int
 	entriesPerExtraPage int
@@ -51,6 +52,7 @@ func NewFreelist(pageSize uint64, maxPages uint64) *Freelist {
 		currentPage:         rootPageNumber,
 		maxPages:            maxPages,
 		releasedPages:       make([]uint64, 0),
+		releasedPagesSet:    make(map[uint64]struct{}),
 		freelistPages:       make([]uint64, 0),
 		entriesPerFirstPage: entriesPerFirstPage,
 		entriesPerExtraPage: entriesPerExtraPage,
@@ -58,25 +60,138 @@ func NewFreelist(pageSize uint64, maxPages uint64) *Freelist {
 	}
 }
 
+func (f *Freelist) availablePageN() int {
+	if f.maxPages == 0 || f.currentPage >= f.maxPages-1 {
+		return len(f.releasedPages)
+	}
+	return int((f.maxPages-1)-f.currentPage) + len(f.releasedPages)
+}
+
+func (f *Freelist) ensureReleasedPagesSet() {
+	if f.releasedPagesSet != nil {
+		return
+	}
+	f.rebuildReleasedPagesSet()
+}
+
+func (f *Freelist) rebuildReleasedPagesSet() {
+	f.releasedPagesSet = make(map[uint64]struct{}, len(f.releasedPages))
+	for _, pageNum := range f.releasedPages {
+		f.releasedPagesSet[pageNum] = struct{}{}
+	}
+}
+
+func (f *Freelist) isFreelistStoragePage(pageNum uint64) bool {
+	for _, freelistPageNum := range f.freelistPages {
+		if pageNum == freelistPageNum {
+			return true
+		}
+	}
+	return false
+}
+
+func (f *Freelist) popReleasedPage() (uint64, bool) {
+	if len(f.releasedPages) == 0 {
+		return 0, false
+	}
+	f.ensureReleasedPagesSet()
+	lastIdx := len(f.releasedPages) - 1
+	pageNum := f.releasedPages[lastIdx]
+	f.releasedPages = f.releasedPages[:lastIdx]
+	delete(f.releasedPagesSet, pageNum)
+	return pageNum, true
+}
+
+func (f *Freelist) addReleasedPage(pageNum uint64) bool {
+	f.ensureReleasedPagesSet()
+	if _, exists := f.releasedPagesSet[pageNum]; exists {
+		return false
+	}
+	f.releasedPages = append(f.releasedPages, pageNum)
+	f.releasedPagesSet[pageNum] = struct{}{}
+	return true
+}
+
+func (f *Freelist) sanitizeReleasedPages() int {
+	freelistPageSet := make(map[uint64]struct{}, len(f.freelistPages))
+	for _, pageNum := range f.freelistPages {
+		freelistPageSet[pageNum] = struct{}{}
+	}
+
+	cleaned := f.releasedPages[:0]
+	dedup := make(map[uint64]struct{}, len(f.releasedPages))
+	removed := 0
+
+	for _, pageNum := range f.releasedPages {
+		if pageNum == metaPageNumber {
+			removed++
+			continue
+		}
+		if pageNum >= f.maxPages {
+			removed++
+			continue
+		}
+		if pageNum > f.currentPage {
+			removed++
+			continue
+		}
+		if _, exists := freelistPageSet[pageNum]; exists {
+			removed++
+			continue
+		}
+		if _, exists := dedup[pageNum]; exists {
+			removed++
+			continue
+		}
+		dedup[pageNum] = struct{}{}
+		cleaned = append(cleaned, pageNum)
+	}
+
+	f.releasedPages = cleaned
+	f.releasedPagesSet = dedup
+	if removed > 0 {
+		f.dirty = true
+	}
+	return removed
+}
+
 func (f *Freelist) GetNextPageNumber() (uint64, error) {
-	f.dirty = true
-	if len(f.releasedPages) > 0 {
-		pageNum := f.releasedPages[len(f.releasedPages)-1]
-		f.releasedPages = f.releasedPages[:len(f.releasedPages)-1]
+	f.ensureReleasedPagesSet()
+
+	for len(f.releasedPages) > 0 {
+		pageNum, _ := f.popReleasedPage()
+		if pageNum == metaPageNumber || pageNum >= f.maxPages || pageNum > f.currentPage || f.isFreelistStoragePage(pageNum) {
+			logger.Warn("freelist dropped invalid page",
+				"page_num", pageNum,
+				"current_page", f.currentPage,
+				"max_pages", f.maxPages)
+			f.dirty = true
+			continue
+		}
+
+		f.dirty = true
 		return pageNum, nil
 	}
-	if f.currentPage >= (f.maxPages - 1) {
+
+	if f.maxPages == 0 || f.currentPage >= (f.maxPages-1) {
 		return 0, ErrNoPagesLeft
 	}
+	if f.currentPage < rootPageNumber {
+		f.currentPage = rootPageNumber
+	}
+
 	f.currentPage += 1
+	f.dirty = true
 	logger.Debug("freelist GetNextPage", "pageNum", f.currentPage)
 	return f.currentPage, nil
 }
 
 func (f *Freelist) ReleasePage(pageNum uint64) {
+	if !f.addReleasedPage(pageNum) {
+		return
+	}
 	f.dirty = true
 	logger.Debug("releasing pageNum", "pageNumber", pageNum)
-	f.releasedPages = append(f.releasedPages, pageNum)
 }
 
 func calculatePagesNeeded(numEntries, entriesPerFirstPage, entriesPerExtraPage int) int {
@@ -86,22 +201,30 @@ func calculatePagesNeeded(numEntries, entriesPerFirstPage, entriesPerExtraPage i
 	return 1 + (numEntries-entriesPerFirstPage+entriesPerExtraPage-1)/entriesPerExtraPage
 }
 
-// Reads entries from a freelist pageNum
-func readEntriesFromPage(page *Page, startPos int, maxEntries int, entries *[]uint64, remaining *uint64) uint64 {
+// Reads entries from a freelist page.
+func readEntriesFromPage(page *Page, startPos int, maxEntries int, entries *[]uint64, totalEntries *uint64) uint64 {
 	pos := startPos
-	for i := 0; i < maxEntries && uint64(len(*entries)) < *remaining; i++ {
-		if pos+UInt64Size <= len(page.Data) {
-			*entries = append(*entries, binary.LittleEndian.Uint64(page.Data[pos:]))
-			pos += UInt64Size
+	for i := 0; i < maxEntries && uint64(len(*entries)) < *totalEntries; i++ {
+		if pos+UInt64Size > len(page.Data) {
+			break
 		}
+		*entries = append(*entries, binary.LittleEndian.Uint64(page.Data[pos:]))
+		pos += UInt64Size
 	}
-	return binary.LittleEndian.Uint64(page.Data[1:]) // Return next pageNum number
+
+	if freelistNextPageOffset+UInt64Size > len(page.Data) {
+		return 0
+	}
+	return binary.LittleEndian.Uint64(page.Data[freelistNextPageOffset:])
 }
 
 func writeEntriesToPage(page *Page, startPos int, entries []uint64, startIdx int, maxEntries int) int {
 	pos := startPos
 	entriesWritten := 0
 	for i := 0; i < maxEntries && startIdx+i < len(entries); i++ {
+		if pos+UInt64Size > len(page.Data) {
+			break
+		}
 		binary.LittleEndian.PutUint64(page.Data[pos:], entries[startIdx+i])
 		pos += UInt64Size
 		entriesWritten++
@@ -109,39 +232,74 @@ func writeEntriesToPage(page *Page, startPos int, entries []uint64, startIdx int
 	return entriesWritten
 }
 
+func isZeroPage(data []byte) bool {
+	for _, b := range data {
+		if b != 0 {
+			return false
+		}
+	}
+	return true
+}
+
 func ReadFreelist(dal *Dal) (*Freelist, error) {
-	freelist := NewFreelist(dal.meta.pageSize, 0)
+	freelist := NewFreelist(dal.meta.pageSize, dal.maxPages)
 	freelist.freelistPages = []uint64{dal.meta.freelistPageNumber}
 
-	// Read the primary freelist pageNum
 	firstPage, err := dal.GetPage(dal.meta.freelistPageNumber)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get freelist pageNum: %w", err)
 	}
 
-	// Read metadata, skip next pageNum pointer for now
+	if firstPage.Data[freelistPageTypeOffset] != FreeListPage {
+		if isZeroPage(firstPage.Data) {
+			// Backward compatibility with databases created before freelist bootstrap fix.
+			freelist.currentPage = rootPageNumber
+			freelist.maxPages = dal.maxPages
+			freelist.dirty = true
+			logger.Warn("freelist page is empty, rebuilding freelist metadata")
+			return freelist, nil
+		}
+		return nil, fmt.Errorf("%w: invalid first page type %d", ErrCorruptedFreelist, firstPage.Data[freelistPageTypeOffset])
+	}
+
 	freelist.currentPage = binary.LittleEndian.Uint64(firstPage.Data[freelistCurrentPageOffset:])
-	freelist.maxPages = binary.LittleEndian.Uint64(firstPage.Data[freelistMaxPagesOffset:])
-	numPages := binary.LittleEndian.Uint64(firstPage.Data[freelistNumPagesOffset:])
+	storedMaxPages := binary.LittleEndian.Uint64(firstPage.Data[freelistMaxPagesOffset:])
+	numReleasedPages := binary.LittleEndian.Uint64(firstPage.Data[freelistNumPagesOffset:])
+	freelist.maxPages = dal.maxPages
+
+	if freelist.currentPage < rootPageNumber || freelist.currentPage >= dal.maxPages {
+		return nil, fmt.Errorf("%w: invalid current page %d (max pages %d)", ErrCorruptedFreelist, freelist.currentPage, dal.maxPages)
+	}
+	if storedMaxPages != dal.maxPages {
+		freelist.dirty = true
+	}
 
 	freelist.releasedPages = make([]uint64, 0)
-
-	// Read entries from first pageNum and get next pageNum number
 	nextPageNum := readEntriesFromPage(
 		firstPage,
 		freelistFirstPageEntriesOffset,
 		freelist.entriesPerFirstPage,
 		&freelist.releasedPages,
-		&numPages,
+		&numReleasedPages,
 	)
 
-	// Read additional pages if needed
-	for nextPageNum != 0 && uint64(len(freelist.releasedPages)) < numPages {
+	visitedPages := map[uint64]struct{}{dal.meta.freelistPageNumber: {}}
+	for nextPageNum != 0 {
+		if nextPageNum >= dal.maxPages {
+			return nil, fmt.Errorf("%w: next freelist page %d is out of bounds", ErrCorruptedFreelist, nextPageNum)
+		}
+		if _, exists := visitedPages[nextPageNum]; exists {
+			return nil, fmt.Errorf("%w: freelist page cycle at %d", ErrCorruptedFreelist, nextPageNum)
+		}
+		visitedPages[nextPageNum] = struct{}{}
 		freelist.freelistPages = append(freelist.freelistPages, nextPageNum)
 
 		page, getPageErr := dal.GetPage(nextPageNum)
 		if getPageErr != nil {
 			return nil, fmt.Errorf("failed to read freelist pageNum %d: %w", nextPageNum, getPageErr)
+		}
+		if page.Data[freelistPageTypeOffset] != FreeListPage {
+			return nil, fmt.Errorf("%w: page %d has type %d", ErrCorruptedFreelist, nextPageNum, page.Data[freelistPageTypeOffset])
 		}
 
 		nextPageNum = readEntriesFromPage(
@@ -149,8 +307,22 @@ func ReadFreelist(dal *Dal) (*Freelist, error) {
 			freelistExtraPageEntriesOffset,
 			freelist.entriesPerExtraPage,
 			&freelist.releasedPages,
-			&numPages,
+			&numReleasedPages,
 		)
+	}
+
+	if uint64(len(freelist.releasedPages)) != numReleasedPages {
+		return nil, fmt.Errorf(
+			"%w: expected %d released pages, read %d",
+			ErrCorruptedFreelist,
+			numReleasedPages,
+			len(freelist.releasedPages),
+		)
+	}
+
+	removedEntries := freelist.sanitizeReleasedPages()
+	if removedEntries > 0 {
+		logger.Warn("freelist sanitized invalid released pages", "removed", removedEntries)
 	}
 
 	logger.Debug("read freelist",
@@ -162,46 +334,64 @@ func ReadFreelist(dal *Dal) (*Freelist, error) {
 }
 
 func WriteFreelist(dal *Dal, freelist *Freelist) error {
+	if freelist == nil {
+		return fmt.Errorf("freelist is nil")
+	}
+
+	if freelist.maxPages != dal.maxPages {
+		freelist.maxPages = dal.maxPages
+		freelist.dirty = true
+	}
+	if freelist.currentPage < rootPageNumber {
+		freelist.currentPage = rootPageNumber
+		freelist.dirty = true
+	}
+
+	if len(freelist.freelistPages) == 0 {
+		freelist.freelistPages = []uint64{dal.meta.freelistPageNumber}
+		freelist.dirty = true
+	} else if freelist.freelistPages[0] != dal.meta.freelistPageNumber {
+		freelist.freelistPages[0] = dal.meta.freelistPageNumber
+		freelist.dirty = true
+	}
+
+	_ = freelist.sanitizeReleasedPages()
+
 	if !freelist.dirty {
 		return nil
 	}
+
 	pagesNeeded := calculatePagesNeeded(
 		len(freelist.releasedPages),
 		freelist.entriesPerFirstPage,
 		freelist.entriesPerExtraPage,
 	)
-
-	// Initialize and ensure first pageNum is the meta.freelistPageNumber
-	if len(freelist.freelistPages) == 0 {
-		freelist.freelistPages = []uint64{dal.meta.freelistPageNumber}
-	} else if freelist.freelistPages[0] != dal.meta.freelistPageNumber {
-		freelist.freelistPages[0] = dal.meta.freelistPageNumber
-	}
-
 	managePageErr := manageFreelistPageAllocation(dal, freelist, pagesNeeded)
 	if managePageErr != nil {
 		return managePageErr
 	}
 
-	// Write the first pageNum with header
+	pagesToWrite := len(freelist.freelistPages)
+	if pagesToWrite == 0 {
+		return fmt.Errorf("%w: freelist page chain is empty", ErrCorruptedFreelist)
+	}
+
 	firstPage, getFirstPageErr := dal.GetPage(dal.meta.freelistPageNumber)
 	if getFirstPageErr != nil {
 		return fmt.Errorf("failed to get first freelist pageNum: %w", getFirstPageErr)
 	}
+	firstPage.Clear()
 
-	// Set next pageNum pointer
 	nextPageNum := uint64(0)
-	if pagesNeeded > 1 {
+	if pagesToWrite > 1 {
 		nextPageNum = freelist.freelistPages[1]
 	}
-
 	firstPage.Data[freelistPageTypeOffset] = FreeListPage
 	binary.LittleEndian.PutUint64(firstPage.Data[freelistNextPageOffset:], nextPageNum)
 	binary.LittleEndian.PutUint64(firstPage.Data[freelistCurrentPageOffset:], freelist.currentPage)
 	binary.LittleEndian.PutUint64(firstPage.Data[freelistMaxPagesOffset:], freelist.maxPages)
 	binary.LittleEndian.PutUint64(firstPage.Data[freelistNumPagesOffset:], uint64(len(freelist.releasedPages)))
 
-	// Write entries to first pageNum
 	entriesWritten := writeEntriesToPage(
 		firstPage,
 		freelistFirstPageEntriesOffset,
@@ -213,23 +403,22 @@ func WriteFreelist(dal *Dal, freelist *Freelist) error {
 		return err
 	}
 
-	// Write additional pages if needed
 	entriesIdx := entriesWritten
-	for i := 1; i < pagesNeeded; i++ {
-		page, getPageErr := dal.GetPage(freelist.freelistPages[i])
+	for i := 1; i < pagesToWrite; i++ {
+		pageNum := freelist.freelistPages[i]
+		page, getPageErr := dal.GetPage(pageNum)
 		if getPageErr != nil {
-			return fmt.Errorf("failed to get freelist pageNum %d: %w", i, getPageErr)
+			return fmt.Errorf("failed to get freelist pageNum %d: %w", pageNum, getPageErr)
 		}
+		page.Clear()
 
-		// Set next pageNum pointer
 		nextPageNum = uint64(0)
-		if i < pagesNeeded-1 {
+		if i < pagesToWrite-1 {
 			nextPageNum = freelist.freelistPages[i+1]
 		}
 		page.Data[freelistPageTypeOffset] = FreeListPage
 		binary.LittleEndian.PutUint64(page.Data[freelistNextPageOffset:], nextPageNum)
 
-		// Write entries
 		written := writeEntriesToPage(
 			page,
 			freelistExtraPageEntriesOffset,
@@ -244,10 +433,14 @@ func WriteFreelist(dal *Dal, freelist *Freelist) error {
 		}
 	}
 
+	if entriesIdx < len(freelist.releasedPages) {
+		return fmt.Errorf("%w: freelist entry overflow, wrote %d of %d entries", ErrCorruptedFreelist, entriesIdx, len(freelist.releasedPages))
+	}
+
 	logger.Debug("write freelist",
 		"currentPage", freelist.currentPage,
 		"releasedPages", len(freelist.releasedPages),
-		"pagesUsed", pagesNeeded)
+		"pagesUsed", pagesToWrite)
 
 	if !dal.txLog.active {
 		freelist.dirty = false
@@ -256,33 +449,73 @@ func WriteFreelist(dal *Dal, freelist *Freelist) error {
 }
 
 func calculateFreelistCapacity(pageSize int) (int, int) {
-	entriesPerFirstPage := ((pageSize - freelistFirstPageEntriesOffset) / UInt64Size) - 1
-	entriesPerExtraPage := ((pageSize - freelistExtraPageEntriesOffset) / UInt64Size) - 1
+	entriesPerFirstPage := (pageSize - freelistFirstPageEntriesOffset) / UInt64Size
+	entriesPerExtraPage := (pageSize - freelistExtraPageEntriesOffset) / UInt64Size
 	return entriesPerFirstPage, entriesPerExtraPage
 }
 
+func allocateFreelistPage(dal *Dal, freelist *Freelist) (uint64, error) {
+	// Prefer extending currentPage to avoid unstable shrink/grow cycles.
+	if freelist.currentPage < freelist.maxPages-1 {
+		freelist.currentPage++
+		return freelist.currentPage, nil
+	}
+
+	for len(freelist.releasedPages) > 0 {
+		pageNum, _ := freelist.popReleasedPage()
+		if pageNum == metaPageNumber || pageNum == dal.meta.freelistPageNumber {
+			continue
+		}
+		if pageNum >= freelist.maxPages || pageNum > freelist.currentPage {
+			continue
+		}
+		if freelist.isFreelistStoragePage(pageNum) {
+			continue
+		}
+		return pageNum, nil
+	}
+
+	return 0, ErrNoPagesLeft
+}
+
 func manageFreelistPageAllocation(dal *Dal, freelist *Freelist, pagesNeeded int) error {
-	// Manage pageNum allocations
 	oldPageCount := len(freelist.freelistPages)
 	if pagesNeeded > oldPageCount {
-		// Need more pages - allocate them
-		for i := oldPageCount; i < pagesNeeded; i++ {
-			newPage, err := dal.AllocatePage()
+		for len(freelist.freelistPages) < pagesNeeded {
+			newPageNum, err := allocateFreelistPage(dal, freelist)
 			if err != nil {
 				return fmt.Errorf("failed to allocate freelist pageNum: %w", err)
 			}
-			freelist.freelistPages = append(freelist.freelistPages, newPage.PageNumber)
+			freelist.freelistPages = append(freelist.freelistPages, newPageNum)
+			freelist.dirty = true
 		}
-	} else if pagesNeeded < oldPageCount {
-		// Have excess pages - release them
-		for i := pagesNeeded; i < oldPageCount; i++ {
-			logger.Debug("freelist drop own pageNum", "pageNum", freelist.freelistPages[i])
-			err := dal.ReleasePage(freelist.freelistPages[i])
-			if err != nil {
-				return err
-			}
-		}
-		freelist.freelistPages = freelist.freelistPages[:pagesNeeded]
 	}
+
+	for len(freelist.freelistPages) > pagesNeeded {
+		prospectivePages := len(freelist.freelistPages) - 1
+		prospectiveEntries := len(freelist.releasedPages) + 1
+		prospectiveNeeded := calculatePagesNeeded(
+			prospectiveEntries,
+			freelist.entriesPerFirstPage,
+			freelist.entriesPerExtraPage,
+		)
+
+		// Releasing this page would immediately require another freelist page.
+		// Keep current allocation to avoid dropping pages.
+		if prospectiveNeeded > prospectivePages {
+			break
+		}
+
+		dropIdx := len(freelist.freelistPages) - 1
+		droppedPageNum := freelist.freelistPages[dropIdx]
+		freelist.freelistPages = freelist.freelistPages[:dropIdx]
+
+		logger.Debug("freelist drop own pageNum", "pageNum", droppedPageNum)
+		if err := dal.ReleasePage(droppedPageNum); err != nil {
+			return err
+		}
+		freelist.dirty = true
+	}
+
 	return nil
 }
