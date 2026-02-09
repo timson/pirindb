@@ -170,31 +170,40 @@ func (dal *Dal) expandAllocation() {
 }
 
 func (dal *Dal) AllocatePage() (*Page, error) {
-	var page *Page
-	newPageNum, err := dal.freelist.GetNextPageNumber()
-	if err != nil {
-		if errors.Is(err, ErrNoPagesLeft) {
-			logger.Debug("trying allocate new pageNum, but no pages left")
-			// if no free pages left, we should allocate new pages
-			// by expand database file and expand mapping
-			dal.expandAllocation()
-			newPageNum, err = dal.freelist.GetNextPageNumber()
-			if err != nil {
-				return nil, err
-			}
-		} else {
-			logger.Error("could not get next pageNum number", "err", err)
-			return nil, err
-		}
-	} else {
-		logger.Debug("allocating pageNum number", "page_number", newPageNum)
-	}
-	page, err = dal.GetPage(newPageNum)
+	pageNums, err := dal.AllocateConsecutivePageNumbers(1)
 	if err != nil {
 		return nil, err
 	}
-	page.Clear()
-	return page, nil
+	return &Page{
+		PageNumber: pageNums[0],
+		Data:       make([]byte, dal.meta.pageSize),
+	}, nil
+}
+
+func (dal *Dal) AllocateConsecutivePageNumbers(count int) ([]uint64, error) {
+	if count <= 0 {
+		return nil, fmt.Errorf("count must be greater than zero")
+	}
+	pageNums, err := dal.freelist.GetConsecutivePageNumbers(count)
+	for errors.Is(err, ErrNoPagesLeft) {
+		logger.Debug("trying allocate new page range, but no pages left", "count", count)
+		prevSize := dal.size
+		dal.expandAllocation()
+		if dal.size <= prevSize {
+			return nil, ErrNoPagesLeft
+		}
+		pageNums, err = dal.freelist.GetConsecutivePageNumbers(count)
+	}
+	if err != nil {
+		logger.Error("could not allocate page range", "count", count, "err", err)
+		return nil, err
+	}
+	if count == 1 {
+		logger.Debug("allocating pageNum number", "page_number", pageNums[0])
+	} else {
+		logger.Debug("allocating page range", "count", count, "start_page", pageNums[0], "end_page", pageNums[len(pageNums)-1])
+	}
+	return pageNums, nil
 }
 
 func (dal *Dal) ReleasePage(pageNumber uint64) error {
@@ -300,9 +309,9 @@ func (dal *Dal) setNode(node *BNode) (*Page, error) {
 			return nil, err
 		}
 	} else {
-		page, err = dal.GetPage(node.PageNum)
-		if err != nil {
-			return nil, err
+		page = &Page{
+			PageNumber: node.PageNum,
+			Data:       make([]byte, dal.meta.pageSize),
 		}
 	}
 	err = node.Serialize(page.Data)

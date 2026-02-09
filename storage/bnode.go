@@ -124,8 +124,7 @@ func (node *BNode) Serialize(data []byte) error {
 		bitSetVar = 1
 	}
 
-	// clear node.Data
-	copy(data, make([]byte, len(data)))
+	clear(data)
 
 	data[NodePageTypeOffset] = NodePage
 	data[NodeTypeOffset] = bitSetVar
@@ -163,15 +162,21 @@ func (node *BNode) Deserialize(data []byte) {
 	pos := NodeHeaderSize
 	numbChildren := int(binary.LittleEndian.Uint16(data[pos:]))
 	pos += UInt16Size
+	node.items = make([]*Item, numItems)
+	if isLeaf == 0 {
+		node.childNodes = make([]uint64, numbChildren)
+	} else {
+		node.childNodes = nil
+	}
 
 	if isLeaf == 0 {
-		for range numbChildren {
+		for idx := range numbChildren {
 			childNode := binary.LittleEndian.Uint64(data[pos:])
 			pos += UInt64Size
-			node.childNodes = append(node.childNodes, childNode)
+			node.childNodes[idx] = childNode
 		}
 	}
-	for range numItems {
+	for idx := range numItems {
 		keyLen := binary.LittleEndian.Uint16(data[pos:])
 		pos += UInt16Size
 		valueLen := binary.LittleEndian.Uint16(data[pos:])
@@ -185,7 +190,7 @@ func (node *BNode) Deserialize(data []byte) {
 		value := make([]byte, valueLen)
 		copy(value, data[pos:pos+int(valueLen)])
 		pos += int(valueLen)
-		node.items = append(node.items, &Item{Key: key, Value: value})
+		node.items[idx] = &Item{Key: key, Value: value}
 	}
 }
 
@@ -244,6 +249,27 @@ func (node *BNode) Find(tx *Tx, key []byte, exact bool) (int, *BNode, []int, boo
 	ancestorsIndexes := []int{0}
 	pos, foundNode, isFound := traverseBTree(tx, node, key, exact, &ancestorsIndexes)
 	return pos, foundNode, ancestorsIndexes, isFound
+}
+
+func (node *BNode) FindExact(tx *Tx, key []byte) (int, *BNode, bool) {
+	current := node
+	for {
+		pos, found := current.findKeyPosition(key)
+		if found {
+			return pos, current, true
+		}
+		if current.isLeaf() {
+			return -1, nil, false
+		}
+		if pos < 0 || pos >= len(current.childNodes) {
+			return -1, nil, false
+		}
+		nextNode, err := tx.getNode(current.childNodes[pos])
+		if err != nil {
+			return -1, nil, false
+		}
+		current = nextNode
+	}
 }
 
 func traverseBTree(tx *Tx, node *BNode, key []byte, exact bool, ancestorsIndexes *[]int) (int, *BNode, bool) {

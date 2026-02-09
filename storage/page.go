@@ -13,9 +13,7 @@ type Page struct {
 }
 
 func (p *Page) Clear() {
-	for i := range p.Data {
-		p.Data[i] = 0
-	}
+	clear(p.Data)
 }
 
 func (p *Page) GetPageType() string {

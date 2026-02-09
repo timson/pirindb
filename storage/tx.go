@@ -6,10 +6,19 @@ import (
 	"sync"
 )
 
+const (
+	readNodeCacheLimit = 16384
+	readPageCacheLimit = 16384
+	readBlobCacheLimit = 512
+)
+
 type Tx struct {
 	dirtyNodes        map[uint64]*BNode
 	dirtyPages        map[uint64]*Page
 	dirtyBuckets      map[string]*Bucket
+	readNodes         map[uint64]*BNode
+	readPages         map[uint64]*Page
+	readBlobs         map[uint64]*Blob
 	pagesToDelete     []uint64
 	allocatedPageNums []uint64
 	originalMetaRoot  uint64
@@ -25,6 +34,9 @@ func newTx(db *DB, write bool) *Tx {
 		map[uint64]*BNode{},
 		map[uint64]*Page{},
 		map[string]*Bucket{},
+		map[uint64]*BNode{},
+		map[uint64]*Page{},
+		map[uint64]*Blob{},
 		make([]uint64, 0),
 		make([]uint64, 0),
 		db.dal.meta.root,
@@ -37,12 +49,23 @@ func newTx(db *DB, write bool) *Tx {
 }
 
 func (tx *Tx) allocatePage() (*Page, error) {
-	page, err := tx.db.dal.AllocatePage()
+	pageNums, err := tx.allocatePageNumbers(1)
 	if err != nil {
 		return nil, err
 	}
-	tx.allocatedPageNums = append(tx.allocatedPageNums, page.PageNumber)
-	return page, nil
+	return &Page{
+		PageNumber: pageNums[0],
+		Data:       make([]byte, tx.db.dal.meta.pageSize),
+	}, nil
+}
+
+func (tx *Tx) allocatePageNumbers(count int) ([]uint64, error) {
+	pageNums, err := tx.db.dal.AllocateConsecutivePageNumbers(count)
+	if err != nil {
+		return nil, err
+	}
+	tx.allocatedPageNums = append(tx.allocatedPageNums, pageNums...)
+	return pageNums, nil
 }
 
 func (tx *Tx) newNode(items []*Item, childNodes []uint64) *BNode {
@@ -59,8 +82,18 @@ func (tx *Tx) getNode(page uint64) (*BNode, error) {
 	if node, ok := tx.dirtyNodes[page]; ok {
 		return node, nil
 	}
+	if !tx.write {
+		if node, ok := tx.readNodes[page]; ok {
+			return node, nil
+		}
+	}
 
 	node, err := tx.db.dal.getNode(page)
+	if err == nil && !tx.write {
+		if _, exists := tx.readNodes[page]; exists || len(tx.readNodes) < readNodeCacheLimit {
+			tx.readNodes[page] = node
+		}
+	}
 	return node, err
 }
 
@@ -76,7 +109,17 @@ func (tx *Tx) getPage(pageNum uint64) (*Page, error) {
 	if page, ok := tx.dirtyPages[pageNum]; ok {
 		return page, nil
 	}
+	if !tx.write {
+		if page, ok := tx.readPages[pageNum]; ok {
+			return page, nil
+		}
+	}
 	page, err := tx.db.dal.GetPage(pageNum)
+	if err == nil && !tx.write {
+		if _, exists := tx.readPages[pageNum]; exists || len(tx.readPages) < readPageCacheLimit {
+			tx.readPages[pageNum] = page
+		}
+	}
 	return page, err
 }
 
@@ -104,6 +147,7 @@ func cloneFreelist(src *Freelist) *Freelist {
 	}
 	clone := *src
 	clone.releasedPages = append([]uint64(nil), src.releasedPages...)
+	clone.releasedPagesDirty = src.releasedPagesDirty
 	clone.freelistPages = append([]uint64(nil), src.freelistPages...)
 	if src.releasedPagesSet != nil {
 		clone.releasedPagesSet = make(map[uint64]struct{}, len(src.releasedPagesSet))
@@ -112,6 +156,30 @@ func cloneFreelist(src *Freelist) *Freelist {
 		}
 	} else {
 		clone.releasedPagesSet = nil
+	}
+	if src.releasedPageIndex != nil {
+		clone.releasedPageIndex = make(map[uint64]int, len(src.releasedPageIndex))
+		for pageNum, idx := range src.releasedPageIndex {
+			clone.releasedPageIndex[pageNum] = idx
+		}
+	} else {
+		clone.releasedPageIndex = nil
+	}
+	if src.releasedExtents != nil {
+		clone.releasedExtents = append([]pageExtent(nil), src.releasedExtents...)
+	} else {
+		clone.releasedExtents = nil
+	}
+	clone.releasedExtentsDirty = src.releasedExtentsDirty
+	if src.persistedState != nil {
+		clone.persistedState = &freelistPersistedState{
+			currentPage:   src.persistedState.currentPage,
+			maxPages:      src.persistedState.maxPages,
+			releasedPages: append([]uint64(nil), src.persistedState.releasedPages...),
+			freelistPages: append([]uint64(nil), src.persistedState.freelistPages...),
+		}
+	} else {
+		clone.persistedState = nil
 	}
 	return &clone
 }
@@ -125,6 +193,9 @@ func (tx *Tx) Rollback() {
 			tx.db.lock.RUnlock()
 			tx.db.TxN.Add(-1)
 		})
+		tx.readNodes = nil
+		tx.readPages = nil
+		tx.readBlobs = nil
 		tx.closed = true
 		return
 	}
@@ -140,6 +211,9 @@ func (tx *Tx) Rollback() {
 	tx.dirtyNodes = nil
 	tx.dirtyPages = nil
 	tx.dirtyBuckets = nil
+	tx.readNodes = nil
+	tx.readPages = nil
+	tx.readBlobs = nil
 	tx.pagesToDelete = nil
 	tx.releaseAllocatedPages()
 }
@@ -168,6 +242,9 @@ func (tx *Tx) Commit() (err error) {
 		tx.dirtyNodes = nil
 		tx.dirtyPages = nil
 		tx.dirtyBuckets = nil
+		tx.readNodes = nil
+		tx.readPages = nil
+		tx.readBlobs = nil
 		tx.pagesToDelete = nil
 		tx.allocatedPageNums = nil
 		tx.closed = true

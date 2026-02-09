@@ -162,7 +162,7 @@ func BenchmarkBucketOperations(b *testing.B) {
 	// Measure Put Speed
 	b.Run("Put", func(b *testing.B) {
 		err = db.Update(func(tx *Tx) error {
-			bucket, _ := tx.CreateBucket([]byte("foo"))
+			bucket, _ := tx.CreateBucketIfNotExists([]byte("foo"))
 			start := time.Now()
 			for i := range numEntries {
 				err = bucket.Put(keys[i], values[i])

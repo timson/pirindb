@@ -51,7 +51,7 @@ func (bucket *Bucket) Get(key []byte) ([]byte, bool) {
 	if err != nil {
 		return nil, false
 	}
-	pos, foundNode, _, found := node.Find(bucket.tx, key, true)
+	pos, foundNode, found := node.FindExact(bucket.tx, key)
 	if !found {
 		return nil, false
 	}
