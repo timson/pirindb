@@ -37,8 +37,9 @@ func TestNewBlob(t *testing.T) {
 	require.True(t, reflect.DeepEqual(existingBlob.data, blob.data))
 
 	// Node we want to delete blob and check if pages are release
-	_, err = DeleteBlob(tx, pageNum)
+	deletedLen, err := DeleteBlob(tx, pageNum)
 	require.NoError(t, err)
+	require.Equal(t, len(data), deletedLen)
 	err = tx.Commit()
 	require.NoError(t, err)
 

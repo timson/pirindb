@@ -47,19 +47,26 @@ func (item *Item) setValue(tx *Tx) error {
 		item.Value[0] = ValueBlob
 		binary.LittleEndian.PutUint64(item.Value[1:], pageNum)
 	} else {
-		item.Value = append(item.Value, 0)
-		copy(item.Value[1:], item.Value)
-		item.Value[0] = ValueSimple
+		encoded := make([]byte, 1+len(item.Value))
+		encoded[0] = ValueSimple
+		copy(encoded[1:], item.Value)
+		item.Value = encoded
 	}
 
 	return nil
 }
 
 func (item *Item) getValue(tx *Tx) ([]byte, error) {
+	if len(item.Value) == 0 {
+		return nil, ErrUnknownItemType
+	}
 	switch item.Value[0] {
 	case ValueSimple:
 		return item.Value[1:], nil
 	case ValueBlob:
+		if len(item.Value) < 1+UInt64Size {
+			return nil, ErrUnknownItemType
+		}
 		pageNum := binary.LittleEndian.Uint64(item.Value[1:])
 		blob, err := GetBlob(tx, pageNum)
 		if err != nil {
@@ -72,10 +79,17 @@ func (item *Item) getValue(tx *Tx) ([]byte, error) {
 
 func (item *Item) deleteValue(tx *Tx) (int, bool, error) {
 	var err error
-	dataLen := len(item.Value)
+	if len(item.Value) == 0 {
+		return 0, false, ErrUnknownItemType
+	}
+
+	dataLen := len(item.Value) - 1
 	blob := false
 	if item.Value[0] == ValueBlob {
 		blob = true
+		if len(item.Value) < 1+UInt64Size {
+			return 0, false, ErrUnknownItemType
+		}
 		pageNum := binary.LittleEndian.Uint64(item.Value[1:])
 		dataLen, err = DeleteBlob(tx, pageNum)
 		if err != nil {

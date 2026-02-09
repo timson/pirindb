@@ -3,6 +3,7 @@ package storage
 import (
 	"fmt"
 	"github.com/stretchr/testify/require"
+	"os"
 	"reflect"
 	"testing"
 )
@@ -59,4 +60,30 @@ func Test_Recovery_AfterSimulatedCrash(t *testing.T) {
 	db = OpenTestDB(t, filename, DefaultOptions().WithRecovery(true))
 	err = checkFunc(db)
 	require.NoError(t, err)
+}
+
+func TestTxLogRecoverRejectsOffsetPageMismatch(t *testing.T) {
+	logPath := TempFileName(".tlog")
+	txLog := NewTxLog(logPath, 0600)
+	require.NotNil(t, txLog.file)
+	t.Cleanup(func() {
+		_ = txLog.file.Close()
+		_ = os.Remove(logPath)
+	})
+
+	page := &Page{
+		PageNumber: 5,
+		Data:       make([]byte, BTreePageSize),
+	}
+
+	err := txLog.With(func() error {
+		// Offset points to page 4, while PageNumber is 5.
+		return txLog.writePage(uint64(4*BTreePageSize), page)
+	})
+	require.NoError(t, err)
+
+	err = txLog.Recover(func(offset uint64, page *Page) error {
+		return nil
+	})
+	require.ErrorContains(t, err, "offset/page mismatch")
 }

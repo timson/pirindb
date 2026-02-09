@@ -16,6 +16,13 @@ type Cursor struct {
 	stack      []cursorFrame
 }
 
+func (cursor *Cursor) reset() {
+	cursor.node = nil
+	cursor.itemIndex = 0
+	cursor.childIndex = 0
+	cursor.stack = cursor.stack[:0]
+}
+
 // stackPop removes and returns the last item from the stack.
 // If the stack is empty, it returns false.
 func stackPop(cursorStack *[]cursorFrame) (cursorFrame, bool) {
@@ -83,6 +90,9 @@ func traverseToFirstItem(tx *Tx, node *BNode, stack *[]cursorFrame) (*Item, *BNo
 // traverseToItem recursively finds the given item in the B-tree
 // It also tracks the traversal path using a stack.
 func traverseToItem(tx *Tx, node *BNode, key []byte, exact bool, stack *[]cursorFrame) (int, *BNode, bool) {
+	if node == nil {
+		return -1, nil, false
+	}
 	pos, isFound := node.findKeyPosition(key)
 	if isFound {
 		return pos, node, isFound
@@ -94,6 +104,9 @@ func traverseToItem(tx *Tx, node *BNode, key []byte, exact bool, stack *[]cursor
 		return pos, node, true
 	}
 	*stack = append(*stack, cursorFrame{pageNum: node.PageNum, children: node.childNodes, childIndex: pos, itemIndex: pos})
+	if pos < 0 || pos >= len(node.childNodes) {
+		return -1, nil, false
+	}
 	child, err := tx.getNode(node.childNodes[pos])
 	if err != nil {
 		return -1, nil, false
@@ -102,50 +115,115 @@ func traverseToItem(tx *Tx, node *BNode, key []byte, exact bool, stack *[]cursor
 }
 
 func (cursor *Cursor) First() (key []byte, value []byte) {
-	root, _ := cursor.tx.getNode(cursor.bucket.root)
-	var pages []uint64
-	traverse(cursor.tx, root, &pages)
+	cursor.reset()
+	if cursor.tx == nil || cursor.bucket == nil || cursor.bucket.root == 0 {
+		return nil, nil
+	}
+	root, err := cursor.tx.getNode(cursor.bucket.root)
+	if err != nil {
+		return nil, nil
+	}
 	item, node, err := traverseToFirstItem(cursor.tx, root, &cursor.stack)
 	if err != nil {
 		return nil, nil
 	}
 	cursor.node = node
-	v, _ := item.getValue(cursor.tx)
+	cursor.itemIndex = 0
+	cursor.childIndex = 0
+	v, getErr := item.getValue(cursor.tx)
+	if getErr != nil {
+		return nil, nil
+	}
 	return item.Key, v
 }
 
 func (cursor *Cursor) Last() (key []byte, value []byte) {
-	root, _ := cursor.tx.getNode(cursor.bucket.root)
+	cursor.reset()
+	if cursor.tx == nil || cursor.bucket == nil || cursor.bucket.root == 0 {
+		return nil, nil
+	}
+	root, err := cursor.tx.getNode(cursor.bucket.root)
+	if err != nil {
+		return nil, nil
+	}
 	item, node, err := traverseToLastItem(cursor.tx, root, &cursor.stack)
 	if err != nil {
 		return nil, nil
 	}
 	cursor.node = node
 	cursor.itemIndex = len(cursor.node.items) - 1
-	v, _ := item.getValue(cursor.tx)
+	cursor.childIndex = len(cursor.node.childNodes)
+	v, getErr := item.getValue(cursor.tx)
+	if getErr != nil {
+		return nil, nil
+	}
 	return item.Key, v
 }
 
 func (cursor *Cursor) Seek(key []byte) ([]byte, []byte) {
-	root, _ := cursor.tx.getNode(cursor.bucket.root)
-	pos, foundNode, isFound := traverseToItem(cursor.tx, root, key, false, &cursor.stack)
-	if !isFound {
+	cursor.reset()
+	if cursor.tx == nil || cursor.bucket == nil || cursor.bucket.root == 0 {
 		return nil, nil
 	}
+	root, err := cursor.tx.getNode(cursor.bucket.root)
+	if err != nil {
+		return nil, nil
+	}
+	pos, foundNode, isFound := traverseToItem(cursor.tx, root, key, false, &cursor.stack)
+	if !isFound || foundNode == nil {
+		return nil, nil
+	}
+
+	// Key is greater than every key in this leaf. Walk up to the next parent separator.
+	if pos >= len(foundNode.items) {
+		for {
+			parent, ok := stackPop(&cursor.stack)
+			if !ok {
+				return nil, nil
+			}
+			parentNode, getErr := cursor.tx.getNode(parent.pageNum)
+			if getErr != nil {
+				return nil, nil
+			}
+			if parent.itemIndex < 0 || parent.itemIndex >= len(parentNode.items) {
+				continue
+			}
+			cursor.node = parentNode
+			cursor.childIndex = parent.childIndex
+			cursor.itemIndex = parent.itemIndex + 1
+			value, valueErr := parentNode.items[parent.itemIndex].getValue(cursor.tx)
+			if valueErr != nil {
+				return nil, nil
+			}
+			return parentNode.items[parent.itemIndex].Key, value
+		}
+	}
+
 	cursor.node = foundNode
 	cursor.itemIndex = pos
+	cursor.childIndex = 0
 
-	value, _ := foundNode.items[pos].getValue(cursor.tx)
+	value, valueErr := foundNode.items[pos].getValue(cursor.tx)
+	if valueErr != nil {
+		return nil, nil
+	}
 	return foundNode.items[pos].Key, value
 }
 
 func (cursor *Cursor) Next() ([]byte, []byte) {
+	if cursor.node == nil {
+		return nil, nil
+	}
+
 	// If we are in a leaf node, iterate over items
 	var err error
 	if cursor.node.isLeaf() {
 		if cursor.itemIndex < len(cursor.node.items)-1 {
 			cursor.itemIndex++
-			value, _ := cursor.node.items[cursor.itemIndex].getValue(cursor.tx)
+			value, valueErr := cursor.node.items[cursor.itemIndex].getValue(cursor.tx)
+			if valueErr != nil {
+				return nil, nil
+			}
 			return cursor.node.items[cursor.itemIndex].Key, value
 		}
 		for {
@@ -158,10 +236,16 @@ func (cursor *Cursor) Next() ([]byte, []byte) {
 				if err != nil {
 					return nil, nil
 				}
+				if parent.itemIndex < 0 || parent.itemIndex >= len(cursor.node.items) {
+					continue
+				}
 				item := cursor.node.items[parent.itemIndex]
 				cursor.childIndex = parent.childIndex
 				cursor.itemIndex = parent.itemIndex + 1
-				value, _ := item.getValue(cursor.tx)
+				value, valueErr := item.getValue(cursor.tx)
+				if valueErr != nil {
+					return nil, nil
+				}
 				return item.Key, value
 			}
 		}
@@ -185,21 +269,35 @@ func (cursor *Cursor) Next() ([]byte, []byte) {
 		itemIndex:  cursor.itemIndex,
 	})
 	// Traverse down to the first item of the new subtree
-	item, node, _ := traverseToFirstItem(cursor.tx, childNode, &cursor.stack)
+	item, node, descendErr := traverseToFirstItem(cursor.tx, childNode, &cursor.stack)
+	if descendErr != nil {
+		return nil, nil
+	}
 	cursor.node = node
 	cursor.itemIndex = 0
-	value, _ := item.getValue(cursor.tx)
+	value, valueErr := item.getValue(cursor.tx)
+	if valueErr != nil {
+		return nil, nil
+	}
 	return item.Key, value
 }
 
 func (cursor *Cursor) Prev() ([]byte, []byte) {
+	if cursor.node == nil {
+		return nil, nil
+	}
+
 	var err error
 
 	// If we are in a leaf node, iterate backward over items
 	if cursor.node.isLeaf() {
 		if cursor.itemIndex > 0 {
 			cursor.itemIndex--
-			return cursor.node.items[cursor.itemIndex].Key, cursor.node.items[cursor.itemIndex].Value
+			value, valueErr := cursor.node.items[cursor.itemIndex].getValue(cursor.tx)
+			if valueErr != nil {
+				return nil, nil
+			}
+			return cursor.node.items[cursor.itemIndex].Key, value
 		}
 
 		// Leaf node is finished, move up the stack
@@ -215,14 +313,24 @@ func (cursor *Cursor) Prev() ([]byte, []byte) {
 				if err != nil {
 					return nil, nil
 				}
+				if parent.itemIndex-1 < 0 || parent.itemIndex-1 >= len(cursor.node.items) {
+					continue
+				}
 				cursor.childIndex = parent.childIndex
 				cursor.itemIndex = parent.itemIndex - 1
-				return cursor.node.items[cursor.itemIndex].Key, cursor.node.items[cursor.itemIndex].Value
+				value, valueErr := cursor.node.items[cursor.itemIndex].getValue(cursor.tx)
+				if valueErr != nil {
+					return nil, nil
+				}
+				return cursor.node.items[cursor.itemIndex].Key, value
 			}
 		}
 	}
 
 	// If we are in an internal node, move down to the last child of the left subtree
+	if cursor.childIndex == 0 {
+		return nil, nil
+	}
 	cursor.childIndex--
 
 	childPage := cursor.node.childNodes[cursor.childIndex]
@@ -240,8 +348,15 @@ func (cursor *Cursor) Prev() ([]byte, []byte) {
 	})
 
 	// Traverse down to the last item of the new subtree
-	item, node, _ := traverseToLastItem(cursor.tx, childNode, &cursor.stack)
+	item, node, descendErr := traverseToLastItem(cursor.tx, childNode, &cursor.stack)
+	if descendErr != nil {
+		return nil, nil
+	}
 	cursor.node = node
 	cursor.itemIndex = len(cursor.node.items) - 1
-	return item.Key, item.Value
+	value, valueErr := item.getValue(cursor.tx)
+	if valueErr != nil {
+		return nil, nil
+	}
+	return item.Key, value
 }

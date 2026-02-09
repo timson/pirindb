@@ -44,6 +44,9 @@ func (bucket *Bucket) Get(key []byte) ([]byte, bool) {
 	if bucket.tx == nil {
 		return nil, false
 	}
+	if bucket.root == 0 {
+		return nil, false
+	}
 	node, err := bucket.tx.getNode(bucket.root)
 	if err != nil {
 		return nil, false
@@ -54,7 +57,10 @@ func (bucket *Bucket) Get(key []byte) ([]byte, bool) {
 	}
 
 	value := foundNode.items[pos]
-	v, _ := value.getValue(bucket.tx)
+	v, getErr := value.getValue(bucket.tx)
+	if getErr != nil {
+		return nil, false
+	}
 
 	return v, true
 }
@@ -95,7 +101,13 @@ func (bucket *Bucket) getNodes(indexes []int) ([]*BNode, error) {
 	nodes := []*BNode{root}
 	child := root
 	for i := 1; i < len(indexes); i++ {
-		child, _ = bucket.tx.getNode(child.childNodes[indexes[i]])
+		if indexes[i] < 0 || indexes[i] >= len(child.childNodes) {
+			return nil, ErrNodeNotFound
+		}
+		child, err = bucket.tx.getNode(child.childNodes[indexes[i]])
+		if err != nil {
+			return nil, err
+		}
 		nodes = append(nodes, child)
 	}
 	return nodes, nil
@@ -105,6 +117,8 @@ func (bucket *Bucket) Put(key, value []byte) error {
 	var root *BNode
 	var err error
 	var keyExists bool
+	newValueLen := len(value)
+	newIsBlob := len(value) > MaxValueSize
 
 	if bucket.tx == nil {
 		return ErrTxClosed
@@ -130,9 +144,13 @@ func (bucket *Bucket) Put(key, value []byte) error {
 	// First insert: no root exists yet. Create a root node and set it
 	if bucket.root == 0 {
 		root = bucket.tx.newNode([]*Item{&item}, []uint64{})
-		root.PageNum = 2
 		bucket.tx.setNode(root)
 		bucket.root = root.PageNum
+		bucket.itemsN++
+		bucket.bytesInUse += uint64(len(key) + newValueLen)
+		if newIsBlob {
+			bucket.blobsN++
+		}
 		return nil
 	}
 
@@ -150,8 +168,26 @@ func (bucket *Bucket) Put(key, value []byte) error {
 
 	// If the key already exists, update the value
 	if nodeToInsertIn.items != nil && insertionIndex < len(nodeToInsertIn.items) && bytes.Equal(nodeToInsertIn.items[insertionIndex].Key, key) {
+		oldValueLen, oldWasBlob, oldValueErr := nodeToInsertIn.items[insertionIndex].deleteValue(bucket.tx)
+		if oldValueErr != nil {
+			return oldValueErr
+		}
 		nodeToInsertIn.items[insertionIndex] = &item
 		keyExists = true
+
+		if newValueLen >= oldValueLen {
+			bucket.bytesInUse += uint64(newValueLen - oldValueLen)
+		} else {
+			bucket.bytesInUse -= uint64(oldValueLen - newValueLen)
+		}
+		if oldWasBlob && !newIsBlob {
+			if bucket.blobsN > 0 {
+				bucket.blobsN--
+			}
+		}
+		if !oldWasBlob && newIsBlob {
+			bucket.blobsN++
+		}
 	} else {
 		// Otherwise, insert the new item at the appropriate position
 		nodeToInsertIn.insertItemAt(&item, insertionIndex)
@@ -199,8 +235,8 @@ func (bucket *Bucket) Put(key, value []byte) error {
 
 	if !keyExists {
 		bucket.itemsN++
-		bucket.bytesInUse += uint64(len(key) + len(value))
-		if len(value) > MaxValueSize {
+		bucket.bytesInUse += uint64(len(key) + newValueLen)
+		if newIsBlob {
 			bucket.blobsN++
 		}
 	}
@@ -211,6 +247,9 @@ func (bucket *Bucket) Put(key, value []byte) error {
 func (bucket *Bucket) Remove(key []byte) error {
 	if bucket.tx == nil {
 		return ErrTxClosed
+	}
+	if bucket.root == 0 {
+		return ErrNodeNotFound
 	}
 	// Fetch the root node of the bucket
 	rootNode, err := bucket.tx.getNode(bucket.root)
@@ -272,14 +311,33 @@ func (bucket *Bucket) Remove(key []byte) error {
 	// If the root node is now empty but has children, promote the first child as the new root
 	rootNode = nodesAlongPath[0]
 	if len(rootNode.items) == 0 && len(rootNode.childNodes) > 0 {
+		oldRootPage := rootNode.PageNum
 		bucket.root = nodesAlongPath[1].PageNum
+		bucket.tx.deletePage(oldRootPage)
+		if bucket.tx.db.dal.meta.root == oldRootPage {
+			bucket.tx.db.dal.meta.root = bucket.root
+		} else {
+			_, err = bucket.tx.createOrUpdateBucket(bucket)
+			if err != nil {
+				return err
+			}
+		}
 	}
 
 	// adjust bucket stat
-	bucket.itemsN--
-	bucket.bytesInUse -= uint64(len(key) + valueLen)
+	if bucket.itemsN > 0 {
+		bucket.itemsN--
+	}
+	removedBytes := len(key) + valueLen
+	if bucket.bytesInUse >= uint64(removedBytes) {
+		bucket.bytesInUse -= uint64(removedBytes)
+	} else {
+		bucket.bytesInUse = 0
+	}
 	if wasBlob {
-		bucket.blobsN--
+		if bucket.blobsN > 0 {
+			bucket.blobsN--
+		}
 	}
 
 	return nil

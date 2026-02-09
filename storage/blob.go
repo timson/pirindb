@@ -62,10 +62,13 @@ func GetBlob(tx *Tx, startPageNum uint64) (*Blob, error) {
 	}
 
 	if startPage.Data[blobExtraPageTypeOffset] != BlobPage {
-		logger.Warn("page type is not a blob page", "type", startPage.Data[blobExtraPageTypeOffset])
+		return nil, ErrCorruptedBlob
 	}
 	pageCount := int(binary.LittleEndian.Uint32(startPage.Data[blobFirstPageTotalPagesOffset:]))
 	dataLen := int(binary.LittleEndian.Uint32(startPage.Data[blobFirstPageDataSizeOffset:]))
+	if pageCount <= 0 {
+		return nil, ErrCorruptedBlob
+	}
 
 	blob := Blob{
 		startPageNum: startPageNum,
@@ -91,7 +94,7 @@ func GetBlob(tx *Tx, startPageNum uint64) (*Blob, error) {
 			}
 			pos = 0
 			if page.Data[pos] != BlobPage {
-				logger.Warn("page type is not a blob page", "type", page.Data[pos])
+				return nil, ErrCorruptedBlob
 			}
 			pos++
 			nextPageNum = binary.LittleEndian.Uint64(page.Data[pos:])
@@ -115,8 +118,14 @@ func DeleteBlob(tx *Tx, startPageNum uint64) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	pageCount := binary.LittleEndian.Uint32(page.Data[1:])
-	dataLen := int(binary.LittleEndian.Uint32(page.Data[blobDataSizeBytes:]))
+	if page.Data[blobFirstPageTypeOffset] != BlobPage {
+		return 0, ErrCorruptedBlob
+	}
+	pageCount := binary.LittleEndian.Uint32(page.Data[blobFirstPageTotalPagesOffset:])
+	if pageCount == 0 {
+		return 0, ErrCorruptedBlob
+	}
+	dataLen := int(binary.LittleEndian.Uint32(page.Data[blobFirstPageDataSizeOffset:]))
 	pages := make([]uint64, pageCount)
 	for pageIndex := 0; pageIndex < int(pageCount); pageIndex++ {
 		pages[pageIndex] = page.PageNumber
@@ -130,9 +139,15 @@ func DeleteBlob(tx *Tx, startPageNum uint64) (int, error) {
 		} else {
 			nextPageNum = binary.LittleEndian.Uint64(page.Data[blobExtraPageNextPageOffset:])
 		}
+		if nextPageNum == 0 {
+			return 0, ErrCorruptedBlob
+		}
 		page, err = tx.getPage(nextPageNum)
 		if err != nil {
 			return 0, err
+		}
+		if page.Data[blobExtraPageTypeOffset] != BlobPage {
+			return 0, ErrCorruptedBlob
 		}
 	}
 

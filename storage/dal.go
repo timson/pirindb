@@ -96,9 +96,19 @@ func NewDal(path string, opts *Options) (*Dal, error) {
 				return nil
 			})
 			if err != nil {
-				logger.Error("unable to apply tx log", "error", err)
-			} else {
+				_ = dal.file.Close()
+				return nil, fmt.Errorf("could not apply tx log: %w", err)
+			}
+			if recoveredPages > 0 {
+				if syncErr := dal.Sync(); syncErr != nil {
+					_ = dal.file.Close()
+					return nil, fmt.Errorf("could not sync recovered pages: %w", syncErr)
+				}
 				logger.Info("tx log applied", "recovered_pages", recoveredPages)
+			}
+			if clearErr := tlog.Clear(); clearErr != nil {
+				_ = dal.file.Close()
+				return nil, fmt.Errorf("could not clear tx log: %w", clearErr)
 			}
 		}
 		meta, readMetaErr := ReadMeta(dal)

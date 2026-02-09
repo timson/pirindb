@@ -10,6 +10,7 @@ var (
 	ErrNotEnoughSpace       = errors.New("not enough space to serialize node")
 	ErrNoPagesLeft          = errors.New("no pages left")
 	ErrCorruptedFreelist    = errors.New("corrupted freelist")
+	ErrCorruptedBlob        = errors.New("corrupted blob")
 	ErrBucketNotFound       = errors.New("bucket not found")
 	ErrBucketExists         = errors.New("bucket already exists")
 	ErrTxClosed             = errors.New("transaction closed")

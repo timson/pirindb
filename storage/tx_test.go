@@ -79,50 +79,45 @@ func TestTxIsolation(t *testing.T) {
 	require.NoError(t, err)
 
 	startRead := make(chan struct{})
-	continueWrite := make(chan struct{})
-	done := make(chan struct{})
-
-	// Start a reader that will block until signaled
+	releaseRead := make(chan struct{})
+	readerDone := make(chan error, 1)
 	go func() {
-		errReader := db.View(func(tx *Tx) error {
+		readerDone <- db.View(func(tx *Tx) error {
 			bucket, _ := tx.GetBucket([]byte("foo"))
 			val, _ := bucket.Get([]byte("key"))
 
 			require.Equal(t, []byte("initial"), val, "reader should see initial value")
-			startRead <- struct{}{}            // signal reader started
-			<-continueWrite                    // wait for write attempt
-			time.Sleep(500 * time.Millisecond) // simulate long read
+			startRead <- struct{}{}
+			<-releaseRead
 			val2, _ := bucket.Get([]byte("key"))
 			require.Equal(t, []byte("initial"), val2, "reader must still see consistent snapshot")
 
 			return nil
 		})
-		require.NoError(t, errReader)
-		done <- struct{}{}
 	}()
 
-	<-startRead // wait for reader to start
+	<-startRead
 
-	// Start a writer while read tx is active
 	writeStarted := make(chan struct{})
+	writeDone := make(chan error, 1)
 	go func() {
 		writeStarted <- struct{}{}
-		errWriter := db.Update(func(tx *Tx) error {
+		writeDone <- db.Update(func(tx *Tx) error {
 			bucket, _ := tx.GetBucket([]byte("foo"))
 			return bucket.Put([]byte("key"), []byte("modified"))
 		})
-		require.NoError(t, errWriter)
-		done <- struct{}{}
 	}()
 
 	<-writeStarted
-	continueWrite <- struct{}{} // let the writer try to proceed
+	select {
+	case errWriter := <-writeDone:
+		require.Failf(t, "writer finished too early", "writer result: %v", errWriter)
+	case <-time.After(100 * time.Millisecond):
+	}
+	releaseRead <- struct{}{}
+	require.NoError(t, <-readerDone)
+	require.NoError(t, <-writeDone)
 
-	// Wait for both goroutines to complete
-	<-done
-	<-done
-
-	// Final check: reader saw original, writer modified it
 	err = db.View(func(tx *Tx) error {
 		bucket, _ := tx.GetBucket([]byte("foo"))
 		val, _ := bucket.Get([]byte("key"))
@@ -145,90 +140,82 @@ func TestTxConcurrencyIsolation(t *testing.T) {
 	const numReaders = 5
 	var wg sync.WaitGroup
 
-	t.Logf("Starting %d concurrent readers", numReaders)
 	wg.Add(numReaders)
 	started := make(chan struct{}, numReaders)
+	releaseReaders := make(chan struct{})
 
-	// Launch multiple readers
 	for i := 0; i < numReaders; i++ {
-		go func(readerID int) {
+		go func() {
 			defer wg.Done()
 			err := db.View(func(tx *Tx) error {
 				started <- struct{}{}
-				t.Logf("Reader %d started", readerID)
 				bucket, _ := tx.GetBucket([]byte("foo"))
 				val, _ := bucket.Get([]byte("key"))
 				require.Equal(t, []byte("initial"), val)
-				time.Sleep(500 * time.Millisecond) // simulate long read
+				<-releaseReaders
 				return nil
 			})
 			require.NoError(t, err)
-			t.Logf("Reader %d finished", readerID)
-		}(i)
+		}()
 	}
 
-	// Wait until all readers have started
 	for i := 0; i < numReaders; i++ {
 		<-started
 	}
 
-	t.Log("Attempting writer while readers are active (should block)")
-	writeDone := make(chan struct{})
-	startWrite := time.Now()
-
+	writeDone := make(chan error, 1)
 	go func() {
-		err := db.Update(func(tx *Tx) error {
+		writeDone <- db.Update(func(tx *Tx) error {
 			bucket, _ := tx.GetBucket([]byte("foo"))
 			return bucket.Put([]byte("key"), []byte("updated_by_writer"))
 		})
-		require.NoError(t, err)
-		t.Log("Writer finished")
-		writeDone <- struct{}{}
 	}()
 
-	// Wait for readers to finish
+	select {
+	case errWriter := <-writeDone:
+		require.Failf(t, "writer finished while readers are active", "writer result: %v", errWriter)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(releaseReaders)
 	wg.Wait()
+	require.NoError(t, <-writeDone)
 
-	<-writeDone
-	writeDuration := time.Since(startWrite)
-	t.Logf("Writer waited for %.2f seconds", writeDuration.Seconds())
-	require.Greater(t, writeDuration, 400*time.Millisecond, "Writer should be blocked until readers finish")
-
-	// Try running two writers concurrently to ensure only one proceeds at a time
-	t.Log("Starting two writers simultaneously")
 	writer1Started := make(chan struct{})
-	writer2Done := make(chan struct{})
+	releaseWriter1 := make(chan struct{})
+	writer1Done := make(chan error, 1)
+	writer2Done := make(chan error, 1)
 
 	go func() {
-		err := db.Update(func(tx *Tx) error {
+		writer1Done <- db.Update(func(tx *Tx) error {
 			writer1Started <- struct{}{}
 			bucket, _ := tx.GetBucket([]byte("foo"))
-			time.Sleep(500 * time.Millisecond) // hold the lock
+			<-releaseWriter1
 			return bucket.Put([]byte("key"), []byte("writer1"))
 		})
-		require.NoError(t, err)
-		t.Log("Writer 1 done")
 	}()
 
+	<-writer1Started
 	go func() {
-		<-writer1Started // ensure writer1 starts first
-		start := time.Now()
-		err := db.Update(func(tx *Tx) error {
+		writer2Done <- db.Update(func(tx *Tx) error {
 			bucket, _ := tx.GetBucket([]byte("foo"))
 			return bucket.Put([]byte("key"), []byte("writer2"))
 		})
-		require.NoError(t, err)
-		t.Logf("Writer 2 waited %.2f seconds", time.Since(start).Seconds())
-		writer2Done <- struct{}{}
 	}()
 
-	<-writer2Done
+	select {
+	case errWriter2 := <-writer2Done:
+		require.Failf(t, "writer2 finished before writer1 released lock", "writer2 result: %v", errWriter2)
+	case <-time.After(100 * time.Millisecond):
+	}
 
-	// Final check
+	close(releaseWriter1)
+	require.NoError(t, <-writer1Done)
+	require.NoError(t, <-writer2Done)
+
 	err = db.View(func(tx *Tx) error {
 		bucket, _ := tx.GetBucket([]byte("foo"))
 		val, _ := bucket.Get([]byte("key"))
-		t.Logf("Final value in DB: %s", val)
+		require.NotNil(t, val)
 		return nil
 	})
 	require.NoError(t, err)
@@ -260,4 +247,88 @@ func TestTxRollbackReleasesBlobAllocatedPages(t *testing.T) {
 
 	after := db.dal.freelist.availablePageN()
 	require.Equal(t, before, after)
+}
+
+func TestCreateBucketExistingDoesNotDirtyTxState(t *testing.T) {
+	db, _ := CreateTestDB(t)
+	err := db.Update(func(tx *Tx) error {
+		_, err := tx.CreateBucket([]byte("foo"))
+		return err
+	})
+	require.NoError(t, err)
+
+	tx := db.Begin(true)
+	_, err = tx.CreateBucket([]byte("foo"))
+	require.ErrorIs(t, err, ErrBucketExists)
+	require.Equal(t, 0, len(tx.dirtyBuckets))
+	require.Equal(t, 0, len(tx.allocatedPageNums))
+	tx.Rollback()
+}
+
+func TestDeleteBucketReclaimsBlobAndNodePages(t *testing.T) {
+	db, _ := CreateTestDB(t)
+	before := db.dal.freelist.availablePageN()
+
+	err := db.Update(func(tx *Tx) error {
+		bucket, err := tx.CreateBucket([]byte("foo"))
+		if err != nil {
+			return err
+		}
+		if err = bucket.Put([]byte("k1"), bytes.Repeat([]byte("a"), MaxValueSize+600)); err != nil {
+			return err
+		}
+		if err = bucket.Put([]byte("k2"), []byte("small")); err != nil {
+			return err
+		}
+		return nil
+	})
+	require.NoError(t, err)
+	require.Less(t, db.dal.freelist.availablePageN(), before)
+
+	err = db.Update(func(tx *Tx) error {
+		return tx.DeleteBucket([]byte("foo"))
+	})
+	require.NoError(t, err)
+	require.Equal(t, before, db.dal.freelist.availablePageN())
+
+	err = db.View(func(tx *Tx) error {
+		_, err := tx.GetBucket([]byte("foo"))
+		require.ErrorIs(t, err, ErrBucketNotFound)
+		return nil
+	})
+	require.NoError(t, err)
+}
+
+func TestDeleteBucketAfterReadOrWriteInSameTx(t *testing.T) {
+	db, _ := CreateTestDB(t)
+	err := db.Update(func(tx *Tx) error {
+		bucket, err := tx.CreateBucket([]byte("foo"))
+		if err != nil {
+			return err
+		}
+		if err = bucket.Put([]byte("k"), []byte("v")); err != nil {
+			return err
+		}
+		return nil
+	})
+	require.NoError(t, err)
+
+	err = db.Update(func(tx *Tx) error {
+		bucket, err := tx.GetBucket([]byte("foo"))
+		if err != nil {
+			return err
+		}
+		if err = bucket.Put([]byte("k2"), bytes.Repeat([]byte("x"), MaxValueSize+333)); err != nil {
+			return err
+		}
+		return tx.DeleteBucket([]byte("foo"))
+	})
+	require.NoError(t, err)
+
+	err = db.View(func(tx *Tx) error {
+		_, err := tx.GetBucket([]byte("foo"))
+		require.ErrorIs(t, err, ErrBucketNotFound)
+		return nil
+	})
+	require.NoError(t, err)
 }
