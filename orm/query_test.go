@@ -1,6 +1,7 @@
 package orm
 
 import (
+	"errors"
 	"sort"
 	"testing"
 
@@ -123,6 +124,72 @@ func TestSaveAutoPKAndReindexOnUpdate(t *testing.T) {
 	require.Equal(t, []string{"nora"}, userLogins(t, rows))
 }
 
+func TestFindLimitAndOffset(t *testing.T) {
+	o, _ := setupORMWithUsers(t)
+
+	rows, err := o.Find(User{}, Where("Age").Gte(0).Offset(1).Limit(2))
+	require.NoError(t, err)
+	require.Equal(t, []string{"bob", "carol"}, userLoginsInOrder(t, rows))
+}
+
+func TestFindPage(t *testing.T) {
+	o, _ := setupORMWithUsers(t)
+
+	rows, err := o.Find(User{}, Where("Age").Gte(0).Page(2, 2))
+	require.NoError(t, err)
+	require.Equal(t, []string{"carol", "dave"}, userLoginsInOrder(t, rows))
+
+	rows, err = o.Find(User{}, Where("Age").Gte(0).Page(3, 2))
+	require.NoError(t, err)
+	require.Equal(t, []string{"admin"}, userLoginsInOrder(t, rows))
+}
+
+func TestFindPaginationValidation(t *testing.T) {
+	o, _ := setupORMWithUsers(t)
+
+	_, err := o.Find(User{}, Where("Age").Gte(0).Limit(-1))
+	require.Error(t, err)
+
+	_, err = o.Find(User{}, Where("Age").Gte(0).Offset(-1))
+	require.Error(t, err)
+
+	_, err = o.Find(User{}, Where("Age").Gte(0).Page(0, 10))
+	require.Error(t, err)
+
+	_, err = o.Find(User{}, Where("Age").Gte(0).Page(1, 0))
+	require.Error(t, err)
+}
+
+func TestTypedFindAll(t *testing.T) {
+	o, _ := setupORMWithUsers(t)
+
+	rows, err := FindAll[User](o, Where("Age").Gte(30).And(Where("City").Eq("Haifa")))
+	require.NoError(t, err)
+	require.Equal(t, []string{"admin", "alice"}, userLoginsTyped(rows))
+
+	rows, err = Model[User](o).FindAll(Where("login").Eq("carol"))
+	require.NoError(t, err)
+	require.Equal(t, []string{"carol"}, userLoginsTyped(rows))
+
+	rows, err = FindAll[User](o, Where("Age").Gte(0).Page(2, 2))
+	require.NoError(t, err)
+	require.Equal(t, []string{"carol", "dave"}, userLoginsTypedInOrder(rows))
+}
+
+func TestTypedFindOne(t *testing.T) {
+	o, _ := setupORMWithUsers(t)
+
+	row, err := FindOne[User](o, Where("login").Eq("carol"))
+	require.NoError(t, err)
+	require.Equal(t, "carol", row.Login)
+
+	_, err = FindOne[User](o, Where("City").Eq("Haifa"))
+	require.True(t, errors.Is(err, ErrMultipleResults))
+
+	_, err = FindOne[User](o, Where("login").Eq("unknown-login"))
+	require.True(t, errors.Is(err, ErrNotFound))
+}
+
 func setupORMWithUsers(t *testing.T) (*ORM, []*User) {
 	db, _ := storage.CreateTestDB(t)
 	o := New(db)
@@ -154,5 +221,32 @@ func userLogins(t *testing.T, rows []any) []string {
 		logins = append(logins, u.Login)
 	}
 	sort.Strings(logins)
+	return logins
+}
+
+func userLoginsInOrder(t *testing.T, rows []any) []string {
+	logins := make([]string, 0, len(rows))
+	for _, row := range rows {
+		u, ok := row.(*User)
+		require.True(t, ok)
+		logins = append(logins, u.Login)
+	}
+	return logins
+}
+
+func userLoginsTyped(rows []*User) []string {
+	logins := make([]string, 0, len(rows))
+	for _, row := range rows {
+		logins = append(logins, row.Login)
+	}
+	sort.Strings(logins)
+	return logins
+}
+
+func userLoginsTypedInOrder(rows []*User) []string {
+	logins := make([]string, 0, len(rows))
+	for _, row := range rows {
+		logins = append(logins, row.Login)
+	}
 	return logins
 }

@@ -42,13 +42,16 @@ func (*neg) isNode() {}
 type Query struct {
 	root queryNode
 	err  error
+	// limit < 0 means unlimited.
+	limit  int
+	offset int
 }
 
 func Where(field string) *Query {
 	if field == "" {
-		return &Query{err: fmt.Errorf("field is empty")}
+		return &Query{err: fmt.Errorf("field is empty"), limit: -1}
 	}
-	return &Query{root: &pred{field: field}}
+	return &Query{root: &pred{field: field}, limit: -1}
 }
 
 func (q *Query) Eq(v any) *Query {
@@ -77,7 +80,7 @@ func (q *Query) Lte(v any) *Query {
 
 func (q *Query) setPred(op string, v any) *Query {
 	if q == nil {
-		return &Query{err: fmt.Errorf("query is nil")}
+		return &Query{err: fmt.Errorf("query is nil"), limit: -1}
 	}
 	if q.err != nil {
 		return q
@@ -96,6 +99,56 @@ func (q *Query) setPred(op string, v any) *Query {
 	return q
 }
 
+func (q *Query) Limit(n int) *Query {
+	if q == nil {
+		return &Query{err: fmt.Errorf("query is nil"), limit: -1}
+	}
+	if q.err != nil {
+		return q
+	}
+	if n < 0 {
+		q.err = fmt.Errorf("limit must be >= 0")
+		return q
+	}
+	q.limit = n
+	return q
+}
+
+func (q *Query) Offset(n int) *Query {
+	if q == nil {
+		return &Query{err: fmt.Errorf("query is nil"), limit: -1}
+	}
+	if q.err != nil {
+		return q
+	}
+	if n < 0 {
+		q.err = fmt.Errorf("offset must be >= 0")
+		return q
+	}
+	q.offset = n
+	return q
+}
+
+func (q *Query) Page(page int, pageSize int) *Query {
+	if q == nil {
+		return &Query{err: fmt.Errorf("query is nil"), limit: -1}
+	}
+	if q.err != nil {
+		return q
+	}
+	if page < 1 {
+		q.err = fmt.Errorf("page must be >= 1")
+		return q
+	}
+	if pageSize <= 0 {
+		q.err = fmt.Errorf("page size must be > 0")
+		return q
+	}
+	q.offset = (page - 1) * pageSize
+	q.limit = pageSize
+	return q
+}
+
 func (q *Query) And(other *Query) *Query {
 	return q.combine(other, "AND")
 }
@@ -106,7 +159,7 @@ func (q *Query) Or(other *Query) *Query {
 
 func (q *Query) Not() *Query {
 	if q == nil {
-		return &Query{err: fmt.Errorf("query is nil")}
+		return &Query{err: fmt.Errorf("query is nil"), limit: -1}
 	}
 	if q.err != nil {
 		return q
@@ -126,11 +179,13 @@ func (q *Query) combine(other *Query, op string) *Query {
 	combined := combineQueries(q, other, op)
 	q.root = combined.root
 	q.err = combined.err
+	q.limit = combined.limit
+	q.offset = combined.offset
 	return q
 }
 
 func combineQueries(left *Query, right *Query, op string) *Query {
-	out := &Query{}
+	out := &Query{limit: -1}
 	if left != nil && left.err != nil {
 		out.err = left.err
 	}
@@ -140,14 +195,20 @@ func combineQueries(left *Query, right *Query, op string) *Query {
 	if left == nil || left.root == nil {
 		if right != nil {
 			out.root = right.root
+			copyPagination(out, right)
 		}
 		return out
 	}
 	if right == nil || right.root == nil {
 		out.root = left.root
+		copyPagination(out, left)
 		return out
 	}
 	out.root = &conj{left: left.root, right: right.root, op: op}
+	copyPagination(out, left)
+	if !hasPagination(left) {
+		copyPagination(out, right)
+	}
 	return out
 }
 
@@ -161,14 +222,14 @@ func Or(queries ...*Query) *Query {
 
 func Not(q *Query) *Query {
 	if q == nil {
-		return &Query{err: fmt.Errorf("query is nil")}
+		return &Query{err: fmt.Errorf("query is nil"), limit: -1}
 	}
 	return q.Not()
 }
 
 func combineMany(op string, queries ...*Query) *Query {
 	if len(queries) == 0 {
-		return &Query{}
+		return &Query{limit: -1}
 	}
 	result := queries[0]
 	for i := 1; i < len(queries); i++ {
@@ -217,7 +278,7 @@ func (orm *ORM) Find(proto any, q *Query) ([]any, error) {
 			return err
 		}
 
-		orderedPKs := sortPKSet(pks)
+		orderedPKs := applyPagination(sortPKSet(pks), q)
 		for _, pk := range orderedPKs {
 			data, found := modelBucket.Get(encodeUint64BE(pk))
 			if !found {
@@ -235,6 +296,45 @@ func (orm *ORM) Find(proto any, q *Query) ([]any, error) {
 		return nil, err
 	}
 	return out, nil
+}
+
+func hasPagination(q *Query) bool {
+	if q == nil {
+		return false
+	}
+	return q.limit >= 0 || q.offset > 0
+}
+
+func copyPagination(dst *Query, src *Query) {
+	if dst == nil || src == nil {
+		return
+	}
+	dst.limit = src.limit
+	dst.offset = src.offset
+}
+
+func applyPagination(orderedPKs []uint64, q *Query) []uint64 {
+	if q == nil {
+		return orderedPKs
+	}
+
+	start := q.offset
+	if start < 0 {
+		start = 0
+	}
+	if start >= len(orderedPKs) {
+		return []uint64{}
+	}
+
+	end := len(orderedPKs)
+	if q.limit >= 0 {
+		if q.limit == 0 {
+			end = start
+		} else if q.limit < end-start {
+			end = start + q.limit
+		}
+	}
+	return orderedPKs[start:end]
 }
 
 type queryEvalContext struct {
