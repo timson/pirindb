@@ -3,7 +3,9 @@ package storage
 import (
 	"encoding/binary"
 	"errors"
+	"sort"
 	"sync"
+	"time"
 )
 
 const (
@@ -23,6 +25,7 @@ type Tx struct {
 	allocatedPageNums []uint64
 	originalMetaRoot  uint64
 	write             bool
+	holdsGroupGate    bool
 	closed            bool
 	once              sync.Once
 	db                *DB
@@ -31,20 +34,21 @@ type Tx struct {
 
 func newTx(db *DB, write bool) *Tx {
 	return &Tx{
-		map[uint64]*BNode{},
-		map[uint64]*Page{},
-		map[string]*Bucket{},
-		map[uint64]*BNode{},
-		map[uint64]*Page{},
-		map[uint64]*Blob{},
-		make([]uint64, 0),
-		make([]uint64, 0),
-		db.dal.meta.root,
-		write,
-		false,
-		sync.Once{},
-		db,
-		sync.Map{},
+		dirtyNodes:        map[uint64]*BNode{},
+		dirtyPages:        map[uint64]*Page{},
+		dirtyBuckets:      map[string]*Bucket{},
+		readNodes:         map[uint64]*BNode{},
+		readPages:         map[uint64]*Page{},
+		readBlobs:         map[uint64]*Blob{},
+		pagesToDelete:     make([]uint64, 0),
+		allocatedPageNums: make([]uint64, 0),
+		originalMetaRoot:  db.dal.meta.root,
+		write:             write,
+		holdsGroupGate:    false,
+		closed:            false,
+		once:              sync.Once{},
+		db:                db,
+		buckets:           sync.Map{},
 	}
 }
 
@@ -203,6 +207,10 @@ func (tx *Tx) Rollback() {
 		tx.allocatedPageNums = nil
 		tx.once.Do(func() {
 			tx.db.lock.Unlock()
+			if tx.holdsGroupGate {
+				tx.db.groupGate.RUnlock()
+				tx.holdsGroupGate = false
+			}
 		})
 		tx.closed = true
 	}()
@@ -230,7 +238,23 @@ func (tx *Tx) Commit() (err error) {
 
 	freelistSnapshot := cloneFreelist(tx.db.dal.freelist)
 	checkpointDurable := false
+	observer := tx.db.dal.opts.CommitObserver
+	commitStarted := time.Time{}
+	commitStats := CommitPhaseStats{}
+	if observer != nil {
+		commitStarted = time.Now()
+		commitStats = CommitPhaseStats{
+			DirtyNodeCount:   len(tx.dirtyNodes),
+			DirtyPageCount:   len(tx.dirtyPages),
+			DeletedPageCount: len(tx.pagesToDelete),
+			UsedFastClear:    true,
+		}
+	}
 	defer func() {
+		if err == nil && observer != nil {
+			commitStats.TotalDuration = time.Since(commitStarted)
+			observer(commitStats)
+		}
 		if err != nil && !checkpointDurable {
 			tx.db.dal.meta.root = tx.originalMetaRoot
 			tx.db.dal.freelist = freelistSnapshot
@@ -238,6 +262,10 @@ func (tx *Tx) Commit() (err error) {
 		}
 		tx.once.Do(func() {
 			tx.db.lock.Unlock()
+			if tx.holdsGroupGate {
+				tx.db.groupGate.RUnlock()
+				tx.holdsGroupGate = false
+			}
 		})
 		tx.dirtyNodes = nil
 		tx.dirtyPages = nil
@@ -258,8 +286,22 @@ func (tx *Tx) Commit() (err error) {
 		}
 	}
 
+	if tx.db.dal.opts.SyncPolicy == SyncPolicyJournal {
+		checkpointDurable, err = tx.commitJournalPolicy(&commitStats, observer != nil)
+		return err
+	}
+	if tx.db.dal.opts.SyncPolicy == SyncPolicyGroup {
+		checkpointDurable, err = tx.commitGroupPolicy(&commitStats, observer != nil)
+		return err
+	}
+
+	checkpointDurable, err = tx.commitStrictPolicy(&commitStats, observer != nil)
+	return err
+}
+
+func (tx *Tx) commitStrictPolicy(commitStats *CommitPhaseStats, collectStats bool) (bool, error) {
 	// First write to physical log
-	err = tx.db.dal.txLog.With(func() error {
+	txLogStats, txLogErr := tx.db.dal.txLog.withStats(func() error {
 		for _, node := range tx.dirtyNodes {
 			if _, setNodeErr := tx.db.dal.setNode(node); setNodeErr != nil {
 				return setNodeErr
@@ -284,23 +326,30 @@ func (tx *Tx) Commit() (err error) {
 		}
 		return nil
 	})
-	if err != nil {
-		return err
+	if collectStats {
+		commitStats.TxLogWriteDuration = txLogStats.writeDuration
+		commitStats.TxLogSyncDuration = txLogStats.syncDuration
+		commitStats.JournalPageCount = txLogStats.bufferedPages
+		commitStats.JournalBytes = txLogStats.bufferedBytes
 	}
-	checkpointDurable = true
+	if txLogErr != nil {
+		return false, txLogErr
+	}
+	checkpointDurable := true
 
 	// Second write to the Database storage
+	dbWriteStarted := time.Now()
 	for _, node := range tx.dirtyNodes {
-		_, err = tx.db.dal.setNode(node)
+		_, err := tx.db.dal.setNode(node)
 		if err != nil {
-			return err
+			return checkpointDurable, err
 		}
 	}
 
 	for _, page := range tx.dirtyPages {
-		err = tx.db.dal.SetPage(page)
+		err := tx.db.dal.SetPage(page)
 		if err != nil {
-			return err
+			return checkpointDurable, err
 		}
 	}
 
@@ -308,22 +357,165 @@ func (tx *Tx) Commit() (err error) {
 	//	tx.db.dal.freelist.ReleasePage(pageNum)
 	//}
 
-	err = WriteFreelist(tx.db.dal, tx.db.dal.freelist)
-	if err != nil {
-		return err
+	if err := WriteFreelist(tx.db.dal, tx.db.dal.freelist); err != nil {
+		return checkpointDurable, err
 	}
-	err = WriteMeta(tx.db.dal, tx.db.dal.meta)
-	if err != nil {
-		return err
+	if err := WriteMeta(tx.db.dal, tx.db.dal.meta); err != nil {
+		return checkpointDurable, err
 	}
-	if err = tx.db.dal.Sync(); err != nil {
-		return err
-	}
-	if err = tx.db.dal.txLog.Clear(); err != nil {
-		return err
+	if collectStats {
+		commitStats.DBWriteDuration = time.Since(dbWriteStarted)
 	}
 
-	return nil
+	dbSyncStarted := time.Now()
+	if err := tx.db.dal.Sync(); err != nil {
+		return checkpointDurable, err
+	}
+	if collectStats {
+		commitStats.DBSyncDuration = time.Since(dbSyncStarted)
+	}
+
+	clearStarted := time.Now()
+	if err := tx.db.dal.txLog.ClearFast(); err != nil {
+		return checkpointDurable, err
+	}
+	if collectStats {
+		commitStats.JournalClearDuration = time.Since(clearStarted)
+	}
+
+	return checkpointDurable, nil
+}
+
+func (tx *Tx) commitJournalPolicy(commitStats *CommitPhaseStats, collectStats bool) (bool, error) {
+	commitPages, err := tx.materializeCommitPages()
+	if err != nil {
+		return false, err
+	}
+
+	tx.db.dal.mergePendingJournalPages(commitPages)
+	pendingPages := tx.db.dal.pendingJournalPages()
+
+	txLogStats, err := tx.db.dal.txLog.ReplaceWithPages(pendingPages, true)
+	if collectStats {
+		commitStats.TxLogWriteDuration = txLogStats.writeDuration
+		commitStats.TxLogSyncDuration = txLogStats.syncDuration
+		commitStats.JournalPageCount = txLogStats.bufferedPages
+		commitStats.JournalBytes = txLogStats.bufferedBytes
+	}
+	if err != nil {
+		return false, err
+	}
+	checkpointDurable := true
+
+	dbWriteStarted := time.Now()
+	for _, page := range commitPages {
+		if err = tx.db.dal.SetPage(page); err != nil {
+			return checkpointDurable, err
+		}
+	}
+	markFreelistPersisted(tx.db.dal.freelist)
+	if collectStats {
+		commitStats.DBWriteDuration = time.Since(dbWriteStarted)
+	}
+
+	if !tx.db.dal.checkpointDue() {
+		return checkpointDurable, nil
+	}
+
+	dbSyncStarted := time.Now()
+	if err = tx.db.dal.Sync(); err != nil {
+		return checkpointDurable, err
+	}
+	if collectStats {
+		commitStats.DBSyncDuration = time.Since(dbSyncStarted)
+	}
+
+	clearStarted := time.Now()
+	tx.db.dal.resetPendingJournal()
+	if err = tx.db.dal.txLog.ClearFast(); err != nil {
+		return checkpointDurable, err
+	}
+	if collectStats {
+		commitStats.JournalClearDuration = time.Since(clearStarted)
+	}
+
+	return checkpointDurable, nil
+}
+
+func (tx *Tx) commitGroupPolicy(commitStats *CommitPhaseStats, collectStats bool) (bool, error) {
+	commitPages, err := tx.materializeCommitPages()
+	if err != nil {
+		return false, err
+	}
+
+	tx.db.dal.mergePendingJournalPages(commitPages)
+	tx.db.dal.mergeOverlayPages(commitPages)
+	markFreelistPersisted(tx.db.dal.freelist)
+
+	if collectStats {
+		commitStats.JournalPageCount = len(tx.db.dal.pendingJournal)
+	}
+
+	batch := tx.db.registerGroupBatch()
+
+	// Release the writer lock early so following writers can join the same flush batch.
+	tx.once.Do(func() {
+		tx.db.lock.Unlock()
+		if tx.holdsGroupGate {
+			tx.db.groupGate.RUnlock()
+			tx.holdsGroupGate = false
+		}
+	})
+
+	if err = tx.db.waitForGroupBatch(batch); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (tx *Tx) materializeCommitPages() ([]*Page, error) {
+	for _, pageNum := range tx.pagesToDelete {
+		if err := tx.db.dal.ReleasePage(pageNum); err != nil {
+			return nil, err
+		}
+	}
+
+	pagesByNum := make(map[uint64]*Page, len(tx.dirtyNodes)+len(tx.dirtyPages)+4)
+
+	for _, node := range tx.dirtyNodes {
+		page, err := tx.db.dal.marshalNodePage(node)
+		if err != nil {
+			return nil, err
+		}
+		pagesByNum[page.PageNumber] = clonePage(page)
+	}
+
+	for _, page := range tx.dirtyPages {
+		pagesByNum[page.PageNumber] = clonePage(page)
+	}
+
+	freelistPages, err := BuildFreelistPages(tx.db.dal, tx.db.dal.freelist)
+	if err != nil {
+		return nil, err
+	}
+	for _, page := range freelistPages {
+		pagesByNum[page.PageNumber] = page
+	}
+	pagesByNum[metaPageNumber] = BuildMetaPage(tx.db.dal.meta.pageSize, tx.db.dal.meta)
+
+	pageNums := make([]uint64, 0, len(pagesByNum))
+	for pageNum := range pagesByNum {
+		pageNums = append(pageNums, pageNum)
+	}
+	sort.Slice(pageNums, func(i, j int) bool {
+		return pageNums[i] < pageNums[j]
+	})
+
+	pages := make([]*Page, 0, len(pageNums))
+	for _, pageNum := range pageNums {
+		pages = append(pages, pagesByNum[pageNum])
+	}
+	return pages, nil
 }
 
 func (tx *Tx) getRootBucket() *Bucket {

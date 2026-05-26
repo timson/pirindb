@@ -575,8 +575,30 @@ func ReadFreelist(dal *Dal) (*Freelist, error) {
 }
 
 func WriteFreelist(dal *Dal, freelist *Freelist) error {
+	pages, err := BuildFreelistPages(dal, freelist)
+	if err != nil {
+		return err
+	}
+	for _, page := range pages {
+		if err = dal.SetPage(page); err != nil {
+			return err
+		}
+	}
+
+	logger.Debug("write freelist",
+		"currentPage", freelist.currentPage,
+		"releasedPages", len(freelist.releasedPages),
+		"pagesUsed", len(freelist.freelistPages))
+
+	if !dal.txLog.active {
+		markFreelistPersisted(freelist)
+	}
+	return nil
+}
+
+func BuildFreelistPages(dal *Dal, freelist *Freelist) ([]*Page, error) {
 	if freelist == nil {
-		return fmt.Errorf("freelist is nil")
+		return nil, fmt.Errorf("freelist is nil")
 	}
 
 	if freelist.maxPages != dal.maxPages {
@@ -599,7 +621,7 @@ func WriteFreelist(dal *Dal, freelist *Freelist) error {
 	_ = freelist.sanitizeReleasedPages()
 
 	if !freelist.dirty {
-		return nil
+		return nil, nil
 	}
 
 	pagesNeeded := calculatePagesNeeded(
@@ -609,7 +631,7 @@ func WriteFreelist(dal *Dal, freelist *Freelist) error {
 	)
 	managePageErr := manageFreelistPageAllocation(dal, freelist, pagesNeeded)
 	if managePageErr != nil {
-		return managePageErr
+		return nil, managePageErr
 	}
 	if freelist.releasedPagesDirty && len(freelist.releasedPages) > 1 {
 		sort.Slice(freelist.releasedPages, func(i, j int) bool {
@@ -621,7 +643,7 @@ func WriteFreelist(dal *Dal, freelist *Freelist) error {
 
 	pagesToWrite := len(freelist.freelistPages)
 	if pagesToWrite == 0 {
-		return fmt.Errorf("%w: freelist page chain is empty", ErrCorruptedFreelist)
+		return nil, fmt.Errorf("%w: freelist page chain is empty", ErrCorruptedFreelist)
 	}
 
 	entryDiffIdx := 0
@@ -647,6 +669,12 @@ func WriteFreelist(dal *Dal, freelist *Freelist) error {
 		tailDirtyPageIdx = 1
 	}
 
+	return buildFreelistPages(dal, freelist, pagesToWrite, tailDirtyPageIdx)
+}
+
+func buildFreelistPages(dal *Dal, freelist *Freelist, pagesToWrite int, tailDirtyPageIdx int) ([]*Page, error) {
+	pages := make([]*Page, 0, pagesToWrite-tailDirtyPageIdx+1)
+
 	firstPage := &Page{
 		PageNumber: dal.meta.freelistPageNumber,
 		Data:       make([]byte, dal.meta.pageSize),
@@ -669,9 +697,7 @@ func WriteFreelist(dal *Dal, freelist *Freelist) error {
 		0,
 		freelist.entriesPerFirstPage,
 	)
-	if err := dal.SetPage(firstPage); err != nil {
-		return err
-	}
+	pages = append(pages, firstPage)
 
 	for i := 1; i < pagesToWrite; i++ {
 		if i < tailDirtyPageIdx {
@@ -699,31 +725,25 @@ func WriteFreelist(dal *Dal, freelist *Freelist) error {
 			freelist.entriesPerExtraPage,
 		)
 
-		if err := dal.SetPage(page); err != nil {
-			return err
-		}
+		pages = append(pages, page)
 	}
 
 	maxEntriesCapacity := freelist.entriesPerFirstPage + max(0, pagesToWrite-1)*freelist.entriesPerExtraPage
 	if maxEntriesCapacity < len(freelist.releasedPages) {
-		return fmt.Errorf("%w: freelist entry overflow, capacity %d entries, have %d entries", ErrCorruptedFreelist, maxEntriesCapacity, len(freelist.releasedPages))
+		return nil, fmt.Errorf("%w: freelist entry overflow, capacity %d entries, have %d entries", ErrCorruptedFreelist, maxEntriesCapacity, len(freelist.releasedPages))
 	}
 
-	logger.Debug("write freelist",
-		"currentPage", freelist.currentPage,
-		"releasedPages", len(freelist.releasedPages),
-		"pagesUsed", pagesToWrite)
+	return pages, nil
+}
 
-	if !dal.txLog.active {
-		freelist.dirty = false
-		freelist.persistedState = &freelistPersistedState{
-			currentPage:   freelist.currentPage,
-			maxPages:      freelist.maxPages,
-			releasedPages: append([]uint64(nil), freelist.releasedPages...),
-			freelistPages: append([]uint64(nil), freelist.freelistPages...),
-		}
+func markFreelistPersisted(freelist *Freelist) {
+	freelist.dirty = false
+	freelist.persistedState = &freelistPersistedState{
+		currentPage:   freelist.currentPage,
+		maxPages:      freelist.maxPages,
+		releasedPages: append([]uint64(nil), freelist.releasedPages...),
+		freelistPages: append([]uint64(nil), freelist.freelistPages...),
 	}
-	return nil
 }
 
 func firstDiffIndex(previous []uint64, current []uint64) int {

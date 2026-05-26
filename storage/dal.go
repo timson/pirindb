@@ -28,6 +28,9 @@ type Dal struct {
 	txLog             *TxLog
 	opts              *Options
 	beforeSetPageHook func(p *Page) error
+	pendingJournal    map[uint64]*Page
+	pendingJournalTxN int
+	pageOverlay       map[uint64]*Page
 }
 
 func NewDal(path string, opts *Options) (*Dal, error) {
@@ -67,7 +70,7 @@ func NewDal(path string, opts *Options) (*Dal, error) {
 
 	fileSize := max(fileInfo.Size(), minFileSize)
 
-	tlog := NewTxLog(opts.TxLogPath, 0600)
+	tlog := NewTxLog(opts.TxLogPath, 0600, opts.PageSize)
 	logger.Info("open database file", "path", path, "size", fileSize,
 		"tx_log", opts.TxLogPath)
 
@@ -81,6 +84,8 @@ func NewDal(path string, opts *Options) (*Dal, error) {
 		MaxFillPercent: 0.95,
 		txLog:          tlog,
 		opts:           opts,
+		pendingJournal: make(map[uint64]*Page),
+		pageOverlay:    make(map[uint64]*Page),
 	}
 	dal.allocateFile(uint64(fileSize))
 
@@ -145,6 +150,64 @@ func NewDal(path string, opts *Options) (*Dal, error) {
 	}
 
 	return dal, nil
+}
+
+func clonePage(page *Page) *Page {
+	if page == nil {
+		return nil
+	}
+	return &Page{
+		PageNumber: page.PageNumber,
+		Data:       append([]byte(nil), page.Data...),
+	}
+}
+
+func (dal *Dal) mergePendingJournalPages(pages []*Page) {
+	for _, page := range pages {
+		dal.pendingJournal[page.PageNumber] = clonePage(page)
+	}
+	dal.pendingJournalTxN++
+}
+
+func (dal *Dal) pendingJournalPages() []*Page {
+	pages := make([]*Page, 0, len(dal.pendingJournal))
+	for _, page := range dal.pendingJournal {
+		pages = append(pages, clonePage(page))
+	}
+	return pages
+}
+
+func (dal *Dal) resetPendingJournal() {
+	clear(dal.pendingJournal)
+	dal.pendingJournalTxN = 0
+}
+
+func (dal *Dal) mergeOverlayPages(pages []*Page) {
+	for _, page := range pages {
+		dal.pageOverlay[page.PageNumber] = clonePage(page)
+	}
+}
+
+func (dal *Dal) overlayPages() []*Page {
+	pages := make([]*Page, 0, len(dal.pageOverlay))
+	for _, page := range dal.pageOverlay {
+		pages = append(pages, clonePage(page))
+	}
+	return pages
+}
+
+func (dal *Dal) resetOverlay() {
+	clear(dal.pageOverlay)
+}
+
+func (dal *Dal) checkpointDue() bool {
+	if dal.opts.SyncPolicy != SyncPolicyJournal {
+		return false
+	}
+	if dal.opts.CheckpointTxThreshold <= 0 {
+		return true
+	}
+	return dal.pendingJournalTxN >= dal.opts.CheckpointTxThreshold
 }
 
 func (dal *Dal) allocateFile(size uint64) {
@@ -243,6 +306,9 @@ func (dal *Dal) GetPage(pageNumber uint64) (*Page, error) {
 	if pageNumber >= dal.maxPages {
 		return nil, fmt.Errorf("page number %d is greater than max page number %d", pageNumber, dal.maxPages)
 	}
+	if overlayPage, ok := dal.pageOverlay[pageNumber]; ok {
+		return clonePage(overlayPage), nil
+	}
 
 	pageSize := dal.meta.pageSize
 	offset := int64(pageNumber * pageSize)
@@ -301,6 +367,14 @@ func (dal *Dal) getNode(pageNumber uint64) (*BNode, error) {
 }
 
 func (dal *Dal) setNode(node *BNode) (*Page, error) {
+	page, err := dal.marshalNodePage(node)
+	if err != nil {
+		return nil, err
+	}
+	return page, dal.SetPage(page)
+}
+
+func (dal *Dal) marshalNodePage(node *BNode) (*Page, error) {
 	var page *Page
 	var err error
 	if node.PageNum == 0 {
@@ -318,7 +392,7 @@ func (dal *Dal) setNode(node *BNode) (*Page, error) {
 	if err != nil {
 		return nil, err
 	}
-	return page, dal.SetPage(page)
+	return page, nil
 }
 
 // func (dal *Dal) deletePage(pageNumber uint64) {

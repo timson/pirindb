@@ -371,3 +371,7 @@ func (bucket *Bucket) NextSequence() (uint64, error) {
 func (bucket *Bucket) Sequence() uint64 {
 	return bucket.counter
 }
+
+func (bucket *Bucket) ItemCount() uint64 {
+	return bucket.itemsN
+}

@@ -86,13 +86,17 @@ func (m *Meta) Deserialize(data []byte) {
 	m.pageSize = binary.LittleEndian.Uint64(data[metaPageSizeOffset:])
 }
 
-func WriteMeta(dal *Dal, m *Meta) error {
-	page, err := dal.GetPage(0)
-	if err != nil {
-		return fmt.Errorf("failed to get pageNum 0: %w", err)
+func BuildMetaPage(pageSize uint64, m *Meta) *Page {
+	page := &Page{
+		PageNumber: metaPageNumber,
+		Data:       make([]byte, pageSize),
 	}
-	page.PageNumber = metaPageNumber
 	m.Serialize(page.Data)
+	return page
+}
+
+func WriteMeta(dal *Dal, m *Meta) error {
+	page := BuildMetaPage(dal.meta.pageSize, m)
 	logger.Debug("write meta pageNum", "rootPage", m.root)
 	return dal.SetPage(page)
 }

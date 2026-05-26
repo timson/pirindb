@@ -15,30 +15,25 @@ func (e *ErrResponse) Render(w http.ResponseWriter, r *http.Request) error {
 	return nil
 }
 
-func ErrInvalidRequest() render.Renderer {
+func ErrStatus(statusCode int, status string) render.Renderer {
 	return &ErrResponse{
-		HTTPStatusCode: http.StatusBadRequest,
-		Status:         "Invalid request",
+		HTTPStatusCode: statusCode,
+		Status:         status,
 	}
+}
+
+func ErrInvalidRequest() render.Renderer {
+	return ErrStatus(http.StatusBadRequest, "Invalid request")
 }
 
 func ErrNotFound() render.Renderer {
-	return &ErrResponse{
-		HTTPStatusCode: http.StatusNotFound,
-		Status:         "Key not found",
-	}
+	return ErrStatus(http.StatusNotFound, "Key not found")
 }
 
 func ErrRequestTimeout() render.Renderer {
-	return &ErrResponse{
-		HTTPStatusCode: http.StatusRequestTimeout,
-		Status:         "Request timed out",
-	}
+	return ErrStatus(http.StatusRequestTimeout, "Request timed out")
 }
 
 func ErrInternalServerError() render.Renderer {
-	return &ErrResponse{
-		HTTPStatusCode: http.StatusInternalServerError,
-		Status:         "Internal Server Error",
-	}
+	return ErrStatus(http.StatusInternalServerError, "Internal Server Error")
 }

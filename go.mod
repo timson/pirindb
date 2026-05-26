@@ -24,7 +24,6 @@ require (
 
 require (
 	github.com/ajg/form v1.5.1 // indirect
-	github.com/brianvoe/gofakeit/v6 v6.28.0 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/ebitengine/purego v0.8.2 // indirect
 	github.com/fsnotify/fsnotify v1.8.0 // indirect

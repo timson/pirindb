@@ -7,6 +7,7 @@ import (
 	"github.com/timson/pirindb/storage"
 	"log/slog"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi"
@@ -18,10 +19,14 @@ var (
 )
 
 type Server struct {
-	DB     *storage.DB
-	Logger *slog.Logger
-	Config *Config
-	Server *http.Server
+	DB          *storage.DB
+	Logger      *slog.Logger
+	Config      *Config
+	HTTPServer  *http.Server
+	RedisServer *RedisServer
+	jobMu       sync.Mutex
+	jobs        map[string]*dbTransferJob
+	importBusy  bool
 }
 
 func NewServer(cfg *Config, db *storage.DB, logger *slog.Logger) *Server {
@@ -29,6 +34,7 @@ func NewServer(cfg *Config, db *storage.DB, logger *slog.Logger) *Server {
 		Config: cfg,
 		DB:     db,
 		Logger: logger,
+		jobs:   make(map[string]*dbTransferJob),
 	}
 }
 
@@ -64,6 +70,9 @@ func (srv *Server) buildRouter() http.Handler {
 		})
 		r.Route("/db", func(r chi.Router) {
 			r.Get("/status", srv.handleStatus)
+			r.Post("/export", srv.handleExportJob)
+			r.Post("/import", srv.handleImportJob)
+			r.Get("/jobs/{jobID}", srv.handleDBJobStatus)
 		})
 	})
 
@@ -71,31 +80,57 @@ func (srv *Server) buildRouter() http.Handler {
 }
 
 func (srv *Server) Start() error {
+	if srv.Config.Redis != nil && srv.Config.Redis.Enabled {
+		srv.RedisServer = NewRedisServer(srv.Config, srv.DB, srv.Logger)
+		if err := srv.RedisServer.Start(); err != nil {
+			return err
+		}
+	}
+
 	r := srv.buildRouter()
-	srv.Logger.Info("started listening", "port", srv.Config.Server.Port, "host", srv.Config.Server.Host)
-	srv.Server = &http.Server{
+	srv.Logger.Info("started listening", "protocol", "http", "port", srv.Config.Server.Port, "host", srv.Config.Server.Host)
+	srv.HTTPServer = &http.Server{
 		Addr:    fmt.Sprintf("%s:%d", srv.Config.Server.Host, srv.Config.Server.Port),
 		Handler: r,
 	}
 	srv.Logger.Info("press Ctrl+C to exit")
 
-	if err := srv.Server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	if err := srv.HTTPServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if srv.RedisServer != nil {
+			_ = srv.RedisServer.Stop()
+		}
 		srv.Logger.Error("HTTP server error", slog.Any("err", err))
+		return err
 	}
 
 	return nil
 }
 
 func (srv *Server) Stop() error {
-	srv.Logger.Info("Stopping HTTP server")
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+	var stopErr error
 
-	if err := srv.Server.Shutdown(ctx); err != nil {
-		srv.Logger.Error("HTTP server shutdown error", "error", err)
-		return err
+	if srv.RedisServer != nil {
+		srv.Logger.Info("Stopping Redis server")
+		if err := srv.RedisServer.Stop(); err != nil {
+			srv.Logger.Error("Redis server shutdown error", "error", err)
+			stopErr = err
+		}
 	}
 
-	srv.Logger.Info("HTTP server stopped")
-	return nil
+	if srv.HTTPServer != nil {
+		srv.Logger.Info("Stopping HTTP server")
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		if err := srv.HTTPServer.Shutdown(ctx); err != nil {
+			srv.Logger.Error("HTTP server shutdown error", "error", err)
+			if stopErr == nil {
+				stopErr = err
+			}
+		} else {
+			srv.Logger.Info("HTTP server stopped")
+		}
+	}
+
+	return stopErr
 }

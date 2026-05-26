@@ -21,7 +21,7 @@ func runServer(cfgFile string) {
 
 	logger := createLogger(config.Server.LogLevel)
 	storage.SetLogger(logger)
-	db, DBErr := storage.Open(config.DB.Filename, nil)
+	db, DBErr := storage.Open(config.DB.Filename, config.DB.StorageOptions())
 	if DBErr != nil {
 		fmt.Printf("Error opening database:\n  %v\n", DBErr)
 		os.Exit(1)

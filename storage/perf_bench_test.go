@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"encoding/binary"
 	"os"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func benchKey(i int) []byte {
@@ -25,6 +27,67 @@ func openBenchmarkDB(b *testing.B) *DB {
 		_ = os.Remove(db.dal.opts.TxLogPath)
 	})
 	return db
+}
+
+func createBatchBucketIfNeeded(tx *Tx, name []byte) (*Bucket, error) {
+	bucket, err := tx.CreateBucketIfNotExists(name)
+	if err != nil {
+		return nil, err
+	}
+	return bucket, nil
+}
+
+func writeBatch(tx *Tx, bucketName []byte, start, count int, value []byte) error {
+	bucket, err := createBatchBucketIfNeeded(tx, bucketName)
+	if err != nil {
+		return err
+	}
+	for i := 0; i < count; i++ {
+		if err = bucket.Put(benchKey(start+i), value); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func TestBatchWrite1000InSingleTx(t *testing.T) {
+	const batchSize = 1000
+
+	db, _ := CreateTestDB(t)
+	value := bytes.Repeat([]byte("v"), 64)
+	start := time.Now()
+
+	err := db.Update(func(tx *Tx) error {
+		return writeBatch(tx, []byte("bench"), 0, batchSize, value)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	elapsed := time.Since(start)
+	writesPerSecond := float64(batchSize) / elapsed.Seconds()
+	t.Logf("batch write: %d records in one tx, value_size=%dB, elapsed=%s, writes/sec=%.0f",
+		batchSize, len(value), elapsed, writesPerSecond)
+
+	err = db.View(func(tx *Tx) error {
+		bucket, err := tx.GetBucket([]byte("bench"))
+		if err != nil {
+			return err
+		}
+		for i := 0; i < batchSize; i++ {
+			got, found := bucket.Get(benchKey(i))
+			if !found {
+				t.Fatalf("missing key %d", i)
+			}
+			if !bytes.Equal(got, value) {
+				t.Fatalf("unexpected value for key %d", i)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 }
 
 func BenchmarkFreelistAllocateRelease(b *testing.B) {
@@ -56,6 +119,120 @@ func BenchmarkBaseSetInWriteTx(b *testing.B) {
 	}
 	b.StopTimer()
 	tx.Rollback()
+}
+
+func BenchmarkBatchWrite1000InSingleTx(b *testing.B) {
+	const batchSize = 1000
+
+	db := openBenchmarkDB(b)
+	value := bytes.Repeat([]byte("v"), 64)
+	b.SetBytes(int64(batchSize * len(value)))
+	b.ReportMetric(float64(batchSize), "writes/tx")
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		start := i * batchSize
+		err := db.Update(func(tx *Tx) error {
+			return writeBatch(tx, []byte("bench"), start, batchSize, value)
+		})
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkSingleWritePerTx(b *testing.B) {
+	db := openBenchmarkDB(b)
+	value := bytes.Repeat([]byte("v"), 64)
+	b.SetBytes(int64(len(value)))
+	b.ReportMetric(1, "writes/tx")
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		err := db.Update(func(tx *Tx) error {
+			bucket, bucketErr := tx.CreateBucketIfNotExists([]byte("bench"))
+			if bucketErr != nil {
+				return bucketErr
+			}
+			return bucket.Put(benchKey(i), value)
+		})
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkSingleWritePerTxJournal(b *testing.B) {
+	path := TempFileName(".db")
+	opts := DefaultOptions().
+		WithSyncPolicy(SyncPolicyJournal).
+		WithCheckpointTxThreshold(64)
+	db, err := Open(path, opts)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() {
+		_ = db.Close()
+		_ = os.Remove(path)
+		_ = os.Remove(db.dal.opts.TxLogPath)
+	})
+
+	value := bytes.Repeat([]byte("v"), 64)
+	b.SetBytes(int64(len(value)))
+	b.ReportMetric(1, "writes/tx")
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		err = db.Update(func(tx *Tx) error {
+			bucket, bucketErr := tx.CreateBucketIfNotExists([]byte("bench"))
+			if bucketErr != nil {
+				return bucketErr
+			}
+			return bucket.Put(benchKey(i), value)
+		})
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkParallelSingleWritePerTxGroup(b *testing.B) {
+	path := TempFileName(".db")
+	opts := DefaultOptions().
+		WithSyncPolicy(SyncPolicyGroup).
+		WithGroupCommitTxThreshold(16).
+		WithGroupCommitWindow(time.Millisecond)
+	db, err := Open(path, opts)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() {
+		_ = db.Close()
+		_ = os.Remove(path)
+		_ = os.Remove(db.dal.opts.TxLogPath)
+	})
+
+	value := bytes.Repeat([]byte("v"), 64)
+	b.SetBytes(int64(len(value)))
+	b.ReportMetric(1, "writes/tx")
+
+	var keyCounter atomic.Uint64
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			keyID := int(keyCounter.Add(1))
+			updateErr := db.Update(func(tx *Tx) error {
+				bucket, bucketErr := tx.CreateBucketIfNotExists([]byte("bench"))
+				if bucketErr != nil {
+					return bucketErr
+				}
+				return bucket.Put(benchKey(keyID), value)
+			})
+			if updateErr != nil {
+				b.Fatal(updateErr)
+			}
+		}
+	})
 }
 
 func BenchmarkBaseGetInReadTx(b *testing.B) {

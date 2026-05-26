@@ -64,7 +64,7 @@ func Test_Recovery_AfterSimulatedCrash(t *testing.T) {
 
 func TestTxLogRecoverRejectsOffsetPageMismatch(t *testing.T) {
 	logPath := TempFileName(".tlog")
-	txLog := NewTxLog(logPath, 0600)
+	txLog := NewTxLog(logPath, 0600, BTreePageSize)
 	require.NotNil(t, txLog.file)
 	t.Cleanup(func() {
 		_ = txLog.file.Close()
@@ -86,4 +86,46 @@ func TestTxLogRecoverRejectsOffsetPageMismatch(t *testing.T) {
 		return nil
 	})
 	require.ErrorContains(t, err, "offset/page mismatch")
+}
+
+func TestRecovery_ReplaysStaleCommittedJournalIdempotently(t *testing.T) {
+	db, filename := CreateTestDB(t)
+
+	var staleJournal []byte
+	captured := false
+	db.dal.beforeSetPageHook = func(_ *Page) error {
+		if db.dal.txLog.active || captured {
+			return nil
+		}
+		data, err := os.ReadFile(db.dal.opts.TxLogPath)
+		require.NoError(t, err)
+		staleJournal = append([]byte(nil), data...)
+		captured = true
+		return nil
+	}
+
+	err := db.Update(func(tx *Tx) error {
+		bucket, err := tx.CreateBucketIfNotExists([]byte("users"))
+		require.NoError(t, err)
+		return bucket.Put([]byte("id"), []byte("committed"))
+	})
+	require.NoError(t, err)
+	require.NotEmpty(t, staleJournal)
+
+	journalFile, err := os.OpenFile(db.dal.opts.TxLogPath, os.O_WRONLY|os.O_TRUNC, 0600)
+	require.NoError(t, err)
+	_, err = journalFile.Write(staleJournal)
+	require.NoError(t, err)
+	require.NoError(t, journalFile.Sync())
+	require.NoError(t, journalFile.Close())
+
+	CloseTestDB(t, db)
+	db = OpenTestDB(t, filename, DefaultOptions().WithRecovery(true))
+	requireBucketValue(t, db, []byte("users"), []byte("id"), []byte("committed"))
+	require.False(t, txLogActive(t, db))
+
+	CloseTestDB(t, db)
+	db = OpenTestDB(t, filename, DefaultOptions().WithRecovery(true))
+	requireBucketValue(t, db, []byte("users"), []byte("id"), []byte("committed"))
+	require.False(t, txLogActive(t, db))
 }
