@@ -3,6 +3,7 @@ package storage
 
 import (
 	"encoding/binary"
+	"io"
 )
 
 // Blob - first page
@@ -70,10 +71,9 @@ func GetBlob(tx *Tx, startPageNum uint64) (*Blob, error) {
 	if startPage.Data[blobExtraPageTypeOffset] != BlobPage {
 		return nil, ErrCorruptedBlob
 	}
-	pageCount := int(binary.LittleEndian.Uint32(startPage.Data[blobFirstPageTotalPagesOffset:]))
-	dataLen := int(binary.LittleEndian.Uint32(startPage.Data[blobFirstPageDataSizeOffset:]))
-	if pageCount <= 0 {
-		return nil, ErrCorruptedBlob
+	pageCount, dataLen, err := decodeBlobHeader(startPage)
+	if err != nil {
+		return nil, err
 	}
 
 	blob := Blob{
@@ -122,6 +122,70 @@ func GetBlob(tx *Tx, startPageNum uint64) (*Blob, error) {
 		}
 	}
 	return &blob, nil
+}
+
+func BlobSize(tx *Tx, startPageNum uint64) (int, error) {
+	page, err := tx.getPage(startPageNum)
+	if err != nil {
+		return 0, err
+	}
+	_, dataLen, err := decodeBlobHeader(page)
+	return dataLen, err
+}
+
+func WriteBlobTo(tx *Tx, startPageNum uint64, w io.Writer) (int64, error) {
+	startPage, err := tx.getPage(startPageNum)
+	if err != nil {
+		return 0, err
+	}
+
+	pageCount, dataLen, err := decodeBlobHeader(startPage)
+	if err != nil {
+		return 0, err
+	}
+
+	var written int64
+	nextPageNum := binary.LittleEndian.Uint64(startPage.Data[blobFirstPageNextPageOffset:])
+	pos := blobFirstPageDataOffset
+	bytesRemaining := dataLen
+
+	for pageIdx := range pageCount {
+		var page *Page
+		if pageIdx == 0 {
+			page = startPage
+		} else {
+			page, err = tx.getPage(nextPageNum)
+			if err != nil {
+				return written, err
+			}
+			pos = 0
+			if page.Data[pos] != BlobPage {
+				return written, ErrCorruptedBlob
+			}
+			pos++
+			nextPageNum = binary.LittleEndian.Uint64(page.Data[pos:])
+			pos += blobNextPageNumSize
+		}
+
+		pageCapacity := len(page.Data[pos:])
+		toWrite := min(bytesRemaining, pageCapacity)
+		if toWrite > 0 {
+			n, writeErr := w.Write(page.Data[pos : pos+toWrite])
+			written += int64(n)
+			if writeErr != nil {
+				return written, writeErr
+			}
+			if n != toWrite {
+				return written, io.ErrShortWrite
+			}
+			bytesRemaining -= toWrite
+		}
+	}
+
+	if bytesRemaining != 0 {
+		return written, ErrCorruptedBlob
+	}
+	return written, nil
 }
 
 func DeleteBlob(tx *Tx, startPageNum uint64) (int, error) {
@@ -219,6 +283,76 @@ func (blob *Blob) Save(tx *Tx) (uint64, error) {
 	}
 
 	return startPageNum, nil
+}
+
+func SaveBlobFromReader(tx *Tx, r io.Reader, dataLen int64) (uint64, error) {
+	if dataLen < 0 {
+		return 0, ErrCorruptedBlob
+	}
+	if dataLen > maxBlobSize {
+		return 0, ErrBlobTooLarge
+	}
+
+	pageCount := calcPageCountForPageSize(int(dataLen), int(tx.db.dal.meta.pageSize))
+	if pageCount <= 0 {
+		return 0, ErrCorruptedBlob
+	}
+	pageNums, err := tx.allocatePageNumbers(pageCount)
+	if err != nil {
+		return 0, err
+	}
+	startPageNum := pageNums[0]
+
+	bytesRemaining := int(dataLen)
+	for pageIndex := 0; pageIndex < pageCount; pageIndex++ {
+		var nextPageNum uint64
+		if pageIndex < pageCount-1 {
+			nextPageNum = pageNums[pageIndex+1]
+		}
+		page := &Page{
+			PageNumber: pageNums[pageIndex],
+			Data:       make([]byte, tx.db.dal.meta.pageSize),
+		}
+		page.Data[blobExtraPageTypeOffset] = BlobPage
+
+		pos := blobExtraPageNextPageOffset
+		if pageIndex == 0 {
+			binary.LittleEndian.PutUint32(page.Data[blobFirstPageTotalPagesOffset:], uint32(pageCount))
+			binary.LittleEndian.PutUint32(page.Data[blobFirstPageDataSizeOffset:], uint32(dataLen))
+			pos = blobFirstPageNextPageOffset
+		}
+
+		binary.LittleEndian.PutUint64(page.Data[pos:], nextPageNum)
+		pos += blobNextPageNumSize
+
+		capacity := len(page.Data[pos:])
+		toRead := min(bytesRemaining, capacity)
+		if toRead > 0 {
+			if _, err = io.ReadFull(r, page.Data[pos:pos+toRead]); err != nil {
+				return 0, err
+			}
+			bytesRemaining -= toRead
+		}
+
+		tx.setPage(page)
+	}
+
+	if bytesRemaining != 0 {
+		return 0, ErrCorruptedBlob
+	}
+	return startPageNum, nil
+}
+
+func decodeBlobHeader(startPage *Page) (int, int, error) {
+	if startPage.Data[blobExtraPageTypeOffset] != BlobPage {
+		return 0, 0, ErrCorruptedBlob
+	}
+	pageCount := int(binary.LittleEndian.Uint32(startPage.Data[blobFirstPageTotalPagesOffset:]))
+	dataLen := int(binary.LittleEndian.Uint32(startPage.Data[blobFirstPageDataSizeOffset:]))
+	if pageCount <= 0 {
+		return 0, 0, ErrCorruptedBlob
+	}
+	return pageCount, dataLen, nil
 }
 
 func calcPageCountForPageSize(dataSize int, pageSize int) int {

@@ -220,7 +220,7 @@ func (srv *RedisServer) executeBlockingMove(selectedDB int, args [][]byte) (redi
 }
 
 func (srv *RedisServer) tryPopAny(selectedDB int, keys [][]byte, left bool) (redisBlockingPopResult, error) {
-	ns := redisNamespaceForDB(selectedDB)
+	ns := srv.redisNamespace(selectedDB)
 	nowMs := srv.nowUnixMilli()
 	var result redisBlockingPopResult
 	err := srv.DB.Update(func(tx *storage.Tx) error {
@@ -247,7 +247,7 @@ func (srv *RedisServer) tryPopAny(selectedDB int, keys [][]byte, left bool) (red
 }
 
 func (srv *RedisServer) tryMove(selectedDB int, source, destination []byte) (redisBlockingMoveResult, error) {
-	ns := redisNamespaceForDB(selectedDB)
+	ns := srv.redisNamespace(selectedDB)
 	nowMs := srv.nowUnixMilli()
 	var result redisBlockingMoveResult
 	err := srv.DB.Update(func(tx *storage.Tx) error {
@@ -350,7 +350,7 @@ func (srv *RedisServer) notifyPipelineListWrites(selectedDB int, queuedCommands 
 
 	if len(renameCandidates) > 0 {
 		nowMs := srv.nowUnixMilli()
-		ns := redisNamespaceForDB(selectedDB)
+		ns := srv.redisNamespace(selectedDB)
 		_ = srv.DB.View(func(tx *storage.Tx) error {
 			for keyString, key := range renameCandidates {
 				keyType, err := redisKeyTypeTx(tx, ns, key, nowMs)

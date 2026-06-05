@@ -323,7 +323,10 @@ func saveRedisBloomMetaTx(tx *storage.Tx, ns redisNamespace, key []byte, meta *r
 	if err != nil {
 		return err
 	}
-	return bucket.Put(key, meta.serialize())
+	if err = bucket.Put(key, meta.serialize()); err != nil {
+		return err
+	}
+	return ensureRedisSlotIndexEntryTx(tx, ns, key)
 }
 
 func deleteRedisBloomMetaTx(tx *storage.Tx, ns redisNamespace, key []byte) error {
@@ -338,7 +341,10 @@ func deleteRedisBloomMetaTx(tx *storage.Tx, ns redisNamespace, key []byte) error
 	if errors.Is(err, storage.ErrNodeNotFound) {
 		return nil
 	}
-	return err
+	if err != nil {
+		return err
+	}
+	return deleteRedisSlotIndexEntryTx(tx, ns, key)
 }
 
 func nextRedisBloomIDTx(tx *storage.Tx, ns redisNamespace) (uint64, error) {

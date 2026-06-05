@@ -266,6 +266,27 @@ func TestBucketInsertBlob(t *testing.T) {
 	require.NoError(t, err)
 }
 
+func TestBucketPutReaderLargeValue(t *testing.T) {
+	db, _ := CreateTestDB(t)
+	testValue := bytes.Repeat([]byte("put-reader-blob-"), 2048)
+
+	err := db.Update(func(tx *Tx) error {
+		bucket, _ := tx.CreateBucket([]byte("foo"))
+		return bucket.PutReader([]byte("foo"), bytes.NewReader(testValue), int64(len(testValue)))
+	})
+	require.NoError(t, err)
+
+	err = db.View(func(tx *Tx) error {
+		bucket, _ := tx.GetBucket([]byte("foo"))
+		v, found := bucket.Get([]byte("foo"))
+		require.True(t, found)
+		require.Equal(t, testValue, v)
+		require.Equal(t, uint64(1), bucket.blobsN)
+		return nil
+	})
+	require.NoError(t, err)
+}
+
 func TestCreateBuckets(t *testing.T) {
 	db, _ := CreateTestDB(t)
 	nBuckets := 1000

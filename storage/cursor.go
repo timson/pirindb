@@ -137,6 +137,25 @@ func (cursor *Cursor) First() (key []byte, value []byte) {
 	return item.Key, v
 }
 
+func (cursor *Cursor) FirstItem() *Item {
+	cursor.reset()
+	if cursor.tx == nil || cursor.bucket == nil || cursor.bucket.root == 0 {
+		return nil
+	}
+	root, err := cursor.tx.getNode(cursor.bucket.root)
+	if err != nil {
+		return nil
+	}
+	item, node, err := traverseToFirstItem(cursor.tx, root, &cursor.stack)
+	if err != nil {
+		return nil
+	}
+	cursor.node = node
+	cursor.itemIndex = 0
+	cursor.childIndex = 0
+	return item
+}
+
 func (cursor *Cursor) Last() (key []byte, value []byte) {
 	cursor.reset()
 	if cursor.tx == nil || cursor.bucket == nil || cursor.bucket.root == 0 {
@@ -280,6 +299,62 @@ func (cursor *Cursor) Next() ([]byte, []byte) {
 		return nil, nil
 	}
 	return item.Key, value
+}
+
+func (cursor *Cursor) NextItem() *Item {
+	if cursor.node == nil {
+		return nil
+	}
+
+	var err error
+	if cursor.node.isLeaf() {
+		if cursor.itemIndex < len(cursor.node.items)-1 {
+			cursor.itemIndex++
+			return cursor.node.items[cursor.itemIndex]
+		}
+		for {
+			parent, ok := stackPop(&cursor.stack)
+			if !ok {
+				return nil
+			}
+			if parent.childIndex < len(parent.children)-1 {
+				cursor.node, err = cursor.tx.getNode(parent.pageNum)
+				if err != nil {
+					return nil
+				}
+				if parent.itemIndex < 0 || parent.itemIndex >= len(cursor.node.items) {
+					continue
+				}
+				item := cursor.node.items[parent.itemIndex]
+				cursor.childIndex = parent.childIndex
+				cursor.itemIndex = parent.itemIndex + 1
+				return item
+			}
+		}
+	}
+
+	cursor.childIndex++
+	if cursor.childIndex >= len(cursor.node.childNodes) {
+		return nil
+	}
+	childPage := cursor.node.childNodes[cursor.childIndex]
+	childNode, errGetNode := cursor.tx.getNode(childPage)
+	if errGetNode != nil {
+		return nil
+	}
+	stackPush(&cursor.stack, cursorFrame{
+		pageNum:    cursor.node.PageNum,
+		children:   cursor.node.childNodes,
+		childIndex: cursor.childIndex,
+		itemIndex:  cursor.itemIndex,
+	})
+	item, node, errTraverse := traverseToFirstItem(cursor.tx, childNode, &cursor.stack)
+	if errTraverse != nil {
+		return nil
+	}
+	cursor.node = node
+	cursor.itemIndex = 0
+	return item
 }
 
 func (cursor *Cursor) Prev() ([]byte, []byte) {

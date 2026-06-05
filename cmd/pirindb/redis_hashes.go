@@ -83,7 +83,10 @@ func saveRedisHashMetaTx(tx *storage.Tx, ns redisNamespace, key []byte, meta *re
 	if err != nil {
 		return err
 	}
-	return bucket.Put(key, meta.serialize())
+	if err = bucket.Put(key, meta.serialize()); err != nil {
+		return err
+	}
+	return ensureRedisSlotIndexEntryTx(tx, ns, key)
 }
 
 func deleteRedisHashMetaTx(tx *storage.Tx, ns redisNamespace, key []byte) error {
@@ -98,7 +101,10 @@ func deleteRedisHashMetaTx(tx *storage.Tx, ns redisNamespace, key []byte) error 
 	if errors.Is(err, storage.ErrNodeNotFound) {
 		return nil
 	}
-	return err
+	if err != nil {
+		return err
+	}
+	return deleteRedisSlotIndexEntryTx(tx, ns, key)
 }
 
 func nextRedisHashIDTx(tx *storage.Tx, ns redisNamespace) (uint64, error) {

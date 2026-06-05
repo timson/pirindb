@@ -1,10 +1,13 @@
 package main
 
 import (
+	"errors"
 	"github.com/go-playground/validator/v10"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 	"github.com/timson/pirindb/storage"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -21,9 +24,32 @@ type RedisConfig struct {
 	Port    int    `mapstructure:"port" validate:"required,min=1,max=65535"`
 }
 
-type ShardConfig struct {
-	Name  string
-	Index int
+type ClusterNodeConfig struct {
+	ID           string   `mapstructure:"id"`
+	RedisAddress string   `mapstructure:"redis_address"`
+	HTTPAddress  string   `mapstructure:"http_address"`
+	Slots        []string `mapstructure:"slots"`
+}
+
+type ClusterBootstrapSlotsConfig struct {
+	NodeID string   `mapstructure:"node_id"`
+	Slots  []string `mapstructure:"slots"`
+}
+
+type ClusterTopologyConfig struct {
+	Name           string                         `mapstructure:"name"`
+	SlotCount      int                            `mapstructure:"slot_count"`
+	Nodes          []*ClusterNodeConfig           `mapstructure:"nodes"`
+	BootstrapSlots []*ClusterBootstrapSlotsConfig `mapstructure:"bootstrap_slots"`
+}
+
+type ClusterConfig struct {
+	Enabled      bool                   `mapstructure:"enabled"`
+	NodeID       string                 `mapstructure:"node_id"`
+	SlotCount    int                    `mapstructure:"slot_count"`
+	Nodes        []*ClusterNodeConfig   `mapstructure:"nodes"`
+	TopologyFile string                 `mapstructure:"topology_file"`
+	Topology     *ClusterTopologyConfig `mapstructure:"-"`
 }
 
 type DatabaseConfig struct {
@@ -35,10 +61,10 @@ type DatabaseConfig struct {
 }
 
 type Config struct {
-	Server *ServerConfig
-	Redis  *RedisConfig
-	Shards []*ShardConfig
-	DB     *DatabaseConfig
+	Server  *ServerConfig
+	Redis   *RedisConfig
+	Cluster *ClusterConfig
+	DB      *DatabaseConfig
 }
 
 func initDefaults() {
@@ -53,6 +79,8 @@ func initDefaults() {
 	viper.SetDefault("redis.enabled", true)
 	viper.SetDefault("redis.host", "127.0.0.1")
 	viper.SetDefault("redis.port", 6379)
+	viper.SetDefault("cluster.enabled", false)
+	viper.SetDefault("cluster.slot_count", 16384)
 }
 
 func setupFlags(cmd *cobra.Command) {
@@ -68,6 +96,10 @@ func setupFlags(cmd *cobra.Command) {
 	cmd.PersistentFlags().Bool("redis-enabled", true, "Enable Redis-compatible server")
 	cmd.PersistentFlags().String("redis-host", "", "Redis server host")
 	cmd.PersistentFlags().Int("redis-port", 0, "Redis server port")
+	cmd.PersistentFlags().Bool("cluster-enabled", false, "Enable internal cluster slot routing")
+	cmd.PersistentFlags().String("cluster-node-id", "", "Local cluster node ID")
+	cmd.PersistentFlags().Int("cluster-slot-count", 0, "Total cluster slot count")
+	cmd.PersistentFlags().String("cluster-topology-file", "", "Path to a shared cluster topology TOML file")
 
 	_ = viper.BindPFlag("server.host", cmd.PersistentFlags().Lookup("host"))
 	_ = viper.BindPFlag("server.port", cmd.PersistentFlags().Lookup("port"))
@@ -80,6 +112,10 @@ func setupFlags(cmd *cobra.Command) {
 	_ = viper.BindPFlag("redis.enabled", cmd.PersistentFlags().Lookup("redis-enabled"))
 	_ = viper.BindPFlag("redis.host", cmd.PersistentFlags().Lookup("redis-host"))
 	_ = viper.BindPFlag("redis.port", cmd.PersistentFlags().Lookup("redis-port"))
+	_ = viper.BindPFlag("cluster.enabled", cmd.PersistentFlags().Lookup("cluster-enabled"))
+	_ = viper.BindPFlag("cluster.node_id", cmd.PersistentFlags().Lookup("cluster-node-id"))
+	_ = viper.BindPFlag("cluster.slot_count", cmd.PersistentFlags().Lookup("cluster-slot-count"))
+	_ = viper.BindPFlag("cluster.topology_file", cmd.PersistentFlags().Lookup("cluster-topology-file"))
 
 	viper.SetEnvPrefix("pirindb")
 	viper.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
@@ -101,12 +137,69 @@ func loadConfig(cfgFile string) (*Config, error) {
 	if err := viper.Unmarshal(&cfg); err != nil {
 		return nil, err
 	}
+	if err := hydrateClusterConfig(&cfg, cfgFile); err != nil {
+		return nil, err
+	}
 	validate := validator.New(validator.WithRequiredStructEnabled())
 	err := validate.Struct(&cfg)
 	if err != nil {
 		return nil, err
 	}
+	if err = validateClusterConfig(&cfg); err != nil {
+		return nil, err
+	}
 	return &cfg, nil
+}
+
+func hydrateClusterConfig(cfg *Config, cfgFile string) error {
+	if cfg == nil || cfg.Cluster == nil || !cfg.Cluster.Enabled {
+		return nil
+	}
+	if cfg.Cluster.TopologyFile != "" {
+		topologyPath := cfg.Cluster.TopologyFile
+		if !filepath.IsAbs(topologyPath) && cfgFile != "" {
+			topologyPath = filepath.Join(filepath.Dir(cfgFile), topologyPath)
+		}
+		topology, err := loadClusterTopologyFile(topologyPath)
+		if err != nil {
+			return err
+		}
+		cfg.Cluster.TopologyFile = topologyPath
+		cfg.Cluster.Topology = topology
+		if topology.SlotCount > 0 {
+			cfg.Cluster.SlotCount = topology.SlotCount
+		}
+	}
+	if strings.TrimSpace(cfg.Cluster.NodeID) == "" {
+		hostname, err := os.Hostname()
+		if err != nil {
+			return err
+		}
+		cfg.Cluster.NodeID = strings.TrimSpace(hostname)
+	}
+	return nil
+}
+
+func loadClusterTopologyFile(path string) (*ClusterTopologyConfig, error) {
+	if strings.TrimSpace(path) == "" {
+		return nil, errors.New("cluster topology file path is empty")
+	}
+	type clusterTopologyFile struct {
+		Cluster *ClusterTopologyConfig `mapstructure:"cluster"`
+	}
+	v := viper.New()
+	v.SetConfigFile(path)
+	if err := v.ReadInConfig(); err != nil {
+		return nil, err
+	}
+	var topoFile clusterTopologyFile
+	if err := v.Unmarshal(&topoFile); err != nil {
+		return nil, err
+	}
+	if topoFile.Cluster == nil {
+		return nil, errors.New("cluster topology file does not contain [cluster]")
+	}
+	return topoFile.Cluster, nil
 }
 
 func (cfg *DatabaseConfig) StorageOptions() *storage.Options {

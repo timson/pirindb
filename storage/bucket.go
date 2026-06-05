@@ -3,6 +3,7 @@ package storage
 import (
 	"bytes"
 	"encoding/binary"
+	"io"
 )
 
 const (
@@ -41,28 +42,58 @@ func newBucket(name []byte) *Bucket {
 }
 
 func (bucket *Bucket) Get(key []byte) ([]byte, bool) {
-	if bucket.tx == nil {
+	value, found, err := bucket.getItem(key)
+	if err != nil || !found {
 		return nil, false
 	}
-	if bucket.root == 0 {
-		return nil, false
-	}
-	node, err := bucket.tx.getNode(bucket.root)
-	if err != nil {
-		return nil, false
-	}
-	pos, foundNode, found := node.FindExact(bucket.tx, key)
-	if !found {
-		return nil, false
-	}
-
-	value := foundNode.items[pos]
 	v, getErr := value.getValue(bucket.tx)
 	if getErr != nil {
 		return nil, false
 	}
 
 	return v, true
+}
+
+func (bucket *Bucket) ValueLen(key []byte) (int, bool, error) {
+	item, found, err := bucket.getItem(key)
+	if err != nil || !found {
+		return 0, found, err
+	}
+	valueLen, err := item.valueLen(bucket.tx)
+	if err != nil {
+		return 0, false, err
+	}
+	return valueLen, true, nil
+}
+
+func (bucket *Bucket) WriteValueTo(key []byte, w io.Writer) (int64, bool, error) {
+	item, found, err := bucket.getItem(key)
+	if err != nil || !found {
+		return 0, found, err
+	}
+	written, err := item.writeValueTo(bucket.tx, w)
+	if err != nil {
+		return written, false, err
+	}
+	return written, true, nil
+}
+
+func (bucket *Bucket) getItem(key []byte) (*Item, bool, error) {
+	if bucket.tx == nil {
+		return nil, false, ErrTxClosed
+	}
+	if bucket.root == 0 {
+		return nil, false, nil
+	}
+	node, err := bucket.tx.getNode(bucket.root)
+	if err != nil {
+		return nil, false, err
+	}
+	pos, foundNode, found := node.FindExact(bucket.tx, key)
+	if !found {
+		return nil, false, nil
+	}
+	return foundNode.items[pos], true, nil
 }
 
 // Bucket value map
@@ -114,11 +145,52 @@ func (bucket *Bucket) getNodes(indexes []int) ([]*BNode, error) {
 }
 
 func (bucket *Bucket) Put(key, value []byte) error {
+	item := Item{
+		Key:   key,
+		Value: value,
+	}
+	if err := item.setValue(bucket.tx); err != nil {
+		return err
+	}
+	return bucket.putEncodedValue(key, item.Value, len(value), len(value) > MaxValueSize)
+}
+
+func (bucket *Bucket) PutReader(key []byte, r io.Reader, valueLen int64) error {
+	if bucket.tx == nil {
+		return ErrTxClosed
+	}
+	if len(key) >= MaxKeySize {
+		return ErrKeyTooLarge
+	}
+	if valueLen < 0 {
+		return ErrValueTooLarge
+	}
+	if valueLen >= OneGigabyte {
+		return ErrValueTooLarge
+	}
+	if valueLen <= MaxValueSize {
+		buf := make([]byte, int(valueLen))
+		if _, err := io.ReadFull(r, buf); err != nil {
+			return err
+		}
+		return bucket.Put(key, buf)
+	}
+
+	pageNum, err := SaveBlobFromReader(bucket.tx, r, valueLen)
+	if err != nil {
+		return err
+	}
+	encodedValue := make([]byte, 1+UInt64Size)
+	encodedValue[0] = ValueBlob
+	binary.LittleEndian.PutUint64(encodedValue[1:], pageNum)
+	return bucket.putEncodedValue(key, encodedValue, int(valueLen), true)
+}
+
+func (bucket *Bucket) putEncodedValue(key []byte, encodedValue []byte, logicalValueLen int, newIsBlob bool) error {
 	var root *BNode
 	var err error
 	var keyExists bool
-	newValueLen := len(value)
-	newIsBlob := len(value) > MaxValueSize
+	newValueLen := logicalValueLen
 
 	if bucket.tx == nil {
 		return ErrTxClosed
@@ -126,19 +198,13 @@ func (bucket *Bucket) Put(key, value []byte) error {
 	if len(key) >= MaxKeySize {
 		return ErrKeyTooLarge
 	}
-	if len(value) >= OneGigabyte {
+	if logicalValueLen >= OneGigabyte {
 		return ErrValueTooLarge
 	}
 
 	item := Item{
 		Key:   key,
-		Value: value,
-	}
-
-	// Persist the value if needed to a blob store, before modifying the tree
-	err = item.setValue(bucket.tx)
-	if err != nil {
-		return err
+		Value: encodedValue,
 	}
 
 	// First insert: no root exists yet. Create a root node and set it

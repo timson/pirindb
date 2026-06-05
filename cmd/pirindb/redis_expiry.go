@@ -215,6 +215,9 @@ func deleteRedisKeyByRawTypeTx(tx *storage.Tx, ns redisNamespace, key []byte, ke
 			return false, err
 		}
 		removed = true
+		if err := deleteRedisSlotIndexEntryTx(tx, ns, key); err != nil {
+			return false, err
+		}
 	case redisKeyTypeList:
 		meta, found, err := loadRedisListMetaTx(tx, ns, key)
 		if err != nil {

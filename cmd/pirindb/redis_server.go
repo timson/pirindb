@@ -20,25 +20,29 @@ import (
 )
 
 type RedisServer struct {
-	DB       *storage.DB
-	Logger   *slog.Logger
-	Config   *Config
-	listener net.Listener
-	wg       sync.WaitGroup
-	conns    sync.Map
-	waitMu   sync.Mutex
-	waiters  map[string]map[chan struct{}]struct{}
-	stopOnce sync.Once
-	stopCh   chan struct{}
-	nowFn    func() time.Time
-	randFn   func() uint64
+	DB         *storage.DB
+	Logger     *slog.Logger
+	Config     *Config
+	Cluster    *ClusterManager
+	clusterErr error
+	listener   net.Listener
+	wg         sync.WaitGroup
+	conns      sync.Map
+	waitMu     sync.Mutex
+	waiters    map[string]map[chan struct{}]struct{}
+	stopOnce   sync.Once
+	stopCh     chan struct{}
+	nowFn      func() time.Time
+	randFn     func() uint64
 }
 
 type redisConn struct {
 	reader         *bufio.Reader
 	writer         *bufio.Writer
 	selectedDB     int
+	asking         bool
 	pipelineActive bool
+	pipelineAsking bool
 	queuedCommands [][][]byte
 }
 
@@ -74,6 +78,7 @@ type redisArrayReply struct {
 }
 
 var supportedRedisCommandNames = []string{
+	"ASKING",
 	"BF.ADD",
 	"BF.EXISTS",
 	"BF.MADD",
@@ -82,6 +87,7 @@ var supportedRedisCommandNames = []string{
 	"BLPOP",
 	"BRPOPLPUSH",
 	"BRPOP",
+	"CLUSTER",
 	"CONFIG",
 	"COMMAND",
 	"DECR",
@@ -157,13 +163,16 @@ var supportedRedisCommandNames = []string{
 }
 
 func NewRedisServer(cfg *Config, db *storage.DB, logger *slog.Logger) *RedisServer {
+	cluster, clusterErr := NewClusterManager(cfg, db, logger)
 	return &RedisServer{
-		DB:      db,
-		Logger:  logger,
-		Config:  cfg,
-		waiters: make(map[string]map[chan struct{}]struct{}),
-		stopCh:  make(chan struct{}),
-		nowFn:   time.Now,
+		DB:         db,
+		Logger:     logger,
+		Config:     cfg,
+		Cluster:    cluster,
+		clusterErr: clusterErr,
+		waiters:    make(map[string]map[chan struct{}]struct{}),
+		stopCh:     make(chan struct{}),
+		nowFn:      time.Now,
 		randFn: func() uint64 {
 			return uint64(rand.Int63())
 		},
@@ -171,6 +180,9 @@ func NewRedisServer(cfg *Config, db *storage.DB, logger *slog.Logger) *RedisServ
 }
 
 func (srv *RedisServer) Start() error {
+	if srv.clusterErr != nil {
+		return srv.clusterErr
+	}
 	if srv.Config == nil || srv.Config.Redis == nil || !srv.Config.Redis.Enabled {
 		return nil
 	}
@@ -284,7 +296,7 @@ func (srv *RedisServer) dispatch(resp *redisConn, args [][]byte) (redisReply, bo
 			if len(args) != 1 {
 				return nil, false, errors.New("wrong number of arguments for 'exec' command")
 			}
-			replies, err := srv.executePipeline(resp.selectedDB, resp.queuedCommands)
+			replies, err := srv.executePipeline(resp.selectedDB, resp.queuedCommands, resp.pipelineAsking)
 			resp.resetPipeline()
 			if err != nil {
 				return nil, false, err
@@ -314,9 +326,19 @@ func (srv *RedisServer) dispatch(resp *redisConn, args [][]byte) (redisReply, bo
 	}
 
 	switch command {
+	case "ASKING":
+		if len(args) != 1 {
+			return nil, false, errors.New("wrong number of arguments for 'asking' command")
+		}
+		resp.asking = true
+		return redisSimpleStringReply{value: "OK"}, false, nil
 	case "PIPELINE", "MULTI":
 		if len(args) != 1 {
 			return nil, false, fmt.Errorf("wrong number of arguments for '%s' command", strings.ToLower(command))
+		}
+		if resp.asking {
+			resp.pipelineAsking = true
+			resp.asking = false
 		}
 		resp.pipelineActive = true
 		resp.queuedCommands = resp.queuedCommands[:0]
@@ -338,22 +360,164 @@ func (srv *RedisServer) dispatch(resp *redisConn, args [][]byte) (redisReply, bo
 		resp.selectedDB = selectedDB
 		return redisSimpleStringReply{value: "OK"}, false, nil
 	default:
-		reply, err := srv.executeCommand(resp.selectedDB, args, nil, srv.nowUnixMilli())
+		allowAsking := resp.asking
+		resp.asking = false
+		reply, err := srv.executeCommand(resp.selectedDB, args, nil, srv.nowUnixMilli(), allowAsking)
 		return reply, false, err
 	}
 }
 
-func (srv *RedisServer) executePipeline(selectedDB int, queuedCommands [][][]byte) ([]redisReply, error) {
+func isRedisDeltaCaptureWriteCommand(command string) bool {
+	switch command {
+	case "BF.ADD", "BF.MADD", "BF.RESERVE",
+		"TOPK.ADD", "TOPK.INCRBY", "TOPK.RESERVE",
+		"DEL", "UNLINK", "EXPIRE", "PEXPIRE", "PERSIST",
+		"SET", "MSET", "GETSET", "INCR", "INCRBY", "DECR", "DECRBY",
+		"LPUSH", "RPUSH", "LPOP", "RPOP", "LSET", "LREM", "LTRIM", "RPOPLPUSH",
+		"HSET", "HDEL",
+		"RENAME", "RENAMENX",
+		"ZADD", "ZREM", "ZREMRANGEBYSCORE", "ZREMRANGEBYLEX":
+		return true
+	default:
+		return false
+	}
+}
+
+func (srv *RedisServer) clusterCopyingDeltaMoveForArgs(args [][]byte) (*clusterPendingMove, int, error) {
+	if srv.Cluster == nil || len(args) == 0 {
+		return nil, 0, nil
+	}
+	command := strings.ToUpper(string(args[0]))
+	if !isRedisDeltaCaptureWriteCommand(command) {
+		return nil, 0, nil
+	}
+	state := srv.Cluster.Snapshot()
+	if state == nil || !state.Rebalancing || state.PendingMove == nil {
+		return nil, 0, nil
+	}
+	if state.PendingMove.Stage != clusterMoveStageCopying || state.PendingMove.SourceNodeID != srv.Cluster.LocalNodeID {
+		return nil, 0, nil
+	}
+	keys, err := redisCommandKeys(args)
+	if err != nil {
+		return nil, 0, err
+	}
+	if len(keys) == 0 {
+		return nil, 0, nil
+	}
+	route, err := srv.Cluster.RouteKeys(keys)
+	if err != nil {
+		return nil, 0, err
+	}
+	if route == nil || !route.hasKey {
+		return nil, 0, nil
+	}
+	move := state.PendingMoveForSlot(route.slot)
+	if move == nil || move.ID == "" {
+		return nil, 0, nil
+	}
+	cloned := *move
+	return &cloned, state.SlotCount, nil
+}
+
+func (srv *RedisServer) clusterCopyingDeltaMoveForPipeline(queuedCommands [][][]byte) (*clusterPendingMove, int, error) {
+	if srv.Cluster == nil {
+		return nil, 0, nil
+	}
+	state := srv.Cluster.Snapshot()
+	if state == nil || !state.Rebalancing || state.PendingMove == nil {
+		return nil, 0, nil
+	}
+	if state.PendingMove.Stage != clusterMoveStageCopying || state.PendingMove.SourceNodeID != srv.Cluster.LocalNodeID {
+		return nil, 0, nil
+	}
+	combinedKeys := make([][]byte, 0)
+	for _, args := range queuedCommands {
+		keys, err := redisCommandKeys(args)
+		if err != nil {
+			return nil, 0, err
+		}
+		combinedKeys = append(combinedKeys, keys...)
+	}
+	if len(combinedKeys) == 0 {
+		return nil, 0, nil
+	}
+	route, err := srv.Cluster.RouteKeys(combinedKeys)
+	if err != nil {
+		return nil, 0, err
+	}
+	if route == nil || !route.hasKey {
+		return nil, 0, nil
+	}
+	move := state.PendingMoveForSlot(route.slot)
+	if move == nil || move.ID == "" {
+		return nil, 0, nil
+	}
+	cloned := *move
+	return &cloned, state.SlotCount, nil
+}
+
+func (srv *RedisServer) notifyStandaloneRedisWrite(selectedDB int, args [][]byte) {
+	if len(args) == 0 {
+		return
+	}
+	switch strings.ToUpper(string(args[0])) {
+	case "LPUSH", "RPUSH":
+		srv.notifyListWaiters(selectedDB, args[1])
+	case "RPOPLPUSH", "RENAME", "RENAMENX":
+		srv.notifyListWaiters(selectedDB, args[2])
+	}
+}
+
+func (srv *RedisServer) executeStandaloneWriteWithClusterDelta(selectedDB int, args [][]byte, nowMs int64, allowAsking bool, move *clusterPendingMove, slotCount int) (redisReply, error) {
+	tx := srv.DB.Begin(true)
+	defer tx.Rollback()
+
+	reply, err := srv.executeCommand(selectedDB, args, tx, nowMs, allowAsking)
+	if err != nil {
+		return nil, err
+	}
+	if err = captureClusterDeltaMutationsForCommandTx(tx, selectedDB, args, move, slotCount, nowMs); err != nil {
+		return nil, err
+	}
+	if err = tx.Commit(); err != nil {
+		return nil, err
+	}
+	srv.notifyStandaloneRedisWrite(selectedDB, args)
+	return reply, nil
+}
+
+func (srv *RedisServer) executePipeline(selectedDB int, queuedCommands [][][]byte, allowAsking bool) ([]redisReply, error) {
+	if err := srv.ensurePipelineClusterRoute(selectedDB, queuedCommands, allowAsking); err != nil {
+		return nil, err
+	}
+
 	writeTx := pipelineNeedsWriteTx(queuedCommands)
+	var (
+		deltaMove      *clusterPendingMove
+		deltaSlotCount int
+		err            error
+	)
+	if writeTx {
+		deltaMove, deltaSlotCount, err = srv.clusterCopyingDeltaMoveForPipeline(queuedCommands)
+		if err != nil {
+			return nil, err
+		}
+	}
 	tx := srv.DB.Begin(writeTx)
 	defer tx.Rollback()
 
 	nowMs := srv.nowUnixMilli()
 	replies := make([]redisReply, 0, len(queuedCommands))
 	for idx, args := range queuedCommands {
-		reply, err := srv.executeCommand(selectedDB, args, tx, nowMs)
+		reply, err := srv.executeCommand(selectedDB, args, tx, nowMs, allowAsking)
 		if err != nil {
 			return nil, fmt.Errorf("pipeline aborted at command %d (%s): %w", idx+1, strings.ToLower(string(args[0])), err)
+		}
+		if deltaMove != nil && isRedisDeltaCaptureWriteCommand(strings.ToUpper(string(args[0]))) {
+			if err = captureClusterDeltaMutationsForCommandTx(tx, selectedDB, args, deltaMove, deltaSlotCount, nowMs); err != nil {
+				return nil, err
+			}
 		}
 		replies = append(replies, reply)
 	}
@@ -387,7 +551,7 @@ func validateQueuedCommand(args [][]byte) error {
 	switch command {
 	case "INFO", "BLPOP", "BRPOP", "BRPOPLPUSH":
 		return fmt.Errorf("%s is not supported inside pipeline", strings.ToLower(command))
-	case "PIPELINE", "MULTI", "EXEC", "DISCARD", "QUIT", "SELECT":
+	case "ASKING", "PIPELINE", "MULTI", "EXEC", "DISCARD", "QUIT", "SELECT":
 		return fmt.Errorf("command '%s' is not queueable", strings.ToLower(command))
 	default:
 		return validateRedisCommand(args)
@@ -401,6 +565,10 @@ func validateRedisCommand(args [][]byte) error {
 
 	command := strings.ToUpper(string(args[0]))
 	switch command {
+	case "ASKING":
+		if len(args) != 1 {
+			return errors.New("wrong number of arguments for 'asking' command")
+		}
 	case "BF.ADD", "BF.EXISTS":
 		if len(args) != 3 {
 			return fmt.Errorf("wrong number of arguments for '%s' command", strings.ToLower(command))
@@ -438,6 +606,22 @@ func validateRedisCommand(args [][]byte) error {
 	case "PING":
 		if len(args) > 2 {
 			return errors.New("wrong number of arguments for 'ping' command")
+		}
+	case "CLUSTER":
+		if len(args) < 2 {
+			return errors.New("wrong number of arguments for 'cluster' command")
+		}
+		switch strings.ToUpper(string(args[1])) {
+		case "KEYSLOT":
+			if len(args) != 3 {
+				return errors.New("wrong number of arguments for 'cluster|keyslot' command")
+			}
+		case "SLOTS", "SHARDS":
+			if len(args) != 2 {
+				return fmt.Errorf("wrong number of arguments for 'cluster|%s' command", strings.ToLower(string(args[1])))
+			}
+		default:
+			return fmt.Errorf("unsupported cluster subcommand '%s'", strings.ToLower(string(args[1])))
 		}
 	case "COMMAND":
 		if len(args) > 2 {
@@ -799,22 +983,56 @@ func (srv *RedisServer) nowUnixMilli() int64 {
 	return redisNowUnixMilli(srv.nowFn())
 }
 
+func (srv *RedisServer) clusterSlotCount() int {
+	if srv != nil && srv.Cluster != nil {
+		if state := srv.Cluster.Snapshot(); state != nil && state.SlotCount > 0 {
+			return state.SlotCount
+		}
+	}
+	return 16384
+}
+
+func (srv *RedisServer) redisNamespace(dbIndex int) redisNamespace {
+	return redisNamespaceForDB(dbIndex, srv.clusterSlotCount())
+}
+
 func (srv *RedisServer) sweepSelectedRedisDB(selectedDB int, nowMs int64, limit int) error {
-	return SweepExpiredRedisDB(srv.DB, redisNamespaceForDB(selectedDB), nowMs, limit)
+	return SweepExpiredRedisDB(srv.DB, srv.redisNamespace(selectedDB), nowMs, limit)
 }
 
 func (srv *RedisServer) sweepAllRedisDBs(nowMs int64, limitPerDB int) error {
-	return SweepAllExpiredRedis(srv.DB, nowMs, limitPerDB)
+	return srv.DB.Update(func(tx *storage.Tx) error {
+		for dbIndex := redisDatabaseMin; dbIndex <= redisDatabaseMax; dbIndex++ {
+			if _, err := sweepExpiredRedisKeysTx(tx, srv.redisNamespace(dbIndex), nowMs, limitPerDB); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
-func (srv *RedisServer) executeCommand(selectedDB int, args [][]byte, tx *storage.Tx, nowMs int64) (redisReply, error) {
+func (srv *RedisServer) executeCommand(selectedDB int, args [][]byte, tx *storage.Tx, nowMs int64, allowAsking bool) (redisReply, error) {
 	if err := validateRedisCommand(args); err != nil {
+		return nil, err
+	}
+	if err := srv.ensureClusterRoute(selectedDB, args, tx, nowMs, allowAsking); err != nil {
 		return nil, err
 	}
 
 	command := strings.ToUpper(string(args[0]))
-	ns := redisNamespaceForDB(selectedDB)
+	if tx == nil {
+		move, slotCount, err := srv.clusterCopyingDeltaMoveForArgs(args)
+		if err != nil {
+			return nil, err
+		}
+		if move != nil {
+			return srv.executeStandaloneWriteWithClusterDelta(selectedDB, args, nowMs, allowAsking, move, slotCount)
+		}
+	}
+	ns := srv.redisNamespace(selectedDB)
 	switch command {
+	case "ASKING":
+		return redisSimpleStringReply{value: "OK"}, nil
 	case "BF.ADD":
 		var (
 			added int64
@@ -1060,6 +1278,8 @@ func (srv *RedisServer) executeCommand(selectedDB int, args [][]byte, tx *storag
 			return redisBulkReply{value: cloneBytes(args[1])}, nil
 		}
 		return redisSimpleStringReply{value: "PONG"}, nil
+	case "CLUSTER":
+		return srv.executeClusterCommand(args)
 	case "COMMAND":
 		if len(args) == 2 && strings.ToUpper(string(args[1])) == "COUNT" {
 			return redisIntegerReply{value: int64(len(supportedRedisCommandNames))}, nil
@@ -2148,7 +2368,7 @@ func (srv *RedisServer) executeScan(selectedDB int, tx *storage.Tx, opts redisSc
 		err        error
 	)
 
-	ns := redisNamespaceForDB(selectedDB)
+	ns := srv.redisNamespace(selectedDB)
 	if prefix, ok := parseRedisPrefixPattern([]byte(opts.pattern)); ok {
 		if tx == nil {
 			if err = srv.sweepSelectedRedisDB(selectedDB, nowMs, redisLazySweepLimit); err != nil {
@@ -2462,6 +2682,7 @@ func cloneCommandArgs(args [][]byte) [][]byte {
 
 func (resp *redisConn) resetPipeline() {
 	resp.pipelineActive = false
+	resp.pipelineAsking = false
 	resp.queuedCommands = resp.queuedCommands[:0]
 }
 
@@ -2651,7 +2872,7 @@ func formatRedisError(err error) string {
 		return "ERR unknown error"
 	}
 	message := err.Error()
-	if strings.HasPrefix(message, "WRONGTYPE") {
+	if strings.HasPrefix(message, "WRONGTYPE") || strings.HasPrefix(message, "MOVED") || strings.HasPrefix(message, "ASK") || strings.HasPrefix(message, "CROSSSLOT") || strings.HasPrefix(message, "TRYAGAIN") {
 		return message
 	}
 	return "ERR " + message

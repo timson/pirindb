@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"io"
 )
 
 const (
@@ -75,6 +76,50 @@ func (item *Item) getValue(tx *Tx) ([]byte, error) {
 		return blob.data, nil
 	}
 	return nil, ErrUnknownItemType
+}
+
+func (item *Item) valueLen(tx *Tx) (int, error) {
+	if len(item.Value) == 0 {
+		return 0, ErrUnknownItemType
+	}
+	switch item.Value[0] {
+	case ValueSimple:
+		return len(item.Value) - 1, nil
+	case ValueBlob:
+		if len(item.Value) < 1+UInt64Size {
+			return 0, ErrUnknownItemType
+		}
+		pageNum := binary.LittleEndian.Uint64(item.Value[1:])
+		return BlobSize(tx, pageNum)
+	}
+	return 0, ErrUnknownItemType
+}
+
+func (item *Item) writeValueTo(tx *Tx, w io.Writer) (int64, error) {
+	if len(item.Value) == 0 {
+		return 0, ErrUnknownItemType
+	}
+	switch item.Value[0] {
+	case ValueSimple:
+		if len(item.Value) == 1 {
+			return 0, nil
+		}
+		n, err := w.Write(item.Value[1:])
+		if err != nil {
+			return int64(n), err
+		}
+		if n != len(item.Value)-1 {
+			return int64(n), io.ErrShortWrite
+		}
+		return int64(n), nil
+	case ValueBlob:
+		if len(item.Value) < 1+UInt64Size {
+			return 0, ErrUnknownItemType
+		}
+		pageNum := binary.LittleEndian.Uint64(item.Value[1:])
+		return WriteBlobTo(tx, pageNum, w)
+	}
+	return 0, ErrUnknownItemType
 }
 
 func (item *Item) deleteValue(tx *Tx) (int, bool, error) {

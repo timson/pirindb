@@ -16,6 +16,7 @@ const (
 
 type redisNamespace struct {
 	dbIndex           int
+	slotCount         int
 	stringBucket      []byte
 	listMetaBucket    []byte
 	listSysBucket     []byte
@@ -33,6 +34,7 @@ type redisNamespace struct {
 	zsetSysBucket     []byte
 	zsetMemberPrefix  []byte
 	zsetScorePrefix   []byte
+	slotIndexBucket   []byte
 	expireMetaBucket  []byte
 	expireIndexBucket []byte
 	waiterKeyPrefix   string
@@ -44,10 +46,15 @@ type redisDBUsage struct {
 	bytesInUse uint64
 }
 
-func redisNamespaceForDB(dbIndex int) redisNamespace {
+func redisNamespaceForDB(dbIndex int, slotCountOverride ...int) redisNamespace {
 	suffix := strconv.Itoa(dbIndex)
+	slotCount := 16384
+	if len(slotCountOverride) > 0 && slotCountOverride[0] > 0 {
+		slotCount = slotCountOverride[0]
+	}
 	return redisNamespace{
 		dbIndex:           dbIndex,
+		slotCount:         slotCount,
 		stringBucket:      []byte("__redis_db_" + suffix + "__"),
 		listMetaBucket:    []byte("__redis_db_" + suffix + "_list_meta__"),
 		listSysBucket:     []byte("__redis_db_" + suffix + "_list_sys__"),
@@ -65,6 +72,7 @@ func redisNamespaceForDB(dbIndex int) redisNamespace {
 		zsetSysBucket:     []byte("__redis_db_" + suffix + "_zset_sys__"),
 		zsetMemberPrefix:  []byte("__redis_db_" + suffix + "_zset_member__:"),
 		zsetScorePrefix:   []byte("__redis_db_" + suffix + "_zset_score__:"),
+		slotIndexBucket:   []byte("__redis_db_" + suffix + "_slot_idx__"),
 		expireMetaBucket:  []byte("__redis_db_" + suffix + "_expire_meta__"),
 		expireIndexBucket: []byte("__redis_db_" + suffix + "_expire_idx__"),
 		waiterKeyPrefix:   "db:" + suffix + ":",

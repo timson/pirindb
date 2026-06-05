@@ -235,11 +235,11 @@ func writeSnapshotBucket(w io.Writer, bucketName []byte, bucket *Bucket, stats *
 	}
 
 	cursor := bucket.Cursor()
-	for key, value := cursor.First(); key != nil; key, value = cursor.Next() {
-		if err := writeSnapshotBytes(w, key); err != nil {
+	for item := cursor.FirstItem(); item != nil; item = cursor.NextItem() {
+		if err := writeSnapshotBytes(w, item.Key); err != nil {
 			return err
 		}
-		if err := writeSnapshotBytes(w, value); err != nil {
+		if err := writeSnapshotItemValue(bucket.tx, w, item); err != nil {
 			return err
 		}
 		stats.KeysExported++
@@ -327,11 +327,11 @@ func importSnapshotBucketRecordsTx(tx *Tx, bucketName []byte, itemCount uint64, 
 		if keyErr != nil {
 			return keyErr
 		}
-		value, valueErr := readSnapshotBytes(r, uint64(OneGigabyte-1))
+		valueLen, valueErr := readSnapshotValueLength(r, uint64(OneGigabyte-1))
 		if valueErr != nil {
 			return valueErr
 		}
-		if err = bucket.Put(key, value); err != nil {
+		if err = bucket.PutReader(key, r, int64(valueLen)); err != nil {
 			return err
 		}
 		stats.KeysImported++
@@ -454,6 +454,21 @@ func writeSnapshotBytes(w io.Writer, data []byte) error {
 	return err
 }
 
+func writeSnapshotItemValue(tx *Tx, w io.Writer, item *Item) error {
+	valueLen, err := item.valueLen(tx)
+	if err != nil {
+		return err
+	}
+	if err = binary.Write(w, binary.LittleEndian, uint64(valueLen)); err != nil {
+		return err
+	}
+	if valueLen == 0 {
+		return nil
+	}
+	_, err = item.writeValueTo(tx, w)
+	return err
+}
+
 func writeSnapshotBytes32(w io.Writer, data []byte) error {
 	if err := binary.Write(w, binary.LittleEndian, uint32(len(data))); err != nil {
 		return err
@@ -466,21 +481,29 @@ func writeSnapshotBytes32(w io.Writer, data []byte) error {
 }
 
 func readSnapshotBytes(r io.Reader, maxLen uint64) ([]byte, error) {
-	var length uint64
-	if err := binary.Read(r, binary.LittleEndian, &length); err != nil {
-		return nil, fmt.Errorf("%w: unable to read value length", ErrSnapshotInvalid)
-	}
-	if length > maxLen {
-		return nil, fmt.Errorf("%w: value length %d exceeds maximum %d", ErrSnapshotInvalid, length, maxLen)
+	length, err := readSnapshotValueLength(r, maxLen)
+	if err != nil {
+		return nil, err
 	}
 	data := make([]byte, int(length))
 	if length == 0 {
 		return data, nil
 	}
-	if _, err := io.ReadFull(r, data); err != nil {
+	if _, err = io.ReadFull(r, data); err != nil {
 		return nil, fmt.Errorf("%w: unable to read value bytes", ErrSnapshotInvalid)
 	}
 	return data, nil
+}
+
+func readSnapshotValueLength(r io.Reader, maxLen uint64) (uint64, error) {
+	var length uint64
+	if err := binary.Read(r, binary.LittleEndian, &length); err != nil {
+		return 0, fmt.Errorf("%w: unable to read value length", ErrSnapshotInvalid)
+	}
+	if length > maxLen {
+		return 0, fmt.Errorf("%w: value length %d exceeds maximum %d", ErrSnapshotInvalid, length, maxLen)
+	}
+	return length, nil
 }
 
 func readSnapshotBytes32(r io.Reader, maxLen uint32) ([]byte, error) {

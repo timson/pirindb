@@ -419,6 +419,9 @@ func putRedisBytesTx(tx *storage.Tx, ns redisNamespace, key, value []byte, nowMs
 	if err = bucket.Put(key, value); err != nil {
 		return err
 	}
+	if err = ensureRedisSlotIndexEntryTx(tx, ns, key); err != nil {
+		return err
+	}
 	return deleteRedisExpireAtMsTx(tx, ns, key)
 }
 
@@ -447,6 +450,9 @@ func putManyRedisBytesTx(tx *storage.Tx, ns redisNamespace, pairs []keyValuePair
 			return err
 		}
 		if err = bucket.Put(pair.key, pair.value); err != nil {
+			return err
+		}
+		if err = ensureRedisSlotIndexEntryTx(tx, ns, pair.key); err != nil {
 			return err
 		}
 		if err = deleteRedisExpireAtMsTx(tx, ns, pair.key); err != nil {
@@ -530,6 +536,9 @@ func setRedisBytesTx(tx *storage.Tx, ns redisNamespace, key, value []byte, opts 
 		return nil, false, false, err
 	}
 	if err = bucket.Put(key, value); err != nil {
+		return nil, false, false, err
+	}
+	if err = ensureRedisSlotIndexEntryTx(tx, ns, key); err != nil {
 		return nil, false, false, err
 	}
 	if err = deleteRedisExpireAtMsTx(tx, ns, key); err != nil {
@@ -631,6 +640,9 @@ func applyRedisIntDeltaTx(tx *storage.Tx, ns redisNamespace, key []byte, delta i
 	if err = bucket.Put(key, []byte(strconv.FormatInt(next, 10))); err != nil {
 		return 0, err
 	}
+	if err = ensureRedisSlotIndexEntryTx(tx, ns, key); err != nil {
+		return 0, err
+	}
 	return next, nil
 }
 
@@ -648,65 +660,18 @@ func ApplyRedisIntDelta(db *storage.DB, ns redisNamespace, key []byte, delta int
 }
 
 func deleteManyRedisBytesTx(tx *storage.Tx, ns redisNamespace, keys [][]byte, nowMs int64) (int64, error) {
-	var bucket *storage.Bucket
-	bucket, err := tx.GetBucket(ns.stringBucket)
-	if errors.Is(err, storage.ErrBucketNotFound) {
-		bucket = nil
-	} else if err != nil {
-		return 0, err
-	}
-
 	var deleted int64
 	for _, key := range keys {
-		if _, err = purgeExpiredRedisKeyTx(tx, ns, key, nowMs); err != nil {
+		if _, err := purgeExpiredRedisKeyTx(tx, ns, key, nowMs); err != nil {
 			return 0, err
 		}
-
-		removed := false
-		if bucket != nil {
-			err = bucket.Remove(key)
-			if errors.Is(err, storage.ErrNodeNotFound) {
-				err = nil
-			} else if err != nil {
-				return 0, err
-			} else {
-				removed = true
-				if err = deleteRedisExpireAtMsTx(tx, ns, key); err != nil {
-					return 0, err
-				}
-			}
-		}
-
-		listRemoved, err := deleteRedisListIfExistsTx(tx, ns, key)
+		keyType, err := redisRawKeyTypeTx(tx, ns, key)
 		if err != nil {
 			return 0, err
 		}
-		if listRemoved {
-			removed = true
-		}
-
-		hashRemoved, err := deleteRedisHashIfExistsTx(tx, ns, key)
+		removed, err := deleteRedisKeyByRawTypeTx(tx, ns, key, keyType)
 		if err != nil {
 			return 0, err
-		}
-		if hashRemoved {
-			removed = true
-		}
-
-		bloomRemoved, err := deleteRedisBloomIfExistsTx(tx, ns, key)
-		if err != nil {
-			return 0, err
-		}
-		if bloomRemoved {
-			removed = true
-		}
-
-		zsetRemoved, err := deleteRedisZSetIfExistsTx(tx, ns, key)
-		if err != nil {
-			return 0, err
-		}
-		if zsetRemoved {
-			removed = true
 		}
 		if removed {
 			deleted++
@@ -1041,6 +1006,7 @@ func isRedisDBBucketName(ns redisNamespace, bucketName []byte) bool {
 		bytes.Equal(bucketName, ns.topkSysBucket),
 		bytes.Equal(bucketName, ns.zsetMetaBucket),
 		bytes.Equal(bucketName, ns.zsetSysBucket),
+		bytes.Equal(bucketName, ns.slotIndexBucket),
 		bytes.Equal(bucketName, ns.expireMetaBucket),
 		bytes.Equal(bucketName, ns.expireIndexBucket):
 		return true
@@ -1161,7 +1127,13 @@ func renameRedisKeyTx(tx *storage.Tx, ns redisNamespace, source, destination []b
 		if err = bucket.Put(destination, cloneBytes(value)); err != nil {
 			return false, redisKeyTypeNone, err
 		}
+		if err = ensureRedisSlotIndexEntryTx(tx, ns, destination); err != nil {
+			return false, redisKeyTypeNone, err
+		}
 		if err = bucket.Remove(source); err != nil && !errors.Is(err, storage.ErrNodeNotFound) {
+			return false, redisKeyTypeNone, err
+		}
+		if err = deleteRedisSlotIndexEntryTx(tx, ns, source); err != nil {
 			return false, redisKeyTypeNone, err
 		}
 	case redisKeyTypeList:

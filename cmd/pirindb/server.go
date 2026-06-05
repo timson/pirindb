@@ -19,23 +19,37 @@ var (
 )
 
 type Server struct {
-	DB          *storage.DB
-	Logger      *slog.Logger
-	Config      *Config
-	HTTPServer  *http.Server
-	RedisServer *RedisServer
-	jobMu       sync.Mutex
-	jobs        map[string]*dbTransferJob
-	importBusy  bool
+	DB            *storage.DB
+	Logger        *slog.Logger
+	Config        *Config
+	Cluster       *ClusterManager
+	clusterErr    error
+	HTTPServer    *http.Server
+	RedisServer   *RedisServer
+	jobMu         sync.Mutex
+	jobs          map[string]*dbTransferJob
+	importBusy    bool
+	rebalanceMu   sync.Mutex
+	rebalanceJobs map[string]*clusterRebalanceJob
 }
 
 func NewServer(cfg *Config, db *storage.DB, logger *slog.Logger) *Server {
-	return &Server{
-		Config: cfg,
-		DB:     db,
-		Logger: logger,
-		jobs:   make(map[string]*dbTransferJob),
+	cluster, clusterErr := NewClusterManager(cfg, db, logger)
+	srv := &Server{
+		Config:        cfg,
+		DB:            db,
+		Logger:        logger,
+		Cluster:       cluster,
+		clusterErr:    clusterErr,
+		jobs:          make(map[string]*dbTransferJob),
+		rebalanceJobs: make(map[string]*clusterRebalanceJob),
 	}
+	if clusterErr == nil && cluster != nil {
+		if err := srv.loadPersistedRebalanceJobs(); err != nil {
+			srv.clusterErr = err
+		}
+	}
+	return srv
 }
 
 func RequestLogger(logger *slog.Logger) func(next http.Handler) http.Handler {
@@ -74,18 +88,39 @@ func (srv *Server) buildRouter() http.Handler {
 			r.Post("/import", srv.handleImportJob)
 			r.Get("/jobs/{jobID}", srv.handleDBJobStatus)
 		})
+		r.Route("/cluster", func(r chi.Router) {
+			r.Get("/status", srv.handleClusterStatus)
+			r.Get("/slots", srv.handleClusterSlots)
+			r.Get("/topology", srv.handleClusterTopology)
+			r.Post("/reconcile-topology", srv.handleClusterReconcileTopology)
+			r.Post("/nodes/join", srv.handleClusterJoinNode)
+			r.Post("/rebalance/plan", srv.handleClusterRebalancePlan)
+			r.Post("/rebalance/execute", srv.handleClusterRebalanceExecute)
+			r.Get("/rebalance/{jobID}", srv.handleClusterRebalanceJobStatus)
+			r.Post("/internal/state", srv.handleClusterInternalApplyState)
+			r.Get("/internal/slot-snapshot", srv.handleClusterInternalSlotSnapshot)
+			r.Post("/internal/slot-import", srv.handleClusterInternalSlotImport)
+			r.Post("/internal/delta-apply", srv.handleClusterInternalDeltaApply)
+			r.Post("/internal/slot-delete", srv.handleClusterInternalSlotDelete)
+		})
 	})
 
 	return r
 }
 
 func (srv *Server) Start() error {
+	if srv.clusterErr != nil {
+		return srv.clusterErr
+	}
 	if srv.Config.Redis != nil && srv.Config.Redis.Enabled {
 		srv.RedisServer = NewRedisServer(srv.Config, srv.DB, srv.Logger)
+		srv.RedisServer.Cluster = srv.Cluster
+		srv.RedisServer.clusterErr = srv.clusterErr
 		if err := srv.RedisServer.Start(); err != nil {
 			return err
 		}
 	}
+	srv.resumePersistedRebalanceJobs()
 
 	r := srv.buildRouter()
 	srv.Logger.Info("started listening", "protocol", "http", "port", srv.Config.Server.Port, "host", srv.Config.Server.Host)

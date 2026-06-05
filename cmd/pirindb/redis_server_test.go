@@ -21,6 +21,7 @@ import (
 type redisTestError string
 
 var expectedRedisCommands = []any{
+	"ASKING",
 	"BF.ADD",
 	"BF.EXISTS",
 	"BF.MADD",
@@ -29,6 +30,7 @@ var expectedRedisCommands = []any{
 	"BLPOP",
 	"BRPOPLPUSH",
 	"BRPOP",
+	"CLUSTER",
 	"CONFIG",
 	"COMMAND",
 	"DECR",

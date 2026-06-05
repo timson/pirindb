@@ -41,7 +41,7 @@ Project contains:
 - [x] Basic key-value operations
 - [ ] Multi-key operations
 - [ ] Range scanning operations
-- [ ] Sharding support (naive or consistent hashing)
+- [x] Internal sharding with fixed hash slots
 - [ ] Replication support
 
 ## Project Status
@@ -93,6 +93,50 @@ The same settings can be supplied via environment variables:
 $ PIRINDB_DB_SYNC_POLICY=journal PIRINDB_DB_CHECKPOINT_TX_THRESHOLD=64 ./bin/pirindb
 $ PIRINDB_DB_SYNC_POLICY=group PIRINDB_DB_GROUP_COMMIT_TX_THRESHOLD=16 PIRINDB_DB_GROUP_COMMIT_WINDOW_MS=1 ./bin/pirindb
 ```
+
+Internal cluster mode is also available for Redis traffic. It uses fixed hash slots and direct-to-shard clients:
+
+```toml
+[cluster]
+enabled = true
+node_id = "node-a"
+topology_file = "/etc/pirindb/topology.toml"
+```
+
+Shared topology file:
+
+```toml
+[cluster]
+name = "prod-eu-1"
+slot_count = 16384
+
+[[cluster.nodes]]
+id = "node-a"
+redis_address = "10.0.0.1:6379"
+http_address = "http://10.0.0.1:4321"
+
+[[cluster.nodes]]
+id = "node-b"
+redis_address = "10.0.0.2:6379"
+http_address = "http://10.0.0.2:4321"
+
+[[cluster.bootstrap_slots]]
+node_id = "node-a"
+slots = ["0-8191"]
+
+[[cluster.bootstrap_slots]]
+node_id = "node-b"
+slots = ["8192-16383"]
+```
+
+In cluster mode:
+
+- Redis keys are routed by Redis-style hash slots, including `{tag}` hash tags.
+- Single-key requests are accepted only on the owning shard; other shards return `MOVED slot host:port`.
+- Multi-key Redis requests are accepted only when every key hashes to the same slot; otherwise PirinDB returns `CROSSSLOT`.
+- `KEYS`, `SCAN`, `DBSIZE`, `FLUSHDB`, and `FLUSHALL` operate on the local shard only.
+- Rebalancing is offline: writes are rejected with `TRYAGAIN` while a slot move is in progress.
+- Nodes may exist in cluster metadata with zero owned slots. This is the expected starting state for a newly added shard before any slot ranges are moved onto it.
 
 To start the CLI client, run:
 
@@ -152,11 +196,50 @@ Notes:
 - db import replaces the whole database bucket set
 - only one import job can run at a time; export requests are rejected while an import is running
 
+Cluster admin endpoints:
+
+- `GET /api/v1/cluster/status`
+- `GET /api/v1/cluster/slots`
+- `GET /api/v1/cluster/topology`
+- `POST /api/v1/cluster/reconcile-topology`
+- `POST /api/v1/cluster/nodes/join`
+- `POST /api/v1/cluster/rebalance/plan`
+- `POST /api/v1/cluster/rebalance/execute`
+- `GET /api/v1/cluster/rebalance/{jobID}`
+
+`GET /api/v1/cluster/topology` returns the configured shared topology plus the current runtime topology hash/version stored in the DB.
+
+`POST /api/v1/cluster/reconcile-topology` applies the configured topology membership to the live runtime state without resetting slot ownership. This is the preferred way to add a new node after updating the shared topology file.
+
+Join a new node before rebalancing any slots onto it:
+
+```json
+{
+  "id": "node-c",
+  "redis_address": "10.0.0.3:6379",
+  "http_address": "http://10.0.0.3:4321"
+}
+```
+
+The rebalance endpoints move one slot range from one shard to another. Submit `POST /api/v1/cluster/rebalance/execute` to the source shard with:
+
+```json
+{
+  "source_node_id": "node-a",
+  "destination_node_id": "node-b",
+  "start_slot": 4096,
+  "end_slot": 8191
+}
+```
+
+PirinDB copies the Redis keys in that slot range to the destination shard, updates cluster ownership metadata on all configured nodes, and then removes the old source copy.
+
 ## Redis Interface
 
 PirinDB now exposes a Redis-compatible RESP endpoint intended for simple cache and key-value integrations.
 Currently supported commands are:
 
+- `ASKING`
 - `COMMAND`
 - `BF.ADD key item`
 - `BF.EXISTS key item`
@@ -166,6 +249,9 @@ Currently supported commands are:
 - `BLPOP key [key ...] timeout`
 - `BRPOPLPUSH source destination timeout`
 - `BRPOP key [key ...] timeout`
+- `CLUSTER KEYSLOT key`
+- `CLUSTER SHARDS`
+- `CLUSTER SLOTS`
 - `CONFIG GET pattern`
 - `CONFIG HELP`
 - `CONFIG RESETSTAT`
@@ -299,6 +385,9 @@ QUEUED
 
 > [!NOTE]
 > PirinDB supports Redis logical DBs `0..9` via `SELECT`. Redis data is stored in reserved Redis-only buckets and is isolated from the HTTP API keyspace, which continues to use the `main` bucket.
+
+> [!NOTE]
+> In cluster mode, wrong-shard requests return `MOVED slot host:port`. During the rebalance handoff window, the source shard may return `ASK slot host:port`; retry that command on the destination shard after sending `ASKING`.
 
 
 

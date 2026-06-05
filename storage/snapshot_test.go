@@ -10,6 +10,17 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+type maxWriteRecorder struct {
+	max int
+}
+
+func (w *maxWriteRecorder) Write(p []byte) (int, error) {
+	if len(p) > w.max {
+		w.max = len(p)
+	}
+	return len(p), nil
+}
+
 func TestSnapshotExportImportDBRoundTrip(t *testing.T) {
 	db, _ := CreateTestDB(t)
 	err := db.Update(func(tx *Tx) error {
@@ -141,4 +152,33 @@ func TestImportInvalidSnapshotDoesNotMutateDB(t *testing.T) {
 	require.True(t, errors.Is(err, ErrSnapshotInvalid))
 
 	requireBucketValue(t, db, []byte("users"), []byte("id"), []byte("original"))
+}
+
+func TestSnapshotWriteBucketStreamsBlobValue(t *testing.T) {
+	db, _ := CreateTestDB(t)
+	big := bytes.Repeat([]byte("snapshot-stream-blob-"), 4096)
+
+	err := db.Update(func(tx *Tx) error {
+		bucket, err := tx.CreateBucketIfNotExists([]byte("main"))
+		if err != nil {
+			return err
+		}
+		return bucket.Put([]byte("blob"), big)
+	})
+	require.NoError(t, err)
+
+	recorder := &maxWriteRecorder{}
+	stats := SnapshotExportStats{}
+	err = db.View(func(tx *Tx) error {
+		bucket, err := tx.GetBucket([]byte("main"))
+		if err != nil {
+			return err
+		}
+		return writeSnapshotBucket(recorder, []byte("main"), bucket, &stats)
+	})
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), stats.KeysExported)
+	require.Greater(t, recorder.max, 0)
+	require.Less(t, recorder.max, len(big))
+	require.LessOrEqual(t, recorder.max, BTreePageSize)
 }
