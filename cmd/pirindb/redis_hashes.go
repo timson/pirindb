@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 
@@ -24,8 +25,9 @@ const (
 )
 
 type redisHashMeta struct {
-	ID         uint64
-	FieldCount uint64
+	ID            uint64
+	FieldCount    uint64
+	StorageFormat byte
 }
 
 type hashFieldValuePair struct {
@@ -45,8 +47,9 @@ func deserializeRedisHashMeta(buf []byte) (*redisHashMeta, error) {
 		return nil, errors.New("corrupted redis hash metadata")
 	}
 	return &redisHashMeta{
-		ID:         binary.BigEndian.Uint64(buf[0:8]),
-		FieldCount: binary.BigEndian.Uint64(buf[8:16]),
+		ID:            binary.BigEndian.Uint64(buf[0:8]),
+		FieldCount:    binary.BigEndian.Uint64(buf[8:16]),
+		StorageFormat: redisKeyStorageLegacy,
 	}, nil
 }
 
@@ -75,6 +78,10 @@ func loadRedisHashMetaTx(tx *storage.Tx, ns redisNamespace, key []byte) (*redisH
 	if err != nil {
 		return nil, false, err
 	}
+	meta.StorageFormat, err = redisObjectStorageFormatTx(tx, ns, key, redisKeyTypeHash, meta.ID)
+	if err != nil {
+		return nil, false, err
+	}
 	return meta, true, nil
 }
 
@@ -84,6 +91,9 @@ func saveRedisHashMetaTx(tx *storage.Tx, ns redisNamespace, key []byte, meta *re
 		return err
 	}
 	if err = bucket.Put(key, meta.serialize()); err != nil {
+		return err
+	}
+	if err = saveRedisKeyMetaForTypeWithFormatTx(tx, ns, key, redisKeyTypeHash, meta.ID, meta.StorageFormat); err != nil {
 		return err
 	}
 	return ensureRedisSlotIndexEntryTx(tx, ns, key)
@@ -102,6 +112,9 @@ func deleteRedisHashMetaTx(tx *storage.Tx, ns redisNamespace, key []byte) error 
 		return nil
 	}
 	if err != nil {
+		return err
+	}
+	if err = deleteRedisKeyMetaTx(tx, ns, key); err != nil {
 		return err
 	}
 	return deleteRedisSlotIndexEntryTx(tx, ns, key)
@@ -136,14 +149,19 @@ func nextRedisHashIDTx(tx *storage.Tx, ns redisNamespace) (uint64, error) {
 	return id, nil
 }
 
-func ensureRedisHashDataBucketTx(tx *storage.Tx, ns redisNamespace, meta *redisHashMeta) (*storage.Bucket, error) {
-	return tx.CreateBucketIfNotExists(redisHashBucketName(ns, meta.ID))
+func ensureRedisHashDataBucketTx(tx *storage.Tx, ns redisNamespace, meta *redisHashMeta) (*redisObjectBucket, error) {
+	return openRedisObjectBucketTx(tx, ns.hashDataBucket, redisHashBucketName(ns, meta.ID), meta.ID, meta.StorageFormat, true)
 }
 
 func deleteRedisHashTx(tx *storage.Tx, ns redisNamespace, key []byte, meta *redisHashMeta) error {
-	err := tx.DeleteBucket(redisHashBucketName(ns, meta.ID))
+	store, err := openRedisObjectBucketTx(tx, ns.hashDataBucket, redisHashBucketName(ns, meta.ID), meta.ID, meta.StorageFormat, false)
 	if err != nil && !errors.Is(err, storage.ErrBucketNotFound) {
 		return err
+	}
+	if err == nil {
+		if err = deleteRedisObjectBucketTx(tx, store, redisHashBucketName(ns, meta.ID)); err != nil {
+			return err
+		}
 	}
 	if err = deleteRedisHashMetaTx(tx, ns, key); err != nil {
 		return err
@@ -199,19 +217,19 @@ func initRedisHashMetaTx(tx *storage.Tx, ns redisNamespace, key []byte, nowMs in
 		return nil, err
 	}
 
-	meta := &redisHashMeta{ID: id}
+	meta := &redisHashMeta{ID: id, StorageFormat: redisKeyStorageShared}
 	if _, err = ensureRedisHashDataBucketTx(tx, ns, meta); err != nil {
 		return nil, err
 	}
 	return meta, nil
 }
 
-func getRedisHashBucketTx(tx *storage.Tx, ns redisNamespace, key []byte, nowMs int64) (*storage.Bucket, *redisHashMeta, bool, error) {
+func getRedisHashBucketTx(tx *storage.Tx, ns redisNamespace, key []byte, nowMs int64) (*redisObjectBucket, *redisHashMeta, bool, error) {
 	meta, found, err := loadRedisHashMetaForReadTx(tx, ns, key, nowMs)
 	if err != nil || !found {
 		return nil, meta, found, err
 	}
-	bucket, err := tx.GetBucket(redisHashBucketName(ns, meta.ID))
+	bucket, err := openRedisObjectBucketTx(tx, ns.hashDataBucket, redisHashBucketName(ns, meta.ID), meta.ID, meta.StorageFormat, false)
 	if err != nil {
 		return nil, nil, false, err
 	}
@@ -240,16 +258,24 @@ func redisHashSetTx(tx *storage.Tx, ns redisNamespace, key []byte, pairs []hashF
 	}
 
 	var added int64
+	changed := false
 	for _, pair := range pairs {
-		if _, exists := bucket.Get(pair.field); !exists {
+		currentValue, exists := bucket.Get(pair.field)
+		if !exists {
 			added++
 			meta.FieldCount++
+		} else if bytes.Equal(currentValue, pair.value) {
+			continue
 		}
 		if err = bucket.Put(pair.field, pair.value); err != nil {
 			return 0, err
 		}
+		changed = true
 	}
 
+	if !changed {
+		return added, nil
+	}
 	if err = saveRedisHashMetaTx(tx, ns, key, meta); err != nil {
 		return 0, err
 	}

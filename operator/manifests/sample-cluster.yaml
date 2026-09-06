@@ -1,0 +1,22 @@
+apiVersion: pirindb.timson.dev/v1alpha1
+kind: PirinDBCluster
+metadata:
+  name: demo
+  namespace: default
+spec:
+  replicas: 3
+  image: ghcr.io/timson/pirindb:v0.1.0
+  httpPort: 4321
+  redisPort: 6379
+  slotCount: 16384
+  syncPolicy: group
+  checkpointTxThreshold: 64
+  groupCommitTxThreshold: 16
+  groupCommitWindowMs: 1
+  autoRebalanceOnScaleUp: true
+  autoRebalanceOnScaleDown: true
+  adminSecretRef:
+    name: demo-cluster-admin
+    key: token
+  storage:
+    size: 20Gi

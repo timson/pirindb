@@ -27,6 +27,19 @@ type HealthResponse struct {
 }
 
 func (srv *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	if err := srv.DB.Health(); err != nil {
+		render.Status(r, http.StatusServiceUnavailable)
+		render.JSON(w, r, HealthResponse{Status: "storage unavailable"})
+		return
+	}
+	srv.lifecycleMu.Lock()
+	redis := srv.RedisServer
+	srv.lifecycleMu.Unlock()
+	if srv.clusterErr != nil || (srv.Config.Redis != nil && srv.Config.Redis.Enabled && (redis == nil || !redis.accepting.Load())) {
+		render.Status(r, http.StatusServiceUnavailable)
+		render.JSON(w, r, HealthResponse{Status: "server unavailable"})
+		return
+	}
 	render.JSON(w, r, HealthResponse{Status: "ok"})
 }
 

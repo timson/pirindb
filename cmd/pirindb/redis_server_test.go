@@ -20,90 +20,13 @@ import (
 
 type redisTestError string
 
-var expectedRedisCommands = []any{
-	"ASKING",
-	"BF.ADD",
-	"BF.EXISTS",
-	"BF.MADD",
-	"BF.MEXISTS",
-	"BF.RESERVE",
-	"BLPOP",
-	"BRPOPLPUSH",
-	"BRPOP",
-	"CLUSTER",
-	"CONFIG",
-	"COMMAND",
-	"DECR",
-	"DECRBY",
-	"DEL",
-	"DBSIZE",
-	"DISCARD",
-	"EXISTS",
-	"EXPIRE",
-	"EXEC",
-	"FLUSHALL",
-	"FLUSHDB",
-	"GET",
-	"GETSET",
-	"HDEL",
-	"HEXISTS",
-	"HGET",
-	"HGETALL",
-	"HKEYS",
-	"HLEN",
-	"HSET",
-	"HVALS",
-	"INCR",
-	"INCRBY",
-	"INFO",
-	"KEYS",
-	"LINDEX",
-	"LLEN",
-	"LPOP",
-	"LPUSH",
-	"LRANGE",
-	"LREM",
-	"LSET",
-	"LTRIM",
-	"MGET",
-	"MSET",
-	"MULTI",
-	"PERSIST",
-	"PEXPIRE",
-	"PING",
-	"PIPELINE",
-	"PTTL",
-	"QUIT",
-	"RENAME",
-	"RENAMENX",
-	"RPOP",
-	"RPOPLPUSH",
-	"RPUSH",
-	"SCAN",
-	"SELECT",
-	"SET",
-	"SSCAN",
-	"TTL",
-	"TOPK.ADD",
-	"TOPK.COUNT",
-	"TOPK.INFO",
-	"TOPK.INCRBY",
-	"TOPK.LIST",
-	"TOPK.QUERY",
-	"TOPK.RESERVE",
-	"TYPE",
-	"UNLINK",
-	"ZADD",
-	"ZCARD",
-	"ZREM",
-	"ZREMRANGEBYLEX",
-	"ZREMRANGEBYSCORE",
-	"ZREVRANGEBYLEX",
-	"ZREVRANGEBYSCORE",
-	"ZRANGEBYLEX",
-	"ZRANGEBYSCORE",
-	"ZSCORE",
-}
+var expectedRedisCommands = func() []any {
+	commands := make([]any, 0, len(redisCommandRegistry))
+	for _, spec := range redisCommandRegistry {
+		commands = append(commands, strings.ToLower(spec.Name))
+	}
+	return commands
+}()
 
 func setupTestRedisServer(t *testing.T) (*RedisServer, net.Conn) {
 	t.Helper()
@@ -176,7 +99,7 @@ func appendRedisCommand(t testing.TB, buf *bytes.Buffer, args ...string) {
 	}
 }
 
-func readRedisReply(t *testing.T, reader *bufio.Reader) any {
+func readRedisReply(t testing.TB, reader *bufio.Reader) any {
 	t.Helper()
 
 	prefix, err := reader.ReadByte()
@@ -218,7 +141,7 @@ func readRedisReply(t *testing.T, reader *bufio.Reader) any {
 	return nil
 }
 
-func readRESPLine(t *testing.T, reader *bufio.Reader) string {
+func readRESPLine(t testing.TB, reader *bufio.Reader) string {
 	t.Helper()
 
 	line, err := reader.ReadString('\n')
@@ -506,13 +429,13 @@ func TestRedisSelectRejectsInvalidValuesAndPipeline(t *testing.T) {
 	writeRedisCommand(t, writer, "SELECT", "wat")
 	require.Equal(t, redisTestError("ERR db index must be an integer"), readRedisReply(t, reader))
 
-	writeRedisCommand(t, writer, "PIPELINE")
+	writeRedisCommand(t, writer, "PIRIN.BATCH")
 	require.Equal(t, "OK", readRedisReply(t, reader))
 
 	writeRedisCommand(t, writer, "SELECT", "1")
 	require.Equal(t, redisTestError("ERR command 'select' is not queueable"), readRedisReply(t, reader))
 
-	writeRedisCommand(t, writer, "DISCARD")
+	writeRedisCommand(t, writer, "PIRIN.DISCARD")
 	require.Equal(t, "OK", readRedisReply(t, reader))
 }
 
@@ -722,7 +645,7 @@ func TestRedisExpireAffectsKeysScanInfoAndPipeline(t *testing.T) {
 	writeRedisCommand(t, writer, "EXPIRE", "old", "1")
 	require.Equal(t, int64(1), readRedisReply(t, reader))
 
-	writeRedisCommand(t, writer, "PIPELINE")
+	writeRedisCommand(t, writer, "PIRIN.BATCH")
 	require.Equal(t, "OK", readRedisReply(t, reader))
 	writeRedisCommand(t, writer, "SET", "pipe", "value")
 	require.Equal(t, "QUEUED", readRedisReply(t, reader))
@@ -730,7 +653,7 @@ func TestRedisExpireAffectsKeysScanInfoAndPipeline(t *testing.T) {
 	require.Equal(t, "QUEUED", readRedisReply(t, reader))
 	writeRedisCommand(t, writer, "TTL", "pipe")
 	require.Equal(t, "QUEUED", readRedisReply(t, reader))
-	writeRedisCommand(t, writer, "EXEC")
+	writeRedisCommand(t, writer, "PIRIN.EXEC")
 	require.Equal(t, []any{"OK", int64(1), int64(10)}, readRedisReply(t, reader))
 
 	currentTime = currentTime.Add(2 * time.Second)
@@ -844,13 +767,13 @@ func TestRedisFlushAllInsidePipeline(t *testing.T) {
 	writeRedisCommand(t, writer, "HSET", "hash", "field", "value")
 	require.Equal(t, int64(1), readRedisReply(t, reader))
 
-	writeRedisCommand(t, writer, "PIPELINE")
+	writeRedisCommand(t, writer, "PIRIN.BATCH")
 	require.Equal(t, "OK", readRedisReply(t, reader))
 	writeRedisCommand(t, writer, "FLUSHALL")
 	require.Equal(t, "QUEUED", readRedisReply(t, reader))
 	writeRedisCommand(t, writer, "TYPE", "plain")
 	require.Equal(t, "QUEUED", readRedisReply(t, reader))
-	writeRedisCommand(t, writer, "EXEC")
+	writeRedisCommand(t, writer, "PIRIN.EXEC")
 	require.Equal(t, []any{"OK", "none"}, readRedisReply(t, reader))
 
 	writeRedisCommand(t, writer, "TYPE", "hash")
@@ -862,7 +785,7 @@ func TestRedisPipelineRenameFlushDBAndDBSize(t *testing.T) {
 	reader := bufio.NewReader(conn)
 	writer := bufio.NewWriter(conn)
 
-	writeRedisCommand(t, writer, "PIPELINE")
+	writeRedisCommand(t, writer, "PIRIN.BATCH")
 	require.Equal(t, "OK", readRedisReply(t, reader))
 	writeRedisCommand(t, writer, "SET", "plain", "value")
 	require.Equal(t, "QUEUED", readRedisReply(t, reader))
@@ -874,7 +797,7 @@ func TestRedisPipelineRenameFlushDBAndDBSize(t *testing.T) {
 	require.Equal(t, "QUEUED", readRedisReply(t, reader))
 	writeRedisCommand(t, writer, "DBSIZE")
 	require.Equal(t, "QUEUED", readRedisReply(t, reader))
-	writeRedisCommand(t, writer, "EXEC")
+	writeRedisCommand(t, writer, "PIRIN.EXEC")
 	require.Equal(t, []any{"OK", "OK", int64(1), "OK", int64(0)}, readRedisReply(t, reader))
 
 	writeRedisCommand(t, writer, "GET", "renamed")
@@ -1603,7 +1526,7 @@ func TestRedisKeysAndScanIncludeListsAndHashes(t *testing.T) {
 	require.Equal(t, []any{"queue"}, reply[1])
 }
 
-func TestRedisSScanCompatibility(t *testing.T) {
+func TestRedisSScanIsNotAdvertisedWithoutSetType(t *testing.T) {
 	_, conn := setupTestRedisServer(t)
 	reader := bufio.NewReader(conn)
 	writer := bufio.NewWriter(conn)
@@ -1614,9 +1537,7 @@ func TestRedisSScanCompatibility(t *testing.T) {
 	}
 
 	writeRedisCommand(t, writer, "SSCAN", "ignored", "0", "MATCH", "cache:*", "COUNT", "10")
-	reply := readRedisReply(t, reader).([]any)
-	require.Equal(t, "0", reply[0])
-	require.Equal(t, []any{"cache:1", "cache:2"}, reply[1])
+	require.Equal(t, redisTestError("ERR unsupported command 'sscan'"), readRedisReply(t, reader))
 }
 
 func TestRedisScanResumeDoesNotRepeatSimilarKeys(t *testing.T) {
@@ -1715,7 +1636,7 @@ func TestRedisKeysAndScanPrefixPatternFastPath(t *testing.T) {
 	require.Equal(t, []any{"disk:1000003"}, reply[1])
 }
 
-func TestRedisSScanCompatibilityIncludesListsAndHashes(t *testing.T) {
+func TestRedisSScanDoesNotExposeOtherRedisTypes(t *testing.T) {
 	_, conn := setupTestRedisServer(t)
 	reader := bufio.NewReader(conn)
 	writer := bufio.NewWriter(conn)
@@ -1728,9 +1649,7 @@ func TestRedisSScanCompatibilityIncludesListsAndHashes(t *testing.T) {
 	require.Equal(t, int64(1), readRedisReply(t, reader))
 
 	writeRedisCommand(t, writer, "SSCAN", "ignored", "0", "MATCH", "cache:*", "COUNT", "10")
-	reply := readRedisReply(t, reader).([]any)
-	require.Equal(t, "0", reply[0])
-	require.Equal(t, []any{"cache:hash", "cache:list", "cache:string"}, reply[1])
+	require.Equal(t, redisTestError("ERR unsupported command 'sscan'"), readRedisReply(t, reader))
 }
 
 func TestRedisInfo(t *testing.T) {
@@ -1745,6 +1664,8 @@ func TestRedisInfo(t *testing.T) {
 	info := readRedisReply(t, reader).(string)
 	require.Contains(t, info, "# Server")
 	require.Contains(t, info, "pirindb_version:")
+	require.Contains(t, info, "redis_mode:standalone\r\n")
+	require.Contains(t, info, "cluster_enabled:0\r\n")
 	require.Contains(t, info, "db0:keys=1")
 }
 
@@ -1754,13 +1675,20 @@ func TestRedisCommand(t *testing.T) {
 	writer := bufio.NewWriter(conn)
 
 	writeRedisCommand(t, writer, "COMMAND")
-	require.Equal(t, expectedRedisCommands, readRedisReply(t, reader))
+	metadata := readRedisReply(t, reader).([]any)
+	require.Len(t, metadata, len(expectedRedisCommands))
+	require.Len(t, metadata[0].([]any), 10)
 
 	writeRedisCommand(t, writer, "COMMAND", "LIST")
 	require.Equal(t, expectedRedisCommands, readRedisReply(t, reader))
 
 	writeRedisCommand(t, writer, "COMMAND", "COUNT")
 	require.Equal(t, int64(len(expectedRedisCommands)), readRedisReply(t, reader))
+
+	writeRedisCommand(t, writer, "COMMAND", "INFO", "GET", "SSCAN")
+	info := readRedisReply(t, reader).([]any)
+	require.Equal(t, "get", info[0].([]any)[0])
+	require.Nil(t, info[1])
 }
 
 func TestRedisConfig(t *testing.T) {
@@ -1777,6 +1705,17 @@ func TestRedisConfig(t *testing.T) {
 		"pirindb-checkpoint-tx-threshold", "64",
 		"pirindb-group-commit-tx-threshold", "16",
 		"pirindb-group-commit-window-ms", "1",
+		"pirindb-expiry-sweep-interval-ms", "0",
+		"pirindb-expiry-sweep-batch-size", "0",
+		"pirindb-expiry-sweep-max-batches", "0",
+		"pirindb-gc-sweep-interval-ms", "0",
+		"pirindb-gc-sweep-batch-size", "0",
+		"pirindb-gc-sweep-batch-bytes", "0",
+		"pirindb-gc-max-batches", "0",
+		"pirindb-migration-batch-size", "0",
+		"pirindb-migration-batch-bytes", "0",
+		"pirindb-pipeline-max-commands", "0",
+		"pirindb-pipeline-max-bytes", "0",
 	}, readRedisReply(t, reader))
 
 	writeRedisCommand(t, writer, "CONFIG", "GET", "dir")
@@ -1794,7 +1733,7 @@ func TestRedisPipelineExecCommitsAtomically(t *testing.T) {
 	reader := bufio.NewReader(conn)
 	writer := bufio.NewWriter(conn)
 
-	writeRedisCommand(t, writer, "PIPELINE")
+	writeRedisCommand(t, writer, "PIRIN.BATCH")
 	require.Equal(t, "OK", readRedisReply(t, reader))
 
 	writeRedisCommand(t, writer, "SET", "pipe:a", "1")
@@ -1806,7 +1745,7 @@ func TestRedisPipelineExecCommitsAtomically(t *testing.T) {
 	writeRedisCommand(t, writer, "GET", "pipe:a")
 	require.Equal(t, "QUEUED", readRedisReply(t, reader))
 
-	writeRedisCommand(t, writer, "EXEC")
+	writeRedisCommand(t, writer, "PIRIN.EXEC")
 	require.Equal(t, []any{"OK", "OK", "1"}, readRedisReply(t, reader))
 
 	writeRedisCommand(t, writer, "GET", "pipe:b")
@@ -1818,7 +1757,7 @@ func TestRedisPipelineMSetMGet(t *testing.T) {
 	reader := bufio.NewReader(conn)
 	writer := bufio.NewWriter(conn)
 
-	writeRedisCommand(t, writer, "PIPELINE")
+	writeRedisCommand(t, writer, "PIRIN.BATCH")
 	require.Equal(t, "OK", readRedisReply(t, reader))
 
 	writeRedisCommand(t, writer, "MSET", "batch:a", "1", "batch:b", "2")
@@ -1827,7 +1766,7 @@ func TestRedisPipelineMSetMGet(t *testing.T) {
 	writeRedisCommand(t, writer, "MGET", "batch:a", "batch:b", "batch:c")
 	require.Equal(t, "QUEUED", readRedisReply(t, reader))
 
-	writeRedisCommand(t, writer, "EXEC")
+	writeRedisCommand(t, writer, "PIRIN.EXEC")
 	require.Equal(t, []any{"OK", []any{"1", "2", nil}}, readRedisReply(t, reader))
 }
 
@@ -1836,7 +1775,7 @@ func TestRedisPipelineGetSetAndCounterCommands(t *testing.T) {
 	reader := bufio.NewReader(conn)
 	writer := bufio.NewWriter(conn)
 
-	writeRedisCommand(t, writer, "PIPELINE")
+	writeRedisCommand(t, writer, "PIRIN.BATCH")
 	require.Equal(t, "OK", readRedisReply(t, reader))
 
 	writeRedisCommand(t, writer, "SET", "count", "1")
@@ -1848,7 +1787,7 @@ func TestRedisPipelineGetSetAndCounterCommands(t *testing.T) {
 	writeRedisCommand(t, writer, "GETSET", "count", "9")
 	require.Equal(t, "QUEUED", readRedisReply(t, reader))
 
-	writeRedisCommand(t, writer, "EXEC")
+	writeRedisCommand(t, writer, "PIRIN.EXEC")
 	require.Equal(t, []any{"OK", int64(5), "5"}, readRedisReply(t, reader))
 
 	writeRedisCommand(t, writer, "GET", "count")
@@ -1860,7 +1799,7 @@ func TestRedisPipelineExistsUnlinkAndSetOptions(t *testing.T) {
 	reader := bufio.NewReader(conn)
 	writer := bufio.NewWriter(conn)
 
-	writeRedisCommand(t, writer, "PIPELINE")
+	writeRedisCommand(t, writer, "PIRIN.BATCH")
 	require.Equal(t, "OK", readRedisReply(t, reader))
 
 	writeRedisCommand(t, writer, "SET", "lock", "a", "NX", "EX", "5")
@@ -1875,7 +1814,7 @@ func TestRedisPipelineExistsUnlinkAndSetOptions(t *testing.T) {
 	writeRedisCommand(t, writer, "UNLINK", "lock")
 	require.Equal(t, "QUEUED", readRedisReply(t, reader))
 
-	writeRedisCommand(t, writer, "EXEC")
+	writeRedisCommand(t, writer, "PIRIN.EXEC")
 	require.Equal(t, []any{"OK", int64(1), "a", int64(1)}, readRedisReply(t, reader))
 
 	writeRedisCommand(t, writer, "GET", "lock")
@@ -1887,7 +1826,7 @@ func TestRedisPipelineHashCommands(t *testing.T) {
 	reader := bufio.NewReader(conn)
 	writer := bufio.NewWriter(conn)
 
-	writeRedisCommand(t, writer, "PIPELINE")
+	writeRedisCommand(t, writer, "PIRIN.BATCH")
 	require.Equal(t, "OK", readRedisReply(t, reader))
 
 	writeRedisCommand(t, writer, "HSET", "hash", "a", "1", "b", "2")
@@ -1899,7 +1838,7 @@ func TestRedisPipelineHashCommands(t *testing.T) {
 	writeRedisCommand(t, writer, "HLEN", "hash")
 	require.Equal(t, "QUEUED", readRedisReply(t, reader))
 
-	writeRedisCommand(t, writer, "EXEC")
+	writeRedisCommand(t, writer, "PIRIN.EXEC")
 	require.Equal(t, []any{int64(2), "1", int64(2)}, readRedisReply(t, reader))
 }
 
@@ -1908,7 +1847,7 @@ func TestRedisPipelineListCommands(t *testing.T) {
 	reader := bufio.NewReader(conn)
 	writer := bufio.NewWriter(conn)
 
-	writeRedisCommand(t, writer, "PIPELINE")
+	writeRedisCommand(t, writer, "PIRIN.BATCH")
 	require.Equal(t, "OK", readRedisReply(t, reader))
 
 	writeRedisCommand(t, writer, "RPUSH", "list", "a", "b", "c", "d", "e")
@@ -1926,7 +1865,7 @@ func TestRedisPipelineListCommands(t *testing.T) {
 	writeRedisCommand(t, writer, "LLEN", "list")
 	require.Equal(t, "QUEUED", readRedisReply(t, reader))
 
-	writeRedisCommand(t, writer, "EXEC")
+	writeRedisCommand(t, writer, "PIRIN.EXEC")
 	require.Equal(t, []any{int64(5), "OK", "OK", []any{"b", "c", "x"}, int64(3)}, readRedisReply(t, reader))
 }
 
@@ -1937,7 +1876,7 @@ func TestRedisPipelineRollbackOnError(t *testing.T) {
 
 	oversizedKey := strings.Repeat("k", storage.MaxKeySize)
 
-	writeRedisCommand(t, writer, "PIPELINE")
+	writeRedisCommand(t, writer, "PIRIN.BATCH")
 	require.Equal(t, "OK", readRedisReply(t, reader))
 
 	writeRedisCommand(t, writer, "SET", "rollback:key", "value")
@@ -1946,9 +1885,9 @@ func TestRedisPipelineRollbackOnError(t *testing.T) {
 	writeRedisCommand(t, writer, "SET", oversizedKey, "boom")
 	require.Equal(t, "QUEUED", readRedisReply(t, reader))
 
-	writeRedisCommand(t, writer, "EXEC")
+	writeRedisCommand(t, writer, "PIRIN.EXEC")
 	reply := readRedisReply(t, reader)
-	require.Equal(t, redisTestError("ERR pipeline aborted at command 2 (set): key too large"), reply)
+	require.Equal(t, redisTestError("ERR PirinDB batch aborted at command 2 (set): key too large"), reply)
 
 	writeRedisCommand(t, writer, "GET", "rollback:key")
 	require.Nil(t, readRedisReply(t, reader))
@@ -1959,7 +1898,7 @@ func TestRedisPipelineHashRollbackOnWrongType(t *testing.T) {
 	reader := bufio.NewReader(conn)
 	writer := bufio.NewWriter(conn)
 
-	writeRedisCommand(t, writer, "PIPELINE")
+	writeRedisCommand(t, writer, "PIRIN.BATCH")
 	require.Equal(t, "OK", readRedisReply(t, reader))
 
 	writeRedisCommand(t, writer, "HSET", "hash", "a", "1")
@@ -1968,15 +1907,15 @@ func TestRedisPipelineHashRollbackOnWrongType(t *testing.T) {
 	writeRedisCommand(t, writer, "LPUSH", "hash", "x")
 	require.Equal(t, "QUEUED", readRedisReply(t, reader))
 
-	writeRedisCommand(t, writer, "EXEC")
+	writeRedisCommand(t, writer, "PIRIN.EXEC")
 	reply := readRedisReply(t, reader)
-	require.Equal(t, redisTestError("ERR pipeline aborted at command 2 (lpush): WRONGTYPE Operation against a key holding the wrong kind of value"), reply)
+	require.Equal(t, redisTestError("ERR PirinDB batch aborted at command 2 (lpush): WRONGTYPE Operation against a key holding the wrong kind of value"), reply)
 
 	writeRedisCommand(t, writer, "HGET", "hash", "a")
 	require.Nil(t, readRedisReply(t, reader))
 }
 
-func TestRedisMultiAliasAndDiscard(t *testing.T) {
+func TestRedisMultiDiscard(t *testing.T) {
 	_, conn := setupTestRedisServer(t)
 	reader := bufio.NewReader(conn)
 	writer := bufio.NewWriter(conn)
@@ -1994,6 +1933,46 @@ func TestRedisMultiAliasAndDiscard(t *testing.T) {
 	require.Nil(t, readRedisReply(t, reader))
 }
 
+func TestRedisMultiRuntimeErrorsRemainInExecArray(t *testing.T) {
+	_, conn := setupTestRedisServer(t)
+	reader := bufio.NewReader(conn)
+	writer := bufio.NewWriter(conn)
+
+	writeRedisCommand(t, writer, "SET", "string-key", "value")
+	require.Equal(t, "OK", readRedisReply(t, reader))
+	writeRedisCommand(t, writer, "MULTI")
+	require.Equal(t, "OK", readRedisReply(t, reader))
+	writeRedisCommand(t, writer, "HSET", "string-key", "field", "value")
+	require.Equal(t, "QUEUED", readRedisReply(t, reader))
+	writeRedisCommand(t, writer, "SET", "after-error", "committed")
+	require.Equal(t, "QUEUED", readRedisReply(t, reader))
+	writeRedisCommand(t, writer, "EXEC")
+	replies := readRedisReply(t, reader).([]any)
+	require.Equal(t, redisTestError("WRONGTYPE Operation against a key holding the wrong kind of value"), replies[0])
+	require.Equal(t, "OK", replies[1])
+
+	writeRedisCommand(t, writer, "GET", "after-error")
+	require.Equal(t, "committed", readRedisReply(t, reader))
+}
+
+func TestRedisMultiQueueErrorAbortsExec(t *testing.T) {
+	_, conn := setupTestRedisServer(t)
+	reader := bufio.NewReader(conn)
+	writer := bufio.NewWriter(conn)
+
+	writeRedisCommand(t, writer, "MULTI")
+	require.Equal(t, "OK", readRedisReply(t, reader))
+	writeRedisCommand(t, writer, "SET", "missing-value")
+	require.Equal(t, redisTestError("ERR wrong number of arguments for 'set' command"), readRedisReply(t, reader))
+	writeRedisCommand(t, writer, "SET", "must-not-commit", "value")
+	require.Equal(t, "QUEUED", readRedisReply(t, reader))
+	writeRedisCommand(t, writer, "EXEC")
+	require.Equal(t, redisTestError("ERR EXECABORT Transaction discarded because of previous errors"), readRedisReply(t, reader))
+
+	writeRedisCommand(t, writer, "GET", "must-not-commit")
+	require.Nil(t, readRedisReply(t, reader))
+}
+
 func TestRedisPipelineSet1000(t *testing.T) {
 	const batchSize = 1000
 
@@ -2002,11 +1981,11 @@ func TestRedisPipelineSet1000(t *testing.T) {
 	value := strings.Repeat("v", 64)
 
 	var payload bytes.Buffer
-	appendRedisCommand(t, &payload, "PIPELINE")
+	appendRedisCommand(t, &payload, "PIRIN.BATCH")
 	for i := 0; i < batchSize; i++ {
 		appendRedisCommand(t, &payload, "SET", fmt.Sprintf("pipe-bench:%04d", i), value)
 	}
-	appendRedisCommand(t, &payload, "EXEC")
+	appendRedisCommand(t, &payload, "PIRIN.EXEC")
 
 	start := time.Now()
 	_, err := conn.Write(payload.Bytes())
@@ -2032,4 +2011,43 @@ func TestRedisPipelineSet1000(t *testing.T) {
 	require.Equal(t, value, readRedisReply(t, reader))
 	writeRedisCommand(t, verifyWriter, "GET", fmt.Sprintf("pipe-bench:%04d", batchSize-1))
 	require.Equal(t, value, readRedisReply(t, reader))
+}
+
+func TestRedisStandardPipelineSharesOneGroupCommit(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "redis-group-pipeline.db")
+	opts := storage.DefaultOptions().
+		WithSyncPolicy(storage.SyncPolicyGroup).
+		WithGroupCommitTxThreshold(16).
+		WithGroupCommitWindow(time.Second)
+	db, err := storage.Open(path, opts)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
+	cfg := &Config{Redis: &RedisConfig{Enabled: true, PipelineMaxCommands: 64, PipelineMaxBytes: 1024 * 1024}}
+	srv := NewRedisServer(cfg, db, createLogger("ERROR"))
+	serverConn, clientConn := net.Pipe()
+	done := make(chan struct{})
+	go func() {
+		srv.handleConn(serverConn)
+		close(done)
+	}()
+	t.Cleanup(func() {
+		_ = clientConn.Close()
+		<-done
+	})
+
+	var payload bytes.Buffer
+	for idx := 0; idx < 16; idx++ {
+		appendRedisCommand(t, &payload, "SET", fmt.Sprintf("pipeline:%02d", idx), "value")
+	}
+	writeDone := make(chan error, 1)
+	go func() {
+		_, writeErr := clientConn.Write(payload.Bytes())
+		writeDone <- writeErr
+	}()
+	reader := bufio.NewReader(clientConn)
+	for idx := 0; idx < 16; idx++ {
+		require.Equal(t, "OK", readRedisReply(t, reader))
+	}
+	require.NoError(t, <-writeDone)
+	require.Equal(t, uint64(1), db.GroupCommitBatchCount())
 }

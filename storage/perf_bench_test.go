@@ -3,11 +3,14 @@ package storage
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"os"
 	"sync/atomic"
 	"testing"
 	"time"
 )
+
+var benchmarkFreelistSnapshot *Freelist
 
 func benchKey(i int) []byte {
 	key := make([]byte, 8)
@@ -102,23 +105,106 @@ func BenchmarkFreelistAllocateRelease(b *testing.B) {
 	}
 }
 
-func BenchmarkBaseSetInWriteTx(b *testing.B) {
-	db := openBenchmarkDB(b)
-	tx := db.Begin(true)
-	bucket, err := tx.CreateBucket([]byte("bench"))
-	if err != nil {
-		b.Fatal(err)
+func BenchmarkFreelistSnapshotFragmented(b *testing.B) {
+	f := newFreelist(BTreePageSize, 1_000_000, true)
+	f.releasedExtents = make([]pageExtent, 100_000)
+	for idx := range f.releasedExtents {
+		pageNum := uint64(rootPageNumber + idx*2)
+		f.releasedExtents[idx] = pageExtent{start: pageNum, end: pageNum}
 	}
-	value := bytes.Repeat([]byte("v"), 64)
+	f.releasedCount = uint64(len(f.releasedExtents))
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if err = bucket.Put(benchKey(i), value); err != nil {
+		benchmarkFreelistSnapshot = cloneFreelist(f)
+	}
+}
+
+func BenchmarkFreelistFragmentedAllocateRelease(b *testing.B) {
+	f := newFreelist(BTreePageSize, 1_000_000, true)
+	f.currentPage = 900_000
+	f.releasedExtents = make([]pageExtent, 100_000)
+	for idx := range f.releasedExtents {
+		pageNum := uint64(rootPageNumber + idx*2)
+		f.releasedExtents[idx] = pageExtent{start: pageNum, end: pageNum}
+	}
+	f.releasedCount = uint64(len(f.releasedExtents))
+	f.dirty = true
+	markFreelistPersisted(f)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		pageNum, err := f.GetNextPageNumber()
+		if err != nil {
+			b.Fatal(err)
+		}
+		f.ReleasePage(pageNum)
+		markFreelistPersisted(f)
+	}
+}
+
+func BenchmarkBaseSetInWriteTx(b *testing.B) {
+	db := openBenchmarkDB(b)
+	const keyspace = 4096
+	value := bytes.Repeat([]byte("v"), 64)
+	err := db.Update(func(tx *Tx) error {
+		bucket, createErr := tx.CreateBucket([]byte("bench"))
+		if createErr != nil {
+			return createErr
+		}
+		for i := 0; i < keyspace; i++ {
+			if putErr := bucket.Put(benchKey(i), value); putErr != nil {
+				return putErr
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+	tx := db.Begin(true)
+	defer tx.Rollback()
+	bucket, err := tx.GetBucket([]byte("bench"))
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err = bucket.Put(benchKey(i%keyspace), value); err != nil {
 			b.Fatal(err)
 		}
 	}
+}
+
+func BenchmarkBaseInsertInWriteTx(b *testing.B) {
+	db := openBenchmarkDB(b)
+	value := bytes.Repeat([]byte("v"), 64)
+	const batchSize = 100_000
+
+	b.ResetTimer()
 	b.StopTimer()
-	tx.Rollback()
+	completed := 0
+	for completed < b.N {
+		tx := db.Begin(true)
+		bucket, err := tx.CreateBucket([]byte("insert"))
+		if err != nil {
+			tx.Rollback()
+			b.Fatal(err)
+		}
+		count := min(batchSize, b.N-completed)
+		b.StartTimer()
+		for idx := 0; idx < count; idx++ {
+			if err = bucket.Put(benchKey(idx), value); err != nil {
+				b.StopTimer()
+				tx.Rollback()
+				b.Fatal(err)
+			}
+		}
+		b.StopTimer()
+		tx.Rollback()
+		completed += count
+	}
 }
 
 func BenchmarkBatchWrite1000InSingleTx(b *testing.B) {
@@ -256,6 +342,7 @@ func BenchmarkBaseGetInReadTx(b *testing.B) {
 	}
 
 	readTx := db.Begin(false)
+	defer readTx.Rollback()
 	bucket, err := readTx.GetBucket([]byte("bench"))
 	if err != nil {
 		b.Fatal(err)
@@ -269,13 +356,96 @@ func BenchmarkBaseGetInReadTx(b *testing.B) {
 			b.Fatalf("expected key %d", i%preload)
 		}
 	}
-	b.StopTimer()
-	readTx.Rollback()
+}
+
+func BenchmarkSingleGetPerReadTx(b *testing.B) {
+	db := openBenchmarkDB(b)
+	const preload = 4096
+	value := []byte("value")
+
+	err := db.Update(func(tx *Tx) error {
+		bucket, bucketErr := tx.CreateBucket([]byte("bench"))
+		if bucketErr != nil {
+			return bucketErr
+		}
+		for i := 0; i < preload; i++ {
+			if putErr := bucket.Put(benchKey(i), value); putErr != nil {
+				return putErr
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		key := benchKey(i % preload)
+		err = db.View(func(tx *Tx) error {
+			bucket, getErr := tx.GetBucket([]byte("bench"))
+			if getErr != nil {
+				return getErr
+			}
+			got, found := bucket.Get(key)
+			if !found || len(got) == 0 {
+				return fmt.Errorf("expected key")
+			}
+			return nil
+		})
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkParallelGetPerReadTx(b *testing.B) {
+	db := openBenchmarkDB(b)
+	const preload = 4096
+	requireValue := []byte("value")
+	err := db.Update(func(tx *Tx) error {
+		bucket, bucketErr := tx.CreateBucket([]byte("bench"))
+		if bucketErr != nil {
+			return bucketErr
+		}
+		for i := 0; i < preload; i++ {
+			if putErr := bucket.Put(benchKey(i), requireValue); putErr != nil {
+				return putErr
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	var keyCounter atomic.Uint64
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			key := benchKey(int(keyCounter.Add(1)) % preload)
+			viewErr := db.View(func(tx *Tx) error {
+				bucket, getErr := tx.GetBucket([]byte("bench"))
+				if getErr != nil {
+					return getErr
+				}
+				value, found := bucket.Get(key)
+				if !found || len(value) == 0 {
+					return fmt.Errorf("expected key")
+				}
+				return nil
+			})
+			if viewErr != nil {
+				b.Fatal(viewErr)
+			}
+		}
+	})
 }
 
 func BenchmarkBaseDeleteReinsertInWriteTx(b *testing.B) {
 	db := openBenchmarkDB(b)
 	tx := db.Begin(true)
+	defer tx.Rollback()
 	bucket, err := tx.CreateBucket([]byte("bench"))
 	if err != nil {
 		b.Fatal(err)
@@ -298,8 +468,6 @@ func BenchmarkBaseDeleteReinsertInWriteTx(b *testing.B) {
 			b.Fatal(err)
 		}
 	}
-	b.StopTimer()
-	tx.Rollback()
 }
 
 func BenchmarkBaseSeekInReadTx(b *testing.B) {
@@ -323,6 +491,7 @@ func BenchmarkBaseSeekInReadTx(b *testing.B) {
 	}
 
 	readTx := db.Begin(false)
+	defer readTx.Rollback()
 	bucket, err := readTx.GetBucket([]byte("bench"))
 	if err != nil {
 		b.Fatal(err)
@@ -336,27 +505,90 @@ func BenchmarkBaseSeekInReadTx(b *testing.B) {
 			b.Fatalf("expected seek key %d", i%preload)
 		}
 	}
-	b.StopTimer()
-	readTx.Rollback()
+}
+
+func BenchmarkCursorScanInReadTx(b *testing.B) {
+	db := openBenchmarkDB(b)
+	const preload = 16_384
+
+	err := db.Update(func(tx *Tx) error {
+		bucket, bucketErr := tx.CreateBucket([]byte("bench"))
+		if bucketErr != nil {
+			return bucketErr
+		}
+		for i := 0; i < preload; i++ {
+			if putErr := bucket.Put(benchKey(i), []byte("value")); putErr != nil {
+				return putErr
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	readTx := db.Begin(false)
+	defer readTx.Rollback()
+	bucket, err := readTx.GetBucket([]byte("bench"))
+	if err != nil {
+		b.Fatal(err)
+	}
+	cursor := bucket.Cursor()
+	key, value := cursor.First()
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if key == nil {
+			key, value = cursor.First()
+		}
+		if key == nil || len(value) == 0 {
+			b.Fatal("unexpected end of cursor")
+		}
+		key, value = cursor.Next()
+	}
 }
 
 func BenchmarkBlobSet64KInWriteTx(b *testing.B) {
 	db := openBenchmarkDB(b)
-	tx := db.Begin(true)
-	bucket, err := tx.CreateBucket([]byte("blob"))
+	err := db.Update(func(tx *Tx) error {
+		_, createErr := tx.CreateBucket([]byte("blob"))
+		return createErr
+	})
 	if err != nil {
 		b.Fatal(err)
 	}
 	payload := bytes.Repeat([]byte("x"), 64*1024)
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		if err = bucket.Put(benchKey(i), payload); err != nil {
+	const batchSize = 256
+	var tx *Tx
+	var bucket *Bucket
+	startBatch := func() {
+		tx = db.Begin(true)
+		bucket, err = tx.GetBucket([]byte("blob"))
+		if err != nil {
+			tx.Rollback()
+			tx = nil
 			b.Fatal(err)
 		}
 	}
-	b.StopTimer()
-	tx.Rollback()
+	startBatch()
+	defer func() {
+		if tx != nil {
+			tx.Rollback()
+		}
+	}()
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if i > 0 && i%batchSize == 0 {
+			b.StopTimer()
+			tx.Rollback()
+			startBatch()
+			b.StartTimer()
+		}
+		if err = bucket.Put(benchKey(i%batchSize), payload); err != nil {
+			b.Fatal(err)
+		}
+	}
 }
 
 func BenchmarkBlobGet64KInReadTx(b *testing.B) {
@@ -376,6 +608,7 @@ func BenchmarkBlobGet64KInReadTx(b *testing.B) {
 	}
 
 	readTx := db.Begin(false)
+	defer readTx.Rollback()
 	bucket, err := readTx.GetBucket([]byte("blob"))
 	if err != nil {
 		b.Fatal(err)
@@ -388,6 +621,4 @@ func BenchmarkBlobGet64KInReadTx(b *testing.B) {
 			b.Fatalf("unexpected blob value length: %d", len(value))
 		}
 	}
-	b.StopTimer()
-	readTx.Rollback()
 }

@@ -44,7 +44,7 @@ func TestNewBlob(t *testing.T) {
 	err = tx.Commit()
 	require.NoError(t, err)
 
-	require.Equal(t, len(db.dal.freelist.releasedPages), existingBlob.pageCount)
+	require.EqualValues(t, existingBlob.pageCount, db.dal.freelist.releasedPageN())
 }
 
 func TestBlobStreamReadWrite(t *testing.T) {

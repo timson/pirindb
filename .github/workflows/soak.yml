@@ -1,0 +1,34 @@
+name: cluster-soak
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration_seconds:
+        description: "Add/drain/restart soak duration"
+        required: true
+        default: "14400"
+
+jobs:
+  redis-soak:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: bash hack/redis-soak.sh
+        env:
+          SOAK_DURATION_SECONDS: ${{ inputs.duration_seconds }}
+
+  kind-soak:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: helm/kind-action@v1
+        with:
+          install_only: true
+      - run: bash hack/kind-soak.sh
+        env:
+          SOAK_DURATION_SECONDS: ${{ inputs.duration_seconds }}

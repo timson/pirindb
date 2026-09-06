@@ -1,0 +1,34 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+          cache: true
+      - run: go test ./...
+      - run: go vet ./...
+      - run: python3 hack/test-kind-client.py
+      - run: bash -n hack/kind-client.sh hack/kind-e2e.sh hack/kind-soak.sh
+      - run: go test -race ./cmd/pirindb ./operator/controllers
+      - run: go test ./... -run Cluster
+      - run: go test ./cmd/pirindb -run '^$' -fuzz FuzzClusterTransferFrameDecoder -fuzztime 10s
+      - run: make generate-crd
+      - run: git diff --exit-code -- operator/api/v1alpha1/zz_generated.deepcopy.go operator/manifests/pirindb.timson.dev_pirindbclusters.yaml
+
+  kind-e2e:
+    runs-on: ubuntu-latest
+    needs: go
+    steps:
+      - uses: actions/checkout@v4
+      - uses: helm/kind-action@v1
+        with:
+          install_only: true
+      - run: bash hack/kind-e2e.sh

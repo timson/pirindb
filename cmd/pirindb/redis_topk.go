@@ -44,12 +44,13 @@ var (
 )
 
 type redisTopKMeta struct {
-	ID        uint64
-	K         uint64
-	Width     uint64
-	Depth     uint64
-	HeapSize  uint64
-	DecayBits uint64
+	ID            uint64
+	K             uint64
+	Width         uint64
+	Depth         uint64
+	HeapSize      uint64
+	DecayBits     uint64
+	StorageFormat byte
 }
 
 type redisTopKHeapEntry struct {
@@ -88,12 +89,13 @@ func deserializeRedisTopKMeta(buf []byte) (*redisTopKMeta, error) {
 		return nil, errors.New("corrupted redis topk metadata")
 	}
 	return &redisTopKMeta{
-		ID:        binary.BigEndian.Uint64(buf[0:8]),
-		K:         binary.BigEndian.Uint64(buf[8:16]),
-		Width:     binary.BigEndian.Uint64(buf[16:24]),
-		Depth:     binary.BigEndian.Uint64(buf[24:32]),
-		HeapSize:  binary.BigEndian.Uint64(buf[32:40]),
-		DecayBits: binary.BigEndian.Uint64(buf[40:48]),
+		ID:            binary.BigEndian.Uint64(buf[0:8]),
+		K:             binary.BigEndian.Uint64(buf[8:16]),
+		Width:         binary.BigEndian.Uint64(buf[16:24]),
+		Depth:         binary.BigEndian.Uint64(buf[24:32]),
+		HeapSize:      binary.BigEndian.Uint64(buf[32:40]),
+		DecayBits:     binary.BigEndian.Uint64(buf[40:48]),
+		StorageFormat: redisKeyStorageLegacy,
 	}, nil
 }
 
@@ -239,6 +241,10 @@ func loadRedisTopKMetaTx(tx *storage.Tx, ns redisNamespace, key []byte) (*redisT
 	if err != nil {
 		return nil, false, err
 	}
+	meta.StorageFormat, err = redisObjectStorageFormatTx(tx, ns, key, redisKeyTypeTopK, meta.ID)
+	if err != nil {
+		return nil, false, err
+	}
 	return meta, true, nil
 }
 
@@ -248,6 +254,9 @@ func saveRedisTopKMetaTx(tx *storage.Tx, ns redisNamespace, key []byte, meta *re
 		return err
 	}
 	if err = bucket.Put(key, meta.serialize()); err != nil {
+		return err
+	}
+	if err = saveRedisKeyMetaForTypeWithFormatTx(tx, ns, key, redisKeyTypeTopK, meta.ID, meta.StorageFormat); err != nil {
 		return err
 	}
 	return ensureRedisSlotIndexEntryTx(tx, ns, key)
@@ -266,6 +275,9 @@ func deleteRedisTopKMetaTx(tx *storage.Tx, ns redisNamespace, key []byte) error 
 		return nil
 	}
 	if err != nil {
+		return err
+	}
+	if err = deleteRedisKeyMetaTx(tx, ns, key); err != nil {
 		return err
 	}
 	return deleteRedisSlotIndexEntryTx(tx, ns, key)
@@ -297,15 +309,15 @@ func nextRedisTopKIDTx(tx *storage.Tx, ns redisNamespace) (uint64, error) {
 	return id, nil
 }
 
-func ensureRedisTopKDataBucketTx(tx *storage.Tx, ns redisNamespace, meta *redisTopKMeta) (*storage.Bucket, error) {
-	return tx.CreateBucketIfNotExists(redisTopKDataBucketName(ns, meta.ID))
+func ensureRedisTopKDataBucketTx(tx *storage.Tx, ns redisNamespace, meta *redisTopKMeta) (*redisObjectBucket, error) {
+	return openRedisObjectBucketTx(tx, ns.topkDataBucket, redisTopKDataBucketName(ns, meta.ID), meta.ID, meta.StorageFormat, true)
 }
 
-func getRedisTopKDataBucketTx(tx *storage.Tx, ns redisNamespace, meta *redisTopKMeta) (*storage.Bucket, error) {
-	return tx.GetBucket(redisTopKDataBucketName(ns, meta.ID))
+func getRedisTopKDataBucketTx(tx *storage.Tx, ns redisNamespace, meta *redisTopKMeta) (*redisObjectBucket, error) {
+	return openRedisObjectBucketTx(tx, ns.topkDataBucket, redisTopKDataBucketName(ns, meta.ID), meta.ID, meta.StorageFormat, false)
 }
 
-func loadRedisTopKCounterBlock(bucket *storage.Bucket, row uint64, blockIndex uint64) ([]byte, error) {
+func loadRedisTopKCounterBlock(bucket *redisObjectBucket, row uint64, blockIndex uint64) ([]byte, error) {
 	raw, found := bucket.Get(redisTopKCounterBlockKey(row, blockIndex))
 	if !found {
 		return make([]byte, redisBloomBlockSize), nil
@@ -316,14 +328,14 @@ func loadRedisTopKCounterBlock(bucket *storage.Bucket, row uint64, blockIndex ui
 	return cloneBytes(raw), nil
 }
 
-func saveRedisTopKCounterBlock(bucket *storage.Bucket, row uint64, blockIndex uint64, block []byte) error {
+func saveRedisTopKCounterBlock(bucket *redisObjectBucket, row uint64, blockIndex uint64, block []byte) error {
 	if len(block) != redisBloomBlockSize {
 		return errors.New("corrupted redis topk counter block")
 	}
 	return bucket.Put(redisTopKCounterBlockKey(row, blockIndex), block)
 }
 
-func loadRedisTopKHeap(bucket *storage.Bucket, heapSize uint64) ([]redisTopKHeapEntry, error) {
+func loadRedisTopKHeap(bucket *redisObjectBucket, heapSize uint64) ([]redisTopKHeapEntry, error) {
 	entries := make([]redisTopKHeapEntry, 0, heapSize)
 	for i := uint64(0); i < heapSize; i++ {
 		raw, found := bucket.Get(redisTopKHeapKey(i))
@@ -339,7 +351,7 @@ func loadRedisTopKHeap(bucket *storage.Bucket, heapSize uint64) ([]redisTopKHeap
 	return entries, nil
 }
 
-func saveRedisTopKHeap(bucket *storage.Bucket, previousSize uint64, entries []redisTopKHeapEntry) error {
+func saveRedisTopKHeap(bucket *redisObjectBucket, previousSize uint64, entries []redisTopKHeapEntry) error {
 	for i, entry := range entries {
 		if err := bucket.Put(redisTopKHeapKey(uint64(i)), entry.serialize()); err != nil {
 			return err
@@ -424,8 +436,14 @@ func redisTopKShouldDecay(randFn func() uint64, decay float64, count uint64) boo
 }
 
 func deleteRedisTopKTx(tx *storage.Tx, ns redisNamespace, key []byte, meta *redisTopKMeta) error {
-	if err := tx.DeleteBucket(redisTopKDataBucketName(ns, meta.ID)); err != nil && !errors.Is(err, storage.ErrBucketNotFound) {
+	store, err := getRedisTopKDataBucketTx(tx, ns, meta)
+	if err != nil && !errors.Is(err, storage.ErrBucketNotFound) {
 		return err
+	}
+	if err == nil {
+		if err = deleteRedisObjectBucketTx(tx, store, redisTopKDataBucketName(ns, meta.ID)); err != nil {
+			return err
+		}
 	}
 	if err := deleteRedisTopKMetaTx(tx, ns, key); err != nil {
 		return err
@@ -467,7 +485,7 @@ func loadRedisTopKMetaForReadTx(tx *storage.Tx, ns redisNamespace, key []byte, n
 	return nil, false, nil
 }
 
-func createRedisTopKTx(tx *storage.Tx, ns redisNamespace, key []byte, k uint64, width uint64, depth uint64, decay float64, nowMs int64) (*redisTopKMeta, *storage.Bucket, error) {
+func createRedisTopKTx(tx *storage.Tx, ns redisNamespace, key []byte, k uint64, width uint64, depth uint64, decay float64, nowMs int64) (*redisTopKMeta, *redisObjectBucket, error) {
 	if _, err := purgeExpiredRedisKeyTx(tx, ns, key, nowMs); err != nil {
 		return nil, nil, err
 	}
@@ -485,11 +503,12 @@ func createRedisTopKTx(tx *storage.Tx, ns redisNamespace, key []byte, k uint64, 
 		return nil, nil, err
 	}
 	meta := &redisTopKMeta{
-		ID:       id,
-		K:        k,
-		Width:    width,
-		Depth:    depth,
-		HeapSize: 0,
+		ID:            id,
+		K:             k,
+		Width:         width,
+		Depth:         depth,
+		HeapSize:      0,
+		StorageFormat: redisKeyStorageShared,
 	}
 	meta.SetDecay(decay)
 	dataBucket, err := ensureRedisTopKDataBucketTx(tx, ns, meta)
@@ -505,7 +524,7 @@ func createRedisTopKTx(tx *storage.Tx, ns redisNamespace, key []byte, k uint64, 
 	return meta, dataBucket, nil
 }
 
-func getRedisTopKBucketTx(tx *storage.Tx, ns redisNamespace, key []byte, nowMs int64) (*storage.Bucket, *redisTopKMeta, error) {
+func getRedisTopKBucketTx(tx *storage.Tx, ns redisNamespace, key []byte, nowMs int64) (*redisObjectBucket, *redisTopKMeta, error) {
 	meta, found, err := loadRedisTopKMetaForReadTx(tx, ns, key, nowMs)
 	if err != nil {
 		return nil, nil, err
@@ -520,7 +539,7 @@ func getRedisTopKBucketTx(tx *storage.Tx, ns redisNamespace, key []byte, nowMs i
 	return dataBucket, meta, nil
 }
 
-func redisTopKEstimateCountTx(bucket *storage.Bucket, meta *redisTopKMeta, item []byte) (uint64, error) {
+func redisTopKEstimateCountTx(bucket *redisObjectBucket, meta *redisTopKMeta, item []byte) (uint64, error) {
 	fingerprint, columns := redisTopKFingerprintAndColumns(item, meta.Width, meta.Depth)
 	var minCount uint64
 	found := false
@@ -546,7 +565,7 @@ func redisTopKEstimateCountTx(bucket *storage.Bucket, meta *redisTopKMeta, item 
 	return minCount, nil
 }
 
-func redisTopKIncrementItem(bucket *storage.Bucket, meta *redisTopKMeta, item []byte, increment uint64, randFn func() uint64) (uint64, error) {
+func redisTopKIncrementItem(bucket *redisObjectBucket, meta *redisTopKMeta, item []byte, increment uint64, randFn func() uint64) (uint64, error) {
 	fingerprint, columns := redisTopKFingerprintAndColumns(item, meta.Width, meta.Depth)
 	blockCache := make(map[[2]uint64][]byte)
 	dirtyBlocks := make(map[[2]uint64]struct{})

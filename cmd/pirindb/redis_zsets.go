@@ -27,8 +27,9 @@ const (
 )
 
 type redisZSetMeta struct {
-	ID          uint64
-	Cardinality uint64
+	ID            uint64
+	Cardinality   uint64
+	StorageFormat byte
 }
 
 type redisZSetScoreMemberPair struct {
@@ -65,8 +66,9 @@ func deserializeRedisZSetMeta(buf []byte) (*redisZSetMeta, error) {
 		return nil, errors.New("corrupted redis zset metadata")
 	}
 	return &redisZSetMeta{
-		ID:          binary.BigEndian.Uint64(buf[0:8]),
-		Cardinality: binary.BigEndian.Uint64(buf[8:16]),
+		ID:            binary.BigEndian.Uint64(buf[0:8]),
+		Cardinality:   binary.BigEndian.Uint64(buf[8:16]),
+		StorageFormat: redisKeyStorageLegacy,
 	}, nil
 }
 
@@ -265,6 +267,10 @@ func loadRedisZSetMetaTx(tx *storage.Tx, ns redisNamespace, key []byte) (*redisZ
 	if err != nil {
 		return nil, false, err
 	}
+	meta.StorageFormat, err = redisObjectStorageFormatTx(tx, ns, key, redisKeyTypeZSet, meta.ID)
+	if err != nil {
+		return nil, false, err
+	}
 	return meta, true, nil
 }
 
@@ -274,6 +280,9 @@ func saveRedisZSetMetaTx(tx *storage.Tx, ns redisNamespace, key []byte, meta *re
 		return err
 	}
 	if err = bucket.Put(key, meta.serialize()); err != nil {
+		return err
+	}
+	if err = saveRedisKeyMetaForTypeWithFormatTx(tx, ns, key, redisKeyTypeZSet, meta.ID, meta.StorageFormat); err != nil {
 		return err
 	}
 	return ensureRedisSlotIndexEntryTx(tx, ns, key)
@@ -292,6 +301,9 @@ func deleteRedisZSetMetaTx(tx *storage.Tx, ns redisNamespace, key []byte) error 
 		return nil
 	}
 	if err != nil {
+		return err
+	}
+	if err = deleteRedisKeyMetaTx(tx, ns, key); err != nil {
 		return err
 	}
 	return deleteRedisSlotIndexEntryTx(tx, ns, key)
@@ -323,20 +335,32 @@ func nextRedisZSetIDTx(tx *storage.Tx, ns redisNamespace) (uint64, error) {
 	return id, nil
 }
 
-func ensureRedisZSetMemberBucketTx(tx *storage.Tx, ns redisNamespace, meta *redisZSetMeta) (*storage.Bucket, error) {
-	return tx.CreateBucketIfNotExists(redisZSetMemberBucketName(ns, meta.ID))
+func ensureRedisZSetMemberBucketTx(tx *storage.Tx, ns redisNamespace, meta *redisZSetMeta) (*redisObjectBucket, error) {
+	return openRedisObjectBucketTx(tx, ns.zsetMemberBucket, redisZSetMemberBucketName(ns, meta.ID), meta.ID, meta.StorageFormat, true)
 }
 
-func ensureRedisZSetScoreBucketTx(tx *storage.Tx, ns redisNamespace, meta *redisZSetMeta) (*storage.Bucket, error) {
-	return tx.CreateBucketIfNotExists(redisZSetScoreBucketName(ns, meta.ID))
+func ensureRedisZSetScoreBucketTx(tx *storage.Tx, ns redisNamespace, meta *redisZSetMeta) (*redisObjectBucket, error) {
+	return openRedisObjectBucketTx(tx, ns.zsetScoreBucket, redisZSetScoreBucketName(ns, meta.ID), meta.ID, meta.StorageFormat, true)
 }
 
 func deleteRedisZSetTx(tx *storage.Tx, ns redisNamespace, key []byte, meta *redisZSetMeta) error {
-	if err := tx.DeleteBucket(redisZSetMemberBucketName(ns, meta.ID)); err != nil && !errors.Is(err, storage.ErrBucketNotFound) {
+	memberStore, err := openRedisObjectBucketTx(tx, ns.zsetMemberBucket, redisZSetMemberBucketName(ns, meta.ID), meta.ID, meta.StorageFormat, false)
+	if err != nil && !errors.Is(err, storage.ErrBucketNotFound) {
 		return err
 	}
-	if err := tx.DeleteBucket(redisZSetScoreBucketName(ns, meta.ID)); err != nil && !errors.Is(err, storage.ErrBucketNotFound) {
+	if err == nil {
+		if err = deleteRedisObjectBucketTx(tx, memberStore, redisZSetMemberBucketName(ns, meta.ID)); err != nil {
+			return err
+		}
+	}
+	scoreStore, err := openRedisObjectBucketTx(tx, ns.zsetScoreBucket, redisZSetScoreBucketName(ns, meta.ID), meta.ID, meta.StorageFormat, false)
+	if err != nil && !errors.Is(err, storage.ErrBucketNotFound) {
 		return err
+	}
+	if err == nil {
+		if err = deleteRedisObjectBucketTx(tx, scoreStore, redisZSetScoreBucketName(ns, meta.ID)); err != nil {
+			return err
+		}
 	}
 	if err := deleteRedisZSetMetaTx(tx, ns, key); err != nil {
 		return err
@@ -391,7 +415,7 @@ func initRedisZSetMetaTx(tx *storage.Tx, ns redisNamespace, key []byte, nowMs in
 	if err != nil {
 		return nil, err
 	}
-	meta := &redisZSetMeta{ID: id}
+	meta := &redisZSetMeta{ID: id, StorageFormat: redisKeyStorageShared}
 	if _, err = ensureRedisZSetMemberBucketTx(tx, ns, meta); err != nil {
 		return nil, err
 	}
@@ -401,16 +425,16 @@ func initRedisZSetMetaTx(tx *storage.Tx, ns redisNamespace, key []byte, nowMs in
 	return meta, nil
 }
 
-func getRedisZSetBucketsTx(tx *storage.Tx, ns redisNamespace, key []byte, nowMs int64) (*storage.Bucket, *storage.Bucket, *redisZSetMeta, bool, error) {
+func getRedisZSetBucketsTx(tx *storage.Tx, ns redisNamespace, key []byte, nowMs int64) (*redisObjectBucket, *redisObjectBucket, *redisZSetMeta, bool, error) {
 	meta, found, err := loadRedisZSetMetaForReadTx(tx, ns, key, nowMs)
 	if err != nil || !found {
 		return nil, nil, meta, found, err
 	}
-	memberBucket, err := tx.GetBucket(redisZSetMemberBucketName(ns, meta.ID))
+	memberBucket, err := openRedisObjectBucketTx(tx, ns.zsetMemberBucket, redisZSetMemberBucketName(ns, meta.ID), meta.ID, meta.StorageFormat, false)
 	if err != nil {
 		return nil, nil, nil, false, err
 	}
-	scoreBucket, err := tx.GetBucket(redisZSetScoreBucketName(ns, meta.ID))
+	scoreBucket, err := openRedisObjectBucketTx(tx, ns.zsetScoreBucket, redisZSetScoreBucketName(ns, meta.ID), meta.ID, meta.StorageFormat, false)
 	if err != nil {
 		return nil, nil, nil, false, err
 	}
@@ -442,15 +466,17 @@ func redisZSetAddTx(tx *storage.Tx, ns redisNamespace, key []byte, pairs []redis
 	}
 
 	var added int64
+	changed := false
 	for _, pair := range pairs {
 		encodedScore := encodeRedisZSetSortableScore(pair.score)
 		oldEncoded, exists := memberBucket.Get(pair.member)
 		if exists {
-			if !bytes.Equal(oldEncoded, encodedScore) {
-				err = scoreBucket.Remove(redisZSetScoreIndexKeyFromEncoded(oldEncoded, pair.member))
-				if err != nil && !errors.Is(err, storage.ErrNodeNotFound) {
-					return 0, err
-				}
+			if bytes.Equal(oldEncoded, encodedScore) {
+				continue
+			}
+			err = scoreBucket.Remove(redisZSetScoreIndexKeyFromEncoded(oldEncoded, pair.member))
+			if err != nil && !errors.Is(err, storage.ErrNodeNotFound) {
+				return 0, err
 			}
 		} else {
 			added++
@@ -463,8 +489,12 @@ func redisZSetAddTx(tx *storage.Tx, ns redisNamespace, key []byte, pairs []redis
 		if err = scoreBucket.Put(redisZSetScoreIndexKeyFromEncoded(encodedScore, pair.member), []byte{}); err != nil {
 			return 0, err
 		}
+		changed = true
 	}
 
+	if !changed {
+		return added, nil
+	}
 	if err = saveRedisZSetMetaTx(tx, ns, key, meta); err != nil {
 		return 0, err
 	}
@@ -534,7 +564,7 @@ func redisZSetRemTx(tx *storage.Tx, ns redisNamespace, key []byte, members [][]b
 	return deleted, nil
 }
 
-func redisZSetForwardStart(cursor *storage.Cursor, min redisZSetScoreBound) ([]byte, []byte) {
+func redisZSetForwardStart(cursor *redisObjectCursor, min redisZSetScoreBound) ([]byte, []byte) {
 	if math.IsInf(min.score, -1) && !min.exclusive {
 		return cursor.First()
 	}
@@ -547,7 +577,7 @@ func redisZSetForwardStart(cursor *storage.Cursor, min redisZSetScoreBound) ([]b
 	return cursor.Seek(seekKey)
 }
 
-func redisZSetReverseStart(cursor *storage.Cursor, max redisZSetScoreBound) ([]byte, []byte) {
+func redisZSetReverseStart(cursor *redisObjectCursor, max redisZSetScoreBound) ([]byte, []byte) {
 	if math.IsInf(max.score, 1) && !max.exclusive {
 		return cursor.Last()
 	}

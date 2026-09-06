@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -336,11 +337,28 @@ func (srv *Server) startDBTransferJob(kind string, req *dbTransferRequest, run f
 	}
 	srv.jobs[job.ID] = job
 
-	go srv.runDBTransferJob(job, run)
+	if err := srv.startBackgroundJob(func(ctx context.Context) {
+		srv.runDBTransferJob(ctx, job, run)
+	}); err != nil {
+		delete(srv.jobs, job.ID)
+		if kind == dbTransferKindImport {
+			srv.importBusy = false
+		}
+		return nil, err
+	}
 	return job, nil
 }
 
-func (srv *Server) runDBTransferJob(job *dbTransferJob, run func() (dbTransferJobStats, error)) {
+func (srv *Server) runDBTransferJob(ctx context.Context, job *dbTransferJob, run func() (dbTransferJobStats, error)) {
+	if contextCancelled(ctx) {
+		finishedAt := time.Now()
+		job.mu.Lock()
+		job.Status = dbTransferStatusFailed
+		job.Error = errServerStopping.Error()
+		job.FinishedAt = &finishedAt
+		job.mu.Unlock()
+		return
+	}
 	startedAt := time.Now()
 	job.mu.Lock()
 	job.Status = dbTransferStatusRunning
@@ -364,6 +382,9 @@ func (srv *Server) runDBTransferJob(job *dbTransferJob, run func() (dbTransferJo
 	}()
 
 	stats, err := run()
+	if err == nil && contextCancelled(ctx) {
+		err = errServerStopping
+	}
 	finishedAt := time.Now()
 
 	job.mu.Lock()

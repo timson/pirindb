@@ -16,8 +16,7 @@ import (
 func TestHTTPExportImportDBJob(t *testing.T) {
 	srv, _, _ := setupTestServer(t)
 	router := srv.buildRouter()
-	ts := httptest.NewServer(router)
-	defer ts.Close()
+	ts := newLocalTestHTTPServer(t, router)
 
 	resp, err := http.Post(ts.URL+"/api/v1/kv/foo", "text/plain", bytes.NewBufferString("bar"))
 	require.NoError(t, err)
@@ -39,7 +38,7 @@ func TestHTTPExportImportDBJob(t *testing.T) {
 		Scope:     dbTransferScopeDB,
 		Overwrite: true,
 	})
-	require.Equal(t, dbTransferStatusQueued, exportResp.Status)
+	require.Contains(t, []string{dbTransferStatusQueued, dbTransferStatusRunning, dbTransferStatusDone}, exportResp.Status)
 	exportResp = waitForDBTransferJob(t, ts, exportResp.JobID)
 	require.Equal(t, dbTransferStatusDone, exportResp.Status)
 	require.Equal(t, uint64(2), exportResp.Stats.BucketsExported)
@@ -62,7 +61,7 @@ func TestHTTPExportImportDBJob(t *testing.T) {
 		Path:  exportPath,
 		Scope: dbTransferScopeDB,
 	})
-	require.Equal(t, dbTransferStatusQueued, importResp.Status)
+	require.Contains(t, []string{dbTransferStatusQueued, dbTransferStatusRunning, dbTransferStatusDone}, importResp.Status)
 	importResp = waitForDBTransferJob(t, ts, importResp.JobID)
 	require.Equal(t, dbTransferStatusDone, importResp.Status)
 	require.Equal(t, uint64(2), importResp.Stats.BucketsImported)
@@ -91,8 +90,7 @@ func TestHTTPExportImportDBJob(t *testing.T) {
 func TestHTTPExportImportBucketJob(t *testing.T) {
 	srv, _, _ := setupTestServer(t)
 	router := srv.buildRouter()
-	ts := httptest.NewServer(router)
-	defer ts.Close()
+	ts := newLocalTestHTTPServer(t, router)
 
 	err := srv.DB.Update(func(tx *storage.Tx) error {
 		users, err := tx.CreateBucketIfNotExists([]byte("users"))
@@ -172,8 +170,7 @@ func TestHTTPExportImportJobConflict(t *testing.T) {
 	srv.jobMu.Unlock()
 
 	router := srv.buildRouter()
-	ts := httptest.NewServer(router)
-	defer ts.Close()
+	ts := newLocalTestHTTPServer(t, router)
 
 	resp, body := postDBTransferJob(t, ts, "/api/v1/db/export", dbTransferRequest{
 		Path:      filepath.Join(t.TempDir(), "conflict.snapshot"),

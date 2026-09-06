@@ -44,6 +44,7 @@ type redisBloomMeta struct {
 	Expansion       uint64
 	Flags           uint64
 	SubFilterCount  uint64
+	StorageFormat   byte
 }
 
 type redisBloomSubFilterMeta struct {
@@ -103,6 +104,7 @@ func deserializeRedisBloomMeta(buf []byte) (*redisBloomMeta, error) {
 		Expansion:       binary.BigEndian.Uint64(buf[24:32]),
 		Flags:           binary.BigEndian.Uint64(buf[32:40]),
 		SubFilterCount:  binary.BigEndian.Uint64(buf[40:48]),
+		StorageFormat:   redisKeyStorageLegacy,
 	}, nil
 }
 
@@ -315,6 +317,10 @@ func loadRedisBloomMetaTx(tx *storage.Tx, ns redisNamespace, key []byte) (*redis
 	if err != nil {
 		return nil, false, err
 	}
+	meta.StorageFormat, err = redisObjectStorageFormatTx(tx, ns, key, redisKeyTypeBloom, meta.ID)
+	if err != nil {
+		return nil, false, err
+	}
 	return meta, true, nil
 }
 
@@ -324,6 +330,9 @@ func saveRedisBloomMetaTx(tx *storage.Tx, ns redisNamespace, key []byte, meta *r
 		return err
 	}
 	if err = bucket.Put(key, meta.serialize()); err != nil {
+		return err
+	}
+	if err = saveRedisKeyMetaForTypeWithFormatTx(tx, ns, key, redisKeyTypeBloom, meta.ID, meta.StorageFormat); err != nil {
 		return err
 	}
 	return ensureRedisSlotIndexEntryTx(tx, ns, key)
@@ -342,6 +351,9 @@ func deleteRedisBloomMetaTx(tx *storage.Tx, ns redisNamespace, key []byte) error
 		return nil
 	}
 	if err != nil {
+		return err
+	}
+	if err = deleteRedisKeyMetaTx(tx, ns, key); err != nil {
 		return err
 	}
 	return deleteRedisSlotIndexEntryTx(tx, ns, key)
@@ -373,19 +385,19 @@ func nextRedisBloomIDTx(tx *storage.Tx, ns redisNamespace) (uint64, error) {
 	return id, nil
 }
 
-func ensureRedisBloomDataBucketTx(tx *storage.Tx, ns redisNamespace, meta *redisBloomMeta) (*storage.Bucket, error) {
-	return tx.CreateBucketIfNotExists(redisBloomDataBucketName(ns, meta.ID))
+func ensureRedisBloomDataBucketTx(tx *storage.Tx, ns redisNamespace, meta *redisBloomMeta) (*redisObjectBucket, error) {
+	return openRedisObjectBucketTx(tx, ns.bloomDataBucket, redisBloomDataBucketName(ns, meta.ID), meta.ID, meta.StorageFormat, true)
 }
 
-func getRedisBloomDataBucketTx(tx *storage.Tx, ns redisNamespace, meta *redisBloomMeta) (*storage.Bucket, error) {
-	return tx.GetBucket(redisBloomDataBucketName(ns, meta.ID))
+func getRedisBloomDataBucketTx(tx *storage.Tx, ns redisNamespace, meta *redisBloomMeta) (*redisObjectBucket, error) {
+	return openRedisObjectBucketTx(tx, ns.bloomDataBucket, redisBloomDataBucketName(ns, meta.ID), meta.ID, meta.StorageFormat, false)
 }
 
-func saveRedisBloomSubFilterMeta(bucket *storage.Bucket, index uint64, meta *redisBloomSubFilterMeta) error {
+func saveRedisBloomSubFilterMeta(bucket *redisObjectBucket, index uint64, meta *redisBloomSubFilterMeta) error {
 	return bucket.Put(redisBloomSubMetaKey(index), meta.serialize())
 }
 
-func loadRedisBloomSubFilterMeta(bucket *storage.Bucket, index uint64) (*redisBloomSubFilterMeta, bool, error) {
+func loadRedisBloomSubFilterMeta(bucket *redisObjectBucket, index uint64) (*redisBloomSubFilterMeta, bool, error) {
 	raw, found := bucket.Get(redisBloomSubMetaKey(index))
 	if !found {
 		return nil, false, nil
@@ -397,7 +409,7 @@ func loadRedisBloomSubFilterMeta(bucket *storage.Bucket, index uint64) (*redisBl
 	return meta, true, nil
 }
 
-func loadRedisBloomBlock(bucket *storage.Bucket, subFilterIndex uint64, blockIndex uint64) ([]byte, error) {
+func loadRedisBloomBlock(bucket *redisObjectBucket, subFilterIndex uint64, blockIndex uint64) ([]byte, error) {
 	raw, found := bucket.Get(redisBloomBlockKey(subFilterIndex, blockIndex))
 	if !found {
 		return make([]byte, redisBloomBlockSize), nil
@@ -408,7 +420,7 @@ func loadRedisBloomBlock(bucket *storage.Bucket, subFilterIndex uint64, blockInd
 	return cloneBytes(raw), nil
 }
 
-func saveRedisBloomBlock(bucket *storage.Bucket, subFilterIndex uint64, blockIndex uint64, block []byte) error {
+func saveRedisBloomBlock(bucket *redisObjectBucket, subFilterIndex uint64, blockIndex uint64, block []byte) error {
 	if len(block) != redisBloomBlockSize {
 		return errors.New("corrupted redis bloom block")
 	}
@@ -416,8 +428,14 @@ func saveRedisBloomBlock(bucket *storage.Bucket, subFilterIndex uint64, blockInd
 }
 
 func deleteRedisBloomTx(tx *storage.Tx, ns redisNamespace, key []byte, meta *redisBloomMeta) error {
-	if err := tx.DeleteBucket(redisBloomDataBucketName(ns, meta.ID)); err != nil && !errors.Is(err, storage.ErrBucketNotFound) {
+	store, err := getRedisBloomDataBucketTx(tx, ns, meta)
+	if err != nil && !errors.Is(err, storage.ErrBucketNotFound) {
 		return err
+	}
+	if err == nil {
+		if err = deleteRedisObjectBucketTx(tx, store, redisBloomDataBucketName(ns, meta.ID)); err != nil {
+			return err
+		}
 	}
 	if err := deleteRedisBloomMetaTx(tx, ns, key); err != nil {
 		return err
@@ -459,7 +477,7 @@ func loadRedisBloomMetaForReadTx(tx *storage.Tx, ns redisNamespace, key []byte, 
 	return nil, false, nil
 }
 
-func createRedisBloomTx(tx *storage.Tx, ns redisNamespace, key []byte, opts redisBloomReserveOptions, nowMs int64) (*redisBloomMeta, *storage.Bucket, error) {
+func createRedisBloomTx(tx *storage.Tx, ns redisNamespace, key []byte, opts redisBloomReserveOptions, nowMs int64) (*redisBloomMeta, *redisObjectBucket, error) {
 	keyType, err := redisKeyTypeTx(tx, ns, key, nowMs)
 	if err != nil {
 		return nil, nil, err
@@ -483,6 +501,7 @@ func createRedisBloomTx(tx *storage.Tx, ns redisNamespace, key []byte, opts redi
 		InitialCapacity: opts.capacity,
 		Expansion:       opts.expansion,
 		SubFilterCount:  1,
+		StorageFormat:   redisKeyStorageShared,
 	}
 	meta.SetErrorRate(opts.errorRate)
 	meta.SetNonScaling(opts.nonScaling)
@@ -507,7 +526,7 @@ func createRedisBloomTx(tx *storage.Tx, ns redisNamespace, key []byte, opts redi
 	return meta, dataBucket, nil
 }
 
-func getOrCreateRedisBloomTx(tx *storage.Tx, ns redisNamespace, key []byte, nowMs int64) (*redisBloomMeta, *storage.Bucket, error) {
+func getOrCreateRedisBloomTx(tx *storage.Tx, ns redisNamespace, key []byte, nowMs int64) (*redisBloomMeta, *redisObjectBucket, error) {
 	if _, err := purgeExpiredRedisKeyTx(tx, ns, key, nowMs); err != nil {
 		return nil, nil, err
 	}
@@ -537,7 +556,7 @@ func getOrCreateRedisBloomTx(tx *storage.Tx, ns redisNamespace, key []byte, nowM
 	}, nowMs)
 }
 
-func redisBloomEnsureWritableSubFilterTx(tx *storage.Tx, ns redisNamespace, key []byte, meta *redisBloomMeta, dataBucket *storage.Bucket) (uint64, *redisBloomSubFilterMeta, error) {
+func redisBloomEnsureWritableSubFilterTx(tx *storage.Tx, ns redisNamespace, key []byte, meta *redisBloomMeta, dataBucket *redisObjectBucket) (uint64, *redisBloomSubFilterMeta, error) {
 	if meta.SubFilterCount == 0 {
 		meta.SubFilterCount = 1
 		subMeta, err := redisBloomBuildSubFilterMeta(meta.InitialCapacity, redisBloomScaledErrorRate(meta.ErrorRate(), 0, meta.NonScaling()))
@@ -587,7 +606,7 @@ func redisBloomEnsureWritableSubFilterTx(tx *storage.Tx, ns redisNamespace, key 
 	return nextIndex, nextMeta, nil
 }
 
-func redisBloomMightContainInSubFilter(dataBucket *storage.Bucket, subFilterIndex uint64, meta *redisBloomSubFilterMeta, item []byte) (bool, error) {
+func redisBloomMightContainInSubFilter(dataBucket *redisObjectBucket, subFilterIndex uint64, meta *redisBloomSubFilterMeta, item []byte) (bool, error) {
 	positions := redisBloomHashPositions(item, meta.BitCount, meta.HashCount)
 	blockCache := make(map[uint64][]byte)
 
@@ -614,7 +633,7 @@ func redisBloomMightContainInSubFilter(dataBucket *storage.Bucket, subFilterInde
 	return true, nil
 }
 
-func redisBloomInsertIntoSubFilter(dataBucket *storage.Bucket, subFilterIndex uint64, meta *redisBloomSubFilterMeta, item []byte) (bool, error) {
+func redisBloomInsertIntoSubFilter(dataBucket *redisObjectBucket, subFilterIndex uint64, meta *redisBloomSubFilterMeta, item []byte) (bool, error) {
 	positions := redisBloomHashPositions(item, meta.BitCount, meta.HashCount)
 	blockCache := make(map[uint64][]byte)
 	modifiedBlocks := make(map[uint64]struct{})
@@ -653,7 +672,7 @@ func redisBloomInsertIntoSubFilter(dataBucket *storage.Bucket, subFilterIndex ui
 	return true, nil
 }
 
-func redisBloomContainsInFilter(dataBucket *storage.Bucket, meta *redisBloomMeta, item []byte) (bool, error) {
+func redisBloomContainsInFilter(dataBucket *redisObjectBucket, meta *redisBloomMeta, item []byte) (bool, error) {
 	for subFilterIndex := meta.SubFilterCount; subFilterIndex > 0; subFilterIndex-- {
 		subMeta, found, err := loadRedisBloomSubFilterMeta(dataBucket, subFilterIndex-1)
 		if err != nil {

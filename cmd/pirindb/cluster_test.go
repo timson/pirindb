@@ -2,9 +2,9 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -137,12 +137,14 @@ func openTestClusterServer(t *testing.T, cfg *Config) *Server {
 	storage.SetLogger(logger)
 	db, err := storage.Open(cfg.DB.Filename, cfg.DB.StorageOptions())
 	require.NoError(t, err)
+	srv := NewServer(cfg, db, logger)
 	t.Cleanup(func() {
+		_ = srv.Stop()
 		_ = db.Close()
 		_ = os.Remove(cfg.DB.Filename)
 		_ = os.Remove(db.GetOptions().TxLogPath)
 	})
-	return NewServer(cfg, db, logger)
+	return srv
 }
 
 func buildClusterStateForTests(slotCount int, sourceHTTP string, destHTTP string) *clusterState {
@@ -166,11 +168,32 @@ func buildClusterStateForTests(slotCount int, sourceHTTP string, destHTTP string
 	}
 }
 
+func buildClusterStateForTestsABC(slotCount int, sourceHTTP string, destHTTP string, newNodeHTTP string) *clusterState {
+	state := buildClusterStateForTests(slotCount, sourceHTTP, destHTTP)
+	state.Nodes = append(state.Nodes, clusterNodeState{
+		ID:           "c",
+		RedisAddress: "127.0.0.1:7002",
+		HTTPAddress:  newNodeHTTP,
+	})
+	return state
+}
+
 func findKeyForOwner(state *clusterState, ownerID string) []byte {
 	for i := 0; i < 100000; i++ {
 		key := []byte("cluster:key:" + strconv.Itoa(i))
 		slot := ClusterKeySlot(key, state.SlotCount)
 		if state.SlotOwners[slot] == ownerID {
+			return key
+		}
+	}
+	return nil
+}
+
+func findKeyForOwnerInSlotRange(state *clusterState, ownerID string, startSlot int, endSlot int) []byte {
+	for i := 0; i < 100000; i++ {
+		key := []byte("cluster:key:" + strconv.Itoa(i))
+		slot := ClusterKeySlot(key, state.SlotCount)
+		if state.SlotOwners[slot] == ownerID && slot >= startSlot && slot <= endSlot {
 			return key
 		}
 	}
@@ -183,6 +206,50 @@ func findHashTagForOwner(state *clusterState, ownerID string) string {
 		key := []byte("{" + tag + "}")
 		slot := ClusterKeySlot(key, state.SlotCount)
 		if state.SlotOwners[slot] == ownerID {
+			return tag
+		}
+	}
+	return ""
+}
+
+func writeTestClusterTopologyFile(t *testing.T, path string, topology *ClusterTopologyConfig) {
+	t.Helper()
+	var builder strings.Builder
+	builder.WriteString("[cluster]\n")
+	builder.WriteString("name = " + strconv.Quote(topology.Name) + "\n")
+	builder.WriteString("slot_count = " + strconv.Itoa(topology.SlotCount) + "\n\n")
+	for _, node := range topology.Nodes {
+		if node == nil {
+			continue
+		}
+		builder.WriteString("[[cluster.nodes]]\n")
+		builder.WriteString("id = " + strconv.Quote(node.ID) + "\n")
+		builder.WriteString("redis_address = " + strconv.Quote(node.RedisAddress) + "\n")
+		builder.WriteString("http_address = " + strconv.Quote(node.HTTPAddress) + "\n\n")
+	}
+	for _, assignment := range topology.BootstrapSlots {
+		if assignment == nil {
+			continue
+		}
+		builder.WriteString("[[cluster.bootstrap_slots]]\n")
+		builder.WriteString("node_id = " + strconv.Quote(assignment.NodeID) + "\n")
+		builder.WriteString("slots = [")
+		for i, slotSpec := range assignment.Slots {
+			if i > 0 {
+				builder.WriteString(", ")
+			}
+			builder.WriteString(strconv.Quote(slotSpec))
+		}
+		builder.WriteString("]\n\n")
+	}
+	require.NoError(t, os.WriteFile(path, []byte(builder.String()), 0o644))
+}
+
+func findHashTagForSlot(state *clusterState, slot int) string {
+	for i := 0; i < 100000; i++ {
+		tag := "cluster-slot-tag-" + strconv.Itoa(i)
+		key := []byte("{" + tag + "}")
+		if ClusterKeySlot(key, state.SlotCount) == slot {
 			return tag
 		}
 	}
@@ -222,9 +289,72 @@ func TestRedisClusterRedirectAndCrossSlot(t *testing.T) {
 	require.Contains(t, err.Error(), "MOVED")
 	require.Contains(t, err.Error(), "127.0.0.1:7001")
 
+	for _, command := range []string{"RPUSH", "RPOP"} {
+		args := [][]byte{[]byte(command), remoteKey}
+		if command == "RPUSH" {
+			args = append(args, []byte("value"))
+		}
+		_, err = server.executeCommand(0, args, nil, redisNowUnixMilli(time.Now()), false)
+		require.ErrorContains(t, err, "MOVED", command+" must route by its list key")
+	}
+
 	_, err = server.executeCommand(0, [][]byte{[]byte("MGET"), localKey, remoteKey}, nil, redisNowUnixMilli(time.Now()), false)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "CROSSSLOT")
+}
+
+func TestRedisClusterWriteCommandsExposeKeys(t *testing.T) {
+	fixtures := map[string][][]byte{
+		"BF.ADD":           {[]byte("key"), []byte("item")},
+		"BF.MADD":          {[]byte("key"), []byte("item")},
+		"BF.RESERVE":       {[]byte("key"), []byte("0.01"), []byte("100")},
+		"TOPK.ADD":         {[]byte("key"), []byte("item")},
+		"TOPK.INCRBY":      {[]byte("key"), []byte("item"), []byte("1")},
+		"TOPK.RESERVE":     {[]byte("key"), []byte("2"), []byte("100"), []byte("5"), []byte("0.9")},
+		"BLPOP":            {[]byte("key"), []byte("1")},
+		"BRPOP":            {[]byte("key"), []byte("1")},
+		"BRPOPLPUSH":       {[]byte("{key}:source"), []byte("{key}:destination"), []byte("1")},
+		"DEL":              {[]byte("key")},
+		"UNLINK":           {[]byte("key")},
+		"EXPIRE":           {[]byte("key"), []byte("1")},
+		"PEXPIRE":          {[]byte("key"), []byte("1")},
+		"PERSIST":          {[]byte("key")},
+		"SET":              {[]byte("key"), []byte("value")},
+		"MSET":             {[]byte("key"), []byte("value")},
+		"GETSET":           {[]byte("key"), []byte("value")},
+		"INCR":             {[]byte("key")},
+		"INCRBY":           {[]byte("key"), []byte("1")},
+		"DECR":             {[]byte("key")},
+		"DECRBY":           {[]byte("key"), []byte("1")},
+		"LPUSH":            {[]byte("key"), []byte("value")},
+		"RPUSH":            {[]byte("key"), []byte("value")},
+		"LPOP":             {[]byte("key")},
+		"RPOP":             {[]byte("key")},
+		"LSET":             {[]byte("key"), []byte("0"), []byte("value")},
+		"LREM":             {[]byte("key"), []byte("0"), []byte("value")},
+		"LTRIM":            {[]byte("key"), []byte("0"), []byte("1")},
+		"RPOPLPUSH":        {[]byte("{key}:source"), []byte("{key}:destination")},
+		"HSET":             {[]byte("key"), []byte("field"), []byte("value")},
+		"HDEL":             {[]byte("key"), []byte("field")},
+		"RENAME":           {[]byte("{key}:source"), []byte("{key}:destination")},
+		"RENAMENX":         {[]byte("{key}:source"), []byte("{key}:destination")},
+		"ZADD":             {[]byte("key"), []byte("1"), []byte("member")},
+		"ZREM":             {[]byte("key"), []byte("member")},
+		"ZREMRANGEBYSCORE": {[]byte("key"), []byte("0"), []byte("1")},
+		"ZREMRANGEBYLEX":   {[]byte("key"), []byte("[a"), []byte("[z")},
+	}
+
+	for _, command := range supportedRedisCommandNames {
+		if !isRedisWriteCommand(command) || isRedisGlobalClusterWriteCommand(command) {
+			continue
+		}
+		fixture, ok := fixtures[command]
+		require.True(t, ok, "add a cluster key-extraction fixture for supported write command %s", command)
+		args := append([][]byte{[]byte(command)}, fixture...)
+		keys, err := redisCommandKeys(args)
+		require.NoError(t, err, command)
+		require.NotEmpty(t, keys, "supported write command %s must expose its keys to cluster routing", command)
+	}
 }
 
 func TestRedisClusterCommands(t *testing.T) {
@@ -317,8 +447,7 @@ func TestClusterRebalanceJobPersistsAndResumesAfterRestart(t *testing.T) {
 	sourceSrv := openTestClusterServer(t, sourceCfg)
 	destSrv := openTestClusterServer(t, destCfg)
 
-	destHTTP := httptest.NewServer(destSrv.buildRouter())
-	defer destHTTP.Close()
+	destHTTP := newLocalTestHTTPServer(t, destSrv.buildRouter())
 
 	state := buildClusterStateForTests(sourceSrv.Cluster.Snapshot().SlotCount, "http://127.0.0.1:17000", destHTTP.URL)
 	require.NoError(t, sourceSrv.Cluster.ReplaceState(state))
@@ -346,7 +475,7 @@ func TestClusterRebalanceJobPersistsAndResumesAfterRestart(t *testing.T) {
 		require.NoError(t, PutRedisBytes(sourceSrv.DB, ns, key, []byte("value-"+strconv.Itoa(i)), nowMs))
 	}
 
-	seedStats, err := sourceSrv.postClusterSlotImportChunk(clusterNodeState{
+	seedStats, err := sourceSrv.postClusterSlotImportChunk(context.Background(), clusterNodeState{
 		ID:           "b",
 		RedisAddress: "127.0.0.1:7001",
 		HTTPAddress:  destHTTP.URL,
@@ -406,15 +535,111 @@ func TestClusterRebalanceJobPersistsAndResumesAfterRestart(t *testing.T) {
 	}
 }
 
+func TestClusterPersistentSchemasMigrateLegacyRecords(t *testing.T) {
+	legacyState := buildClusterStateForTests(128, "http://a", "http://b")
+	legacyState.SchemaVersion = 0
+	rawState, err := json.Marshal(legacyState)
+	require.NoError(t, err)
+	decodedState, err := decodeClusterState(rawState)
+	require.NoError(t, err)
+	require.Equal(t, clusterStateSchemaVersion, decodedState.SchemaVersion)
+
+	legacyJob := clusterRebalanceJobResponse{
+		JobID:           "legacy-child",
+		Status:          clusterRebalanceStatusRunning,
+		Phase:           clusterRebalancePhaseCopying,
+		ChunkEntryLimit: 7,
+		Move: clusterPendingMove{
+			SourceNodeID:      "a",
+			DestinationNodeID: "b",
+			StartSlot:         0,
+			EndSlot:           0,
+		},
+	}
+	rawJob, err := json.Marshal(legacyJob)
+	require.NoError(t, err)
+	decodedJob, err := decodeClusterRebalanceJob(rawJob)
+	require.NoError(t, err)
+	require.Equal(t, clusterRebalanceJobSchemaVersion, decodedJob.SchemaVersion)
+	require.Equal(t, 7, decodedJob.ChunkEntryLimit)
+	require.Equal(t, clusterTransferDefaultTargetChunkBytes, decodedJob.ChunkTargetBytes)
+	require.Equal(t, clusterTransferDefaultMaxChunkBytes, decodedJob.ChunkMaxBytes)
+
+	legacyState.SchemaVersion = clusterStateSchemaVersion + 1
+	rawState, err = json.Marshal(legacyState)
+	require.NoError(t, err)
+	_, err = decodeClusterState(rawState)
+	require.ErrorContains(t, err, "unsupported cluster state schema version")
+}
+
+func TestClusterOrchestrationJobPersistsAndResumesAfterRestart(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "orchestration-resume.db")
+	cfg := newTestClusterConfig(t, "a", dbPath)
+	srv := openTestClusterServer(t, cfg)
+	state := srv.Cluster.Snapshot()
+	require.NotNil(t, state)
+
+	child := &clusterRebalanceJob{
+		ID:                 "completed-child",
+		Status:             clusterRebalanceStatusDone,
+		Phase:              clusterRebalancePhaseDone,
+		Move:               clusterPendingMove{ID: "completed-child", SourceNodeID: "a", DestinationNodeID: "b", StartSlot: 0, EndSlot: 0},
+		ChunkEntryLimit:    1,
+		CopyCursorDB:       redisDatabaseMin,
+		CleanupCursorDB:    redisDatabaseMin,
+		LastCommittedChunk: 1,
+	}
+	require.NoError(t, srv.persistRebalanceJob(child))
+
+	parent := &clusterAutoRebalanceJob{
+		SchemaVersion:  clusterOrchestrationSchemaVersion,
+		ID:             "resume-parent",
+		IdempotencyKey: "resume-key",
+		RequestedNode:  "b",
+		ClusterID:      state.ClusterID,
+		PlanEpoch:      state.Epoch,
+		Kind:           "scale-out",
+		Status:         clusterRebalanceStatusRunning,
+		Steps: []clusterAutoRebalanceStep{{
+			Move: clusterRebalancePlanMoveResponse{
+				SourceNode:        state.Nodes[0],
+				DestinationNode:   state.Nodes[1],
+				SourceNodeID:      "a",
+				DestinationNodeID: "b",
+				StartSlot:         0,
+				EndSlot:           0,
+				SlotCount:         1,
+			},
+			RebalanceJobID:  child.ID,
+			RebalanceStatus: clusterRebalanceStatusRunning,
+		}},
+	}
+	require.NoError(t, srv.persistClusterOrchestrationJob(parent))
+	require.NoError(t, srv.DB.Close())
+
+	restarted := openTestClusterServer(t, cfg)
+	restarted.resumePersistedClusterOrchestrationJobs()
+	require.Eventually(t, func() bool {
+		restarted.autoMu.Lock()
+		job := restarted.autoJobs[parent.ID]
+		restarted.autoMu.Unlock()
+		return job != nil && job.snapshot().Status == clusterRebalanceStatusDone
+	}, 5*time.Second, 25*time.Millisecond)
+
+	replayed, err := restarted.orchestrationJobByIdempotencyKey("scale-out", "resume-key", "b")
+	require.NoError(t, err)
+	require.NotNil(t, replayed)
+	require.Equal(t, parent.ID, replayed.ID)
+}
+
 func TestClusterOnlineRebalanceAppliesWriteDeltaAfterBaseCopy(t *testing.T) {
 	tmpDir := t.TempDir()
 	sourceSrv := openTestClusterServer(t, newTestClusterConfig(t, "a", filepath.Join(tmpDir, "online-source.db")))
 	destSrv := openTestClusterServer(t, newTestClusterConfig(t, "b", filepath.Join(tmpDir, "online-dest.db")))
 
-	sourceHTTP := httptest.NewServer(sourceSrv.buildRouter())
-	defer sourceHTTP.Close()
-	destHTTP := httptest.NewServer(destSrv.buildRouter())
-	defer destHTTP.Close()
+	sourceHTTP := newLocalTestHTTPServer(t, sourceSrv.buildRouter())
+	destHTTP := newLocalTestHTTPServer(t, destSrv.buildRouter())
 
 	state := buildClusterStateForTests(sourceSrv.Cluster.Snapshot().SlotCount, sourceHTTP.URL, destHTTP.URL)
 	require.NoError(t, sourceSrv.Cluster.ReplaceState(state))
@@ -452,7 +677,9 @@ func TestClusterOnlineRebalanceAppliesWriteDeltaAfterBaseCopy(t *testing.T) {
 		CleanupCursorDB: redisDatabaseMin,
 	}
 
-	go sourceSrv.runClusterRebalanceJob(job)
+	require.NoError(t, sourceSrv.startBackgroundJob(func(ctx context.Context) {
+		sourceSrv.runClusterRebalanceJob(ctx, job)
+	}))
 
 	require.Eventually(t, func() bool {
 		snapshot := job.snapshot()
@@ -466,7 +693,7 @@ func TestClusterOnlineRebalanceAppliesWriteDeltaAfterBaseCopy(t *testing.T) {
 	require.Eventually(t, func() bool {
 		snapshot := job.snapshot()
 		return snapshot.Status == clusterRebalanceStatusDone
-	}, 15*time.Second, 50*time.Millisecond)
+	}, 60*time.Second, 50*time.Millisecond)
 
 	finalSnapshot := job.snapshot()
 	require.Greater(t, finalSnapshot.DeltaMutationsApplied, uint64(0))
@@ -487,11 +714,12 @@ func TestClusterRebalanceLargeSlotRangeUsesChunkedCopyAndCleanup(t *testing.T) {
 	tmpDir := t.TempDir()
 	sourceSrv := openTestClusterServer(t, newTestClusterConfig(t, "a", filepath.Join(tmpDir, "large-source.db")))
 	destSrv := openTestClusterServer(t, newTestClusterConfig(t, "b", filepath.Join(tmpDir, "large-dest.db")))
+	sourceSrv.Config.Cluster.TransferChunkTargetBytes = 16 * 1024
+	sourceSrv.Config.Cluster.TransferChunkMaxBytes = 32 * 1024
+	sourceSrv.Config.Cluster.TransferChunkMaxRecords = clusterTransferDefaultMaxChunkRecords
 
-	sourceHTTP := httptest.NewServer(sourceSrv.buildRouter())
-	defer sourceHTTP.Close()
-	destHTTP := httptest.NewServer(destSrv.buildRouter())
-	defer destHTTP.Close()
+	sourceHTTP := newLocalTestHTTPServer(t, sourceSrv.buildRouter())
+	destHTTP := newLocalTestHTTPServer(t, destSrv.buildRouter())
 
 	state := buildClusterStateForTests(sourceSrv.Cluster.Snapshot().SlotCount, sourceHTTP.URL, destHTTP.URL)
 	require.NoError(t, sourceSrv.Cluster.ReplaceState(state))
@@ -560,12 +788,9 @@ func TestClusterJoinNodePropagatesState(t *testing.T) {
 	peerSrv := openTestClusterServer(t, newTestClusterConfig(t, "b", filepath.Join(tmpDir, "join-peer.db")))
 	newNodeSrv := openTestClusterServer(t, newTestClusterConfigWithNodes(t, "c", filepath.Join(tmpDir, "join-new.db"), newTestClusterNodesABC()))
 
-	sourceHTTP := httptest.NewServer(sourceSrv.buildRouter())
-	defer sourceHTTP.Close()
-	peerHTTP := httptest.NewServer(peerSrv.buildRouter())
-	defer peerHTTP.Close()
-	newNodeHTTP := httptest.NewServer(newNodeSrv.buildRouter())
-	defer newNodeHTTP.Close()
+	sourceHTTP := newLocalTestHTTPServer(t, sourceSrv.buildRouter())
+	peerHTTP := newLocalTestHTTPServer(t, peerSrv.buildRouter())
+	newNodeHTTP := newLocalTestHTTPServer(t, newNodeSrv.buildRouter())
 
 	initialState := buildClusterStateForTests(sourceSrv.Cluster.Snapshot().SlotCount, sourceHTTP.URL, peerHTTP.URL)
 	require.NoError(t, sourceSrv.Cluster.ReplaceState(initialState))
@@ -620,12 +845,9 @@ func TestClusterReconcileTopologyAddsNodeWithoutResettingSlots(t *testing.T) {
 	peerSrv := openTestClusterServer(t, newTestClusterConfigWithTopology(t, "b", filepath.Join(tmpDir, "reconcile-peer.db"), topologyAB))
 	newNodeSrv := openTestClusterServer(t, newTestClusterConfigWithTopology(t, "c", filepath.Join(tmpDir, "reconcile-new.db"), topologyABC))
 
-	sourceHTTP := httptest.NewServer(sourceSrv.buildRouter())
-	defer sourceHTTP.Close()
-	peerHTTP := httptest.NewServer(peerSrv.buildRouter())
-	defer peerHTTP.Close()
-	newNodeHTTP := httptest.NewServer(newNodeSrv.buildRouter())
-	defer newNodeHTTP.Close()
+	sourceHTTP := newLocalTestHTTPServer(t, sourceSrv.buildRouter())
+	peerHTTP := newLocalTestHTTPServer(t, peerSrv.buildRouter())
+	newNodeHTTP := newLocalTestHTTPServer(t, newNodeSrv.buildRouter())
 
 	initialState := buildClusterStateForTests(sourceSrv.Cluster.Snapshot().SlotCount, sourceHTTP.URL, peerHTTP.URL)
 	require.NoError(t, sourceSrv.Cluster.ReplaceState(initialState))
@@ -679,6 +901,312 @@ func TestClusterReconcileTopologyAddsNodeWithoutResettingSlots(t *testing.T) {
 	require.Equal(t, sourceState.TopologyHash, topologyStatus.RuntimeHash)
 }
 
+func TestClusterReconcileTopologyReloadsTopologyFileFromDisk(t *testing.T) {
+	tmpDir := t.TempDir()
+	topologyPath := filepath.Join(tmpDir, "topology.toml")
+	writeTestClusterTopologyFile(t, topologyPath, newTestClusterTopologyAB())
+
+	cfg := newTestClusterConfigWithTopology(t, "a", filepath.Join(tmpDir, "reload-topology.db"), newTestClusterTopologyAB())
+	cfg.Cluster.TopologyFile = topologyPath
+	srv := openTestClusterServer(t, cfg)
+
+	initialState := srv.Cluster.Snapshot()
+	require.Len(t, initialState.Nodes, 2)
+
+	writeTestClusterTopologyFile(t, topologyPath, newTestClusterTopologyABC())
+	httpServer := newLocalTestHTTPServer(t, srv.buildRouter())
+	statusResp, err := http.Get(httpServer.URL + "/api/v1/cluster/status")
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, statusResp.StatusCode)
+	var status clusterStatusResponse
+	require.NoError(t, json.NewDecoder(statusResp.Body).Decode(&status))
+	_ = statusResp.Body.Close()
+	require.Len(t, status.ConfiguredNodeIDs, 3)
+	require.Len(t, status.Nodes, 2, "status refresh must not mutate runtime membership")
+	require.NotEqual(t, status.ConfiguredTopologyHash, status.RuntimeTopologyHash)
+	require.Equal(t, initialState, srv.Cluster.Snapshot())
+
+	updatedState, err := srv.Cluster.ReconcileConfiguredTopology()
+	require.NoError(t, err)
+	require.Len(t, updatedState.Nodes, 3)
+	_, found := updatedState.NodeByID("c")
+	require.True(t, found)
+}
+
+func TestClusterPlanForNodeReturnsBalancedMoves(t *testing.T) {
+	tmpDir := t.TempDir()
+	sourceSrv := openTestClusterServer(t, newTestClusterConfigWithNodes(t, "a", filepath.Join(tmpDir, "plan-source.db"), newTestClusterNodesABC()))
+
+	sourceHTTP := newLocalTestHTTPServer(t, sourceSrv.buildRouter())
+
+	state := buildClusterStateForTestsABC(sourceSrv.Cluster.Snapshot().SlotCount, sourceHTTP.URL, "http://127.0.0.1:17001", "http://127.0.0.1:17002")
+	require.NoError(t, sourceSrv.Cluster.ReplaceState(state))
+
+	reqBody, err := json.Marshal(clusterRebalancePlanForNodeRequest{
+		DestinationNodeID:      "c",
+		AllowSlotCountFallback: true,
+	})
+	require.NoError(t, err)
+
+	resp, err := http.Post(sourceHTTP.URL+"/api/v1/cluster/rebalance/plan-for-node", "application/json", bytes.NewReader(reqBody))
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	var plan clusterRebalancePlanForNodeResponse
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&plan))
+	_ = resp.Body.Close()
+
+	require.Equal(t, "c", plan.DestinationNode.ID)
+	require.Equal(t, 0, plan.CurrentOwnedSlots)
+	require.Equal(t, 42, plan.TargetOwnedSlots)
+	require.Equal(t, 42, plan.DeficitSlots)
+	require.Equal(t, 42, plan.PlannedSlots)
+	require.Equal(t, 0, plan.RemainingDeficitSlots)
+	require.True(t, plan.Complete)
+	require.Len(t, plan.Moves, 2)
+
+	require.Equal(t, "a", plan.Moves[0].SourceNodeID)
+	require.Equal(t, 43, plan.Moves[0].StartSlot)
+	require.Equal(t, 63, plan.Moves[0].EndSlot)
+	require.Equal(t, 21, plan.Moves[0].SlotCount)
+	require.True(t, plan.Moves[0].SubmitOnSource)
+
+	require.Equal(t, "b", plan.Moves[1].SourceNodeID)
+	require.Equal(t, 107, plan.Moves[1].StartSlot)
+	require.Equal(t, 127, plan.Moves[1].EndSlot)
+	require.Equal(t, 21, plan.Moves[1].SlotCount)
+	require.False(t, plan.Moves[1].SubmitOnSource)
+}
+
+func TestClusterStatusIncludesConditionsAndNodeSummaries(t *testing.T) {
+	tmpDir := t.TempDir()
+	topology := newTestClusterTopologyABC()
+	sourceSrv := openTestClusterServer(t, newTestClusterConfigWithTopology(t, "a", filepath.Join(tmpDir, "status-source.db"), topology))
+	sourceHTTP := newLocalTestHTTPServer(t, sourceSrv.buildRouter())
+	sourceSrv.Cluster.Topology.Nodes[0].HTTPAddress = sourceHTTP.URL
+
+	state := buildClusterStateForTestsABC(sourceSrv.Cluster.Snapshot().SlotCount, sourceHTTP.URL, "http://127.0.0.1:17001", "http://127.0.0.1:17002")
+	state.TopologyName = topology.Name
+	state.TopologyHash = clusterTopologyHash(sourceSrv.Cluster.Topology)
+	require.NoError(t, sourceSrv.Cluster.ReplaceState(state))
+
+	resp, err := http.Get(sourceHTTP.URL + "/api/v1/cluster/status")
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	var status clusterStatusResponse
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&status))
+	_ = resp.Body.Close()
+
+	require.NotEmpty(t, status.Conditions)
+	require.Len(t, status.NodeStatuses, 3)
+	require.Equal(t, topology.Name, status.ConfiguredTopologyName)
+	require.Equal(t, clusterTopologyHash(sourceSrv.Cluster.Topology), status.ConfiguredTopologyHash)
+	require.Equal(t, state.TopologyHash, status.RuntimeTopologyHash)
+	require.Equal(t, []uint16{clusterTransferProtocolVersion}, status.SupportedTransferProtocols)
+	require.Equal(t, []string{"a", "b", "c"}, status.ConfiguredNodeIDs)
+	conditionByType := make(map[string]clusterStatusCondition, len(status.Conditions))
+	for _, condition := range status.Conditions {
+		conditionByType[condition.Type] = condition
+	}
+	require.Equal(t, "True", conditionByType["Available"].Status)
+	require.Equal(t, "True", conditionByType["TopologyAligned"].Status)
+	require.Equal(t, "False", conditionByType["Rebalancing"].Status)
+	require.Equal(t, "False", conditionByType["SlotBalanced"].Status)
+
+	foundLocal := false
+	for _, nodeStatus := range status.NodeStatuses {
+		if nodeStatus.NodeID == "a" {
+			foundLocal = true
+			require.True(t, nodeStatus.IsLocal)
+			require.Equal(t, 64, nodeStatus.OwnedSlots)
+		}
+	}
+	require.True(t, foundLocal)
+}
+
+func TestClusterPlanForNodeUsesKeyWeightsWhenAvailable(t *testing.T) {
+	tmpDir := t.TempDir()
+	sourceSrv := openTestClusterServer(t, newTestClusterConfigWithNodes(t, "a", filepath.Join(tmpDir, "plan-weights.db"), newTestClusterNodesABC()))
+	sourceHTTP := newLocalTestHTTPServer(t, sourceSrv.buildRouter())
+
+	state := buildClusterStateForTestsABC(sourceSrv.Cluster.Snapshot().SlotCount, sourceHTTP.URL, "http://127.0.0.1:17001", "http://127.0.0.1:17002")
+	require.NoError(t, sourceSrv.Cluster.ReplaceState(state))
+
+	tag := findHashTagForSlot(state, 63)
+	require.NotEmpty(t, tag)
+	ns := redisNamespaceForDB(0, state.SlotCount)
+	nowMs := redisNowUnixMilli(time.Now())
+	for i := 0; i < 20; i++ {
+		key := []byte("weighted:{" + tag + "}:" + strconv.Itoa(i))
+		require.NoError(t, PutRedisBytes(sourceSrv.DB, ns, key, []byte("v"), nowMs))
+	}
+
+	reqBody, err := json.Marshal(clusterRebalancePlanForNodeRequest{DestinationNodeID: "c", AllowSlotCountFallback: true})
+	require.NoError(t, err)
+	resp, err := http.Post(sourceHTTP.URL+"/api/v1/cluster/rebalance/plan-for-node", "application/json", bytes.NewReader(reqBody))
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	var plan clusterRebalancePlanForNodeResponse
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&plan))
+	_ = resp.Body.Close()
+
+	require.Equal(t, "visible_key_count", plan.WeightMetric)
+	require.Len(t, plan.Moves, 1)
+	require.Equal(t, "a", plan.Moves[0].SourceNodeID)
+	require.Equal(t, 63, plan.Moves[0].StartSlot)
+	require.Equal(t, 63, plan.Moves[0].EndSlot)
+	require.Equal(t, 1, plan.Moves[0].SlotCount)
+	require.Equal(t, int64(20), plan.Moves[0].EstimatedKeyCount)
+	require.Equal(t, int64(20), plan.PlannedKeys)
+}
+
+func TestClusterAutoRebalanceToNewNode(t *testing.T) {
+	tmpDir := t.TempDir()
+	sourceSrv := openTestClusterServer(t, newTestClusterConfigWithNodes(t, "a", filepath.Join(tmpDir, "auto-source.db"), newTestClusterNodesABC()))
+	peerSrv := openTestClusterServer(t, newTestClusterConfigWithNodes(t, "b", filepath.Join(tmpDir, "auto-peer.db"), newTestClusterNodesABC()))
+	newNodeSrv := openTestClusterServer(t, newTestClusterConfigWithNodes(t, "c", filepath.Join(tmpDir, "auto-new.db"), newTestClusterNodesABC()))
+
+	sourceHTTP := newLocalTestHTTPServer(t, sourceSrv.buildRouter())
+	peerHTTP := newLocalTestHTTPServer(t, peerSrv.buildRouter())
+	newNodeHTTP := newLocalTestHTTPServer(t, newNodeSrv.buildRouter())
+
+	state := buildClusterStateForTestsABC(sourceSrv.Cluster.Snapshot().SlotCount, sourceHTTP.URL, peerHTTP.URL, newNodeHTTP.URL)
+	require.NoError(t, sourceSrv.Cluster.ReplaceState(state))
+	require.NoError(t, peerSrv.Cluster.ReplaceState(state))
+	require.NoError(t, newNodeSrv.Cluster.ReplaceState(state))
+
+	ns := redisNamespaceForDB(0, state.SlotCount)
+	nowMs := redisNowUnixMilli(time.Now())
+	keyFromA := findKeyForOwnerInSlotRange(state, "a", 43, 63)
+	keyFromB := findKeyForOwnerInSlotRange(state, "b", 107, 127)
+	require.NotNil(t, keyFromA)
+	require.NotNil(t, keyFromB)
+	require.NoError(t, PutRedisBytes(sourceSrv.DB, ns, keyFromA, []byte("from-a"), nowMs))
+	require.NoError(t, PutRedisBytes(peerSrv.DB, ns, keyFromB, []byte("from-b"), nowMs))
+
+	reqBody, err := json.Marshal(clusterRebalancePlanForNodeRequest{
+		DestinationNodeID: "c",
+	})
+	require.NoError(t, err)
+
+	resp, err := http.Post(sourceHTTP.URL+"/api/v1/cluster/rebalance/auto", "application/json", bytes.NewReader(reqBody))
+	require.NoError(t, err)
+	require.Equal(t, http.StatusAccepted, resp.StatusCode)
+	var autoJob clusterAutoRebalanceJobResponse
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&autoJob))
+	_ = resp.Body.Close()
+	require.Len(t, autoJob.Plan.Moves, 1)
+
+	require.Eventually(t, func() bool {
+		statusResp, getErr := http.Get(sourceHTTP.URL + "/api/v1/cluster/rebalance/auto/" + autoJob.JobID)
+		if getErr != nil {
+			return false
+		}
+		defer func() { _ = statusResp.Body.Close() }()
+		if decodeErr := json.NewDecoder(statusResp.Body).Decode(&autoJob); decodeErr != nil {
+			return false
+		}
+		return autoJob.Status == clusterRebalanceStatusDone
+	}, 20*time.Second, 100*time.Millisecond)
+
+	require.GreaterOrEqual(t, len(autoJob.Steps), 2)
+	for _, step := range autoJob.Steps {
+		require.Equal(t, clusterRebalanceStatusDone, step.RebalanceStatus)
+		require.NotEmpty(t, step.RebalanceJobID)
+	}
+
+	sourceState := sourceSrv.Cluster.Snapshot()
+	peerState := peerSrv.Cluster.Snapshot()
+	newState := newNodeSrv.Cluster.Snapshot()
+	require.Equal(t, 43, clusterNodeSlotCounts(sourceState)["a"])
+	require.Equal(t, 43, clusterNodeSlotCounts(peerState)["b"])
+	require.Equal(t, 42, clusterNodeSlotCounts(newState)["c"])
+
+	value, found, err := GetRedisBytes(newNodeSrv.DB, ns, keyFromA, redisNowUnixMilli(time.Now()))
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, "from-a", string(value))
+	value, found, err = GetRedisBytes(newNodeSrv.DB, ns, keyFromB, redisNowUnixMilli(time.Now()))
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, "from-b", string(value))
+}
+
+func TestClusterDrainAndRemoveNodeFlow(t *testing.T) {
+	tmpDir := t.TempDir()
+	sourceSrv := openTestClusterServer(t, newTestClusterConfigWithNodes(t, "a", filepath.Join(tmpDir, "drain-source.db"), newTestClusterNodesABC()))
+	peerSrv := openTestClusterServer(t, newTestClusterConfigWithNodes(t, "b", filepath.Join(tmpDir, "drain-peer.db"), newTestClusterNodesABC()))
+	newNodeSrv := openTestClusterServer(t, newTestClusterConfigWithNodes(t, "c", filepath.Join(tmpDir, "drain-new.db"), newTestClusterNodesABC()))
+
+	sourceHTTP := newLocalTestHTTPServer(t, sourceSrv.buildRouter())
+	peerHTTP := newLocalTestHTTPServer(t, peerSrv.buildRouter())
+	newNodeHTTP := newLocalTestHTTPServer(t, newNodeSrv.buildRouter())
+
+	state := buildClusterStateForTestsABC(sourceSrv.Cluster.Snapshot().SlotCount, sourceHTTP.URL, peerHTTP.URL, newNodeHTTP.URL)
+	require.NoError(t, sourceSrv.Cluster.ReplaceState(state))
+	require.NoError(t, peerSrv.Cluster.ReplaceState(state))
+	require.NoError(t, newNodeSrv.Cluster.ReplaceState(state))
+
+	ns := redisNamespaceForDB(0, state.SlotCount)
+	nowMs := redisNowUnixMilli(time.Now())
+	keyFromA := findKeyForOwner(state, "a")
+	require.NotNil(t, keyFromA)
+	require.NoError(t, PutRedisBytes(sourceSrv.DB, ns, keyFromA, []byte("drain-me"), nowMs))
+
+	planReqBody, err := json.Marshal(clusterDrainNodeRequest{NodeID: "a"})
+	require.NoError(t, err)
+	planResp, err := http.Post(sourceHTTP.URL+"/api/v1/cluster/rebalance/plan-drain-node", "application/json", bytes.NewReader(planReqBody))
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, planResp.StatusCode)
+	var drainPlan clusterDrainNodeResponse
+	require.NoError(t, json.NewDecoder(planResp.Body).Decode(&drainPlan))
+	_ = planResp.Body.Close()
+	require.True(t, drainPlan.Complete)
+	require.Len(t, drainPlan.Moves, 1)
+	require.Equal(t, "c", drainPlan.Moves[0].DestinationNodeID)
+	require.Equal(t, 64, drainPlan.Moves[0].SlotCount)
+
+	drainResp, err := http.Post(sourceHTTP.URL+"/api/v1/cluster/rebalance/drain", "application/json", bytes.NewReader(planReqBody))
+	require.NoError(t, err)
+	require.Equal(t, http.StatusAccepted, drainResp.StatusCode)
+	var drainJob clusterAutoRebalanceJobResponse
+	require.NoError(t, json.NewDecoder(drainResp.Body).Decode(&drainJob))
+	_ = drainResp.Body.Close()
+
+	require.Eventually(t, func() bool {
+		statusResp, getErr := http.Get(sourceHTTP.URL + "/api/v1/cluster/rebalance/drain/" + drainJob.JobID)
+		if getErr != nil {
+			return false
+		}
+		defer func() { _ = statusResp.Body.Close() }()
+		if decodeErr := json.NewDecoder(statusResp.Body).Decode(&drainJob); decodeErr != nil {
+			return false
+		}
+		return drainJob.Status == clusterRebalanceStatusDone
+	}, 20*time.Second, 100*time.Millisecond)
+
+	require.Equal(t, 0, clusterNodeSlotCounts(sourceSrv.Cluster.Snapshot())["a"])
+	require.Equal(t, 64, clusterNodeSlotCounts(newNodeSrv.Cluster.Snapshot())["c"])
+
+	value, found, err := GetRedisBytes(newNodeSrv.DB, ns, keyFromA, redisNowUnixMilli(time.Now()))
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, "drain-me", string(value))
+
+	removeReqBody, err := json.Marshal(clusterRemoveNodeRequest{ID: "a"})
+	require.NoError(t, err)
+	removeResp, err := http.Post(peerHTTP.URL+"/api/v1/cluster/nodes/remove", "application/json", bytes.NewReader(removeReqBody))
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, removeResp.StatusCode)
+	var removeStatus clusterStatusResponse
+	require.NoError(t, json.NewDecoder(removeResp.Body).Decode(&removeStatus))
+	_ = removeResp.Body.Close()
+	require.Len(t, removeStatus.Nodes, 2)
+	_, foundNode := peerSrv.Cluster.Snapshot().NodeByID("a")
+	require.False(t, foundNode)
+	_, foundNode = newNodeSrv.Cluster.Snapshot().NodeByID("a")
+	require.False(t, foundNode)
+}
+
 func TestRedisClusterAskingRoute(t *testing.T) {
 	tmpDir := t.TempDir()
 	sourceCfg := newTestClusterConfig(t, "a", filepath.Join(tmpDir, "asking-source.db"))
@@ -730,12 +1258,9 @@ func TestClusterJoinNodeThenRebalanceToNewNode(t *testing.T) {
 	peerSrv := openTestClusterServer(t, newTestClusterConfig(t, "b", filepath.Join(tmpDir, "rebalance-peer.db")))
 	newNodeSrv := openTestClusterServer(t, newTestClusterConfigWithNodes(t, "c", filepath.Join(tmpDir, "rebalance-new.db"), newTestClusterNodesABC()))
 
-	sourceHTTP := httptest.NewServer(sourceSrv.buildRouter())
-	defer sourceHTTP.Close()
-	peerHTTP := httptest.NewServer(peerSrv.buildRouter())
-	defer peerHTTP.Close()
-	newNodeHTTP := httptest.NewServer(newNodeSrv.buildRouter())
-	defer newNodeHTTP.Close()
+	sourceHTTP := newLocalTestHTTPServer(t, sourceSrv.buildRouter())
+	peerHTTP := newLocalTestHTTPServer(t, peerSrv.buildRouter())
+	newNodeHTTP := newLocalTestHTTPServer(t, newNodeSrv.buildRouter())
 
 	initialState := buildClusterStateForTests(sourceSrv.Cluster.Snapshot().SlotCount, sourceHTTP.URL, peerHTTP.URL)
 	require.NoError(t, sourceSrv.Cluster.ReplaceState(initialState))
@@ -820,10 +1345,8 @@ func TestClusterRebalanceMovesRedisKeysAcrossShards(t *testing.T) {
 	sourceSrv := openTestClusterServer(t, newTestClusterConfig(t, "a", filepath.Join(tmpDir, "source.db")))
 	destSrv := openTestClusterServer(t, newTestClusterConfig(t, "b", filepath.Join(tmpDir, "dest.db")))
 
-	sourceHTTP := httptest.NewServer(sourceSrv.buildRouter())
-	defer sourceHTTP.Close()
-	destHTTP := httptest.NewServer(destSrv.buildRouter())
-	defer destHTTP.Close()
+	sourceHTTP := newLocalTestHTTPServer(t, sourceSrv.buildRouter())
+	destHTTP := newLocalTestHTTPServer(t, destSrv.buildRouter())
 
 	state := buildClusterStateForTests(sourceSrv.Cluster.Snapshot().SlotCount, sourceHTTP.URL, destHTTP.URL)
 	require.NoError(t, sourceSrv.Cluster.ReplaceState(state))

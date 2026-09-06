@@ -1,8 +1,10 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sort"
 
 	"github.com/timson/pirindb/storage"
@@ -10,6 +12,7 @@ import (
 
 const (
 	clusterRebalanceJobsBucketNameConst = "__pirin_cluster_rebalance_jobs__"
+	clusterRebalanceJobSchemaVersion    = 1
 
 	clusterRebalanceStatusQueued  = "queued"
 	clusterRebalanceStatusRunning = "running"
@@ -27,16 +30,6 @@ func clusterRebalanceJobsBucketName() []byte {
 	return []byte(clusterRebalanceJobsBucketNameConst)
 }
 
-func (job *clusterRebalanceJob) clone() *clusterRebalanceJob {
-	if job == nil {
-		return nil
-	}
-	job.mu.Lock()
-	defer job.mu.Unlock()
-	cloned := *job
-	return &cloned
-}
-
 func (job *clusterRebalanceJob) active() bool {
 	if job == nil {
 		return false
@@ -47,7 +40,43 @@ func (job *clusterRebalanceJob) active() bool {
 }
 
 func encodeClusterRebalanceJob(job *clusterRebalanceJob) ([]byte, error) {
+	if err := normalizeClusterRebalanceJob(job); err != nil {
+		return nil, err
+	}
 	return json.Marshal(job.snapshot())
+}
+
+func normalizeClusterRebalanceJob(job *clusterRebalanceJob) error {
+	if job == nil {
+		return errors.New("rebalance job is required")
+	}
+	job.mu.Lock()
+	defer job.mu.Unlock()
+	if job.SchemaVersion == 0 {
+		job.SchemaVersion = clusterRebalanceJobSchemaVersion
+	}
+	if job.SchemaVersion != clusterRebalanceJobSchemaVersion {
+		return fmt.Errorf("unsupported rebalance job schema version %d", job.SchemaVersion)
+	}
+	if job.ChunkEntryLimit < 0 {
+		return errors.New("rebalance legacy chunk entry limit is invalid")
+	}
+	if job.ChunkTargetBytes <= 0 {
+		job.ChunkTargetBytes = clusterTransferDefaultTargetChunkBytes
+	}
+	if job.ChunkMaxBytes <= 0 {
+		job.ChunkMaxBytes = clusterTransferDefaultMaxChunkBytes
+	}
+	if job.ChunkMaxBytes < job.ChunkTargetBytes || job.ChunkMaxBytes > clusterTransferMaxConfiguredChunkBytes {
+		return errors.New("rebalance chunk byte limits are invalid")
+	}
+	if job.ChunkMaxRecords <= 0 {
+		job.ChunkMaxRecords = clusterTransferDefaultMaxChunkRecords
+	}
+	if job.ChunkMaxRecords > clusterTransferMaxConfiguredRecords {
+		return errors.New("rebalance chunk record limit is invalid")
+	}
+	return nil
 }
 
 func decodeClusterRebalanceJob(raw []byte) (*clusterRebalanceJob, error) {
@@ -56,26 +85,36 @@ func decodeClusterRebalanceJob(raw []byte) (*clusterRebalanceJob, error) {
 		return nil, err
 	}
 	job := &clusterRebalanceJob{
-		ID:                    snapshot.JobID,
-		Status:                snapshot.Status,
-		Phase:                 snapshot.Phase,
-		Error:                 snapshot.Error,
-		Move:                  snapshot.Move,
-		ChunkEntryLimit:       snapshot.ChunkEntryLimit,
-		SnapshotWatermark:     snapshot.SnapshotWatermark,
-		LastSentChunk:         snapshot.LastSentChunk,
-		LastCommittedChunk:    snapshot.LastCommittedChunk,
-		LastDeltaAppliedSeq:   snapshot.LastDeltaAppliedSeq,
-		DeltaMutationsApplied: snapshot.DeltaMutationsApplied,
-		KeysTransferred:       snapshot.KeysTransferred,
-		BytesTransferred:      snapshot.BytesTransferred,
-		CopyCursorDB:          snapshot.CopyCursorDB,
-		CopyCursorKey:         cloneBytes(snapshot.CopyCursorKey),
-		CleanupCursorDB:       snapshot.CleanupCursorDB,
-		CleanupCursorKey:      cloneBytes(snapshot.CleanupCursorKey),
-		CleanupDeletedKeys:    snapshot.CleanupDeletedKeys,
-		StartedAt:             snapshot.StartedAt,
-		FinishedAt:            snapshot.FinishedAt,
+		SchemaVersion:             snapshot.SchemaVersion,
+		ID:                        snapshot.JobID,
+		Status:                    snapshot.Status,
+		Phase:                     snapshot.Phase,
+		Error:                     snapshot.Error,
+		Move:                      snapshot.Move,
+		ChunkEntryLimit:           snapshot.ChunkEntryLimit,
+		ChunkTargetBytes:          snapshot.ChunkTargetBytes,
+		ChunkMaxBytes:             snapshot.ChunkMaxBytes,
+		ChunkMaxRecords:           snapshot.ChunkMaxRecords,
+		SnapshotWatermark:         snapshot.SnapshotWatermark,
+		EstimateInitialized:       snapshot.EstimateInitialized,
+		EstimatedTotalKeys:        snapshot.EstimatedTotalKeys,
+		LastSentChunk:             snapshot.LastSentChunk,
+		LastCommittedChunk:        snapshot.LastCommittedChunk,
+		LastDeltaAppliedSeq:       snapshot.LastDeltaAppliedSeq,
+		DeltaMutationsApplied:     snapshot.DeltaMutationsApplied,
+		KeysTransferred:           snapshot.KeysTransferred,
+		BytesTransferred:          snapshot.BytesTransferred,
+		RecordsTransferred:        snapshot.RecordsTransferred,
+		OversizedLogicalKeyChunks: snapshot.OversizedLogicalKeyChunks,
+		RetryCount:                snapshot.RetryCount,
+		LastRetryReason:           snapshot.LastRetryReason,
+		CopyCursorDB:              snapshot.CopyCursorDB,
+		CopyCursorKey:             cloneBytes(snapshot.CopyCursorKey),
+		CleanupCursorDB:           snapshot.CleanupCursorDB,
+		CleanupCursorKey:          cloneBytes(snapshot.CleanupCursorKey),
+		CleanupDeletedKeys:        snapshot.CleanupDeletedKeys,
+		StartedAt:                 snapshot.StartedAt,
+		FinishedAt:                snapshot.FinishedAt,
 	}
 	if job.ID == "" {
 		return nil, errors.New("rebalance job id is required")
@@ -86,8 +125,8 @@ func decodeClusterRebalanceJob(raw []byte) (*clusterRebalanceJob, error) {
 	if job.Phase == "" {
 		job.Phase = clusterRebalancePhaseCopying
 	}
-	if job.ChunkEntryLimit <= 0 {
-		job.ChunkEntryLimit = clusterImportBatchEntryLimit
+	if err := normalizeClusterRebalanceJob(job); err != nil {
+		return nil, err
 	}
 	if job.CopyCursorDB == 0 {
 		job.CopyCursorDB = redisDatabaseMin
@@ -162,6 +201,11 @@ func (srv *Server) resumePersistedRebalanceJobs() {
 		return jobs[i].ID < jobs[j].ID
 	})
 	for _, job := range jobs {
-		go srv.runClusterRebalanceJob(job)
+		job := job
+		if err := srv.startBackgroundJob(func(ctx context.Context) {
+			srv.runClusterRebalanceJob(ctx, job)
+		}); err != nil && srv.Logger != nil {
+			srv.Logger.Error("failed to resume rebalance job", "job_id", job.ID, "error", err)
+		}
 	}
 }

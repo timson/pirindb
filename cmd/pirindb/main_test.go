@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"github.com/stretchr/testify/require"
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
@@ -40,11 +39,13 @@ func setupTestServer(t *testing.T) (*Server, string, string) {
 	if err != nil {
 		t.Fatalf("failed to open DB: %v", err)
 	}
+	srv := NewServer(cfg, db, logger)
 	t.Cleanup(func() {
+		_ = srv.Stop()
 		_ = db.Close()
 	})
 
-	return NewServer(cfg, db, logger), filename, db.GetOptions().TxLogPath
+	return srv, filename, db.GetOptions().TxLogPath
 }
 
 func TestCRUD(t *testing.T) {
@@ -55,8 +56,7 @@ func TestCRUD(t *testing.T) {
 	})
 
 	router := srv.buildRouter()
-	ts := httptest.NewServer(router)
-	defer ts.Close()
+	ts := newLocalTestHTTPServer(t, router)
 
 	key := "foo"
 	value := "bar"
@@ -107,8 +107,7 @@ func TestHealthCheck(t *testing.T) {
 	})
 
 	router := srv.buildRouter()
-	ts := httptest.NewServer(router)
-	defer ts.Close()
+	ts := newLocalTestHTTPServer(t, router)
 
 	resp, err := http.Get(ts.URL + "/health")
 	require.NoError(t, err)

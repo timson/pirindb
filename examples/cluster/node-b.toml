@@ -1,0 +1,21 @@
+[server]
+host = "127.0.0.1"
+port = 4322
+log_level = "INFO"
+
+[redis]
+enabled = true
+host = "127.0.0.1"
+port = 6380
+
+[db]
+filename = "cluster-demo-node-b.db"
+sync_policy = "strict"
+checkpoint_tx_threshold = 64
+group_commit_tx_threshold = 16
+group_commit_window_ms = 1
+
+[cluster]
+enabled = true
+node_id = "node-b"
+topology_file = "cluster-topology.toml"

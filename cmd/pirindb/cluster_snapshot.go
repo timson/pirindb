@@ -75,11 +75,15 @@ type clusterSnapshotTopK struct {
 }
 
 type clusterSlotTransferStats struct {
-	EntriesTransferred uint64 `json:"entries_transferred"`
-	BytesTransferred   uint64 `json:"bytes_transferred"`
-	EOF                bool   `json:"eof"`
-	NextCursorDB       int    `json:"-"`
-	NextCursorKey      []byte `json:"-"`
+	EntriesTransferred  uint64 `json:"entries_transferred"`
+	BytesTransferred    uint64 `json:"bytes_transferred"`
+	RecordsTransferred  uint64 `json:"records_transferred"`
+	OversizedLogicalKey bool   `json:"oversized_logical_key,omitempty"`
+	Retries             uint64 `json:"retries"`
+	LastRetryReason     string `json:"last_retry_reason,omitempty"`
+	EOF                 bool   `json:"eof"`
+	NextCursorDB        int    `json:"-"`
+	NextCursorKey       []byte `json:"-"`
 }
 
 type clusterSlotDeleteStats struct {
@@ -94,7 +98,7 @@ func streamClusterSlotRange(db *storage.DB, w io.Writer, slotCount int, startSlo
 	return err
 }
 
-func streamClusterSlotRangeChunk(db *storage.DB, w io.Writer, slotCount int, startSlot int, endSlot int, nowMs int64, cursorDB int, cursorKey []byte, limit int) (clusterSlotTransferStats, error) {
+func streamClusterSlotRangeChunkV1(db *storage.DB, w io.Writer, slotCount int, startSlot int, endSlot int, nowMs int64, cursorDB int, cursorKey []byte, limit int) (clusterSlotTransferStats, error) {
 	buffered := bufio.NewWriter(w)
 	header := clusterSlotStreamHeader{
 		Version:   clusterSlotStreamVersion,
@@ -198,7 +202,7 @@ func (r *countingReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-func importClusterSlotStream(db *storage.DB, r io.Reader, nowMs int64) (clusterSlotTransferStats, error) {
+func importClusterSlotStreamV1(db *storage.DB, r io.Reader, nowMs int64) (clusterSlotTransferStats, error) {
 	buffered := bufio.NewReader(r)
 	counter := &countingReader{r: buffered}
 	header, err := readClusterSlotStreamHeader(counter)
@@ -251,7 +255,7 @@ func importClusterSlotStream(db *storage.DB, r io.Reader, nowMs int64) (clusterS
 	}
 }
 
-func dumpBucketEntries(bucket *storage.Bucket) ([]clusterSnapshotBucketEntry, error) {
+func dumpBucketEntries(bucket *redisObjectBucket) ([]clusterSnapshotBucketEntry, error) {
 	entries := make([]clusterSnapshotBucketEntry, 0)
 	if err := bucket.ForEach(func(k, v []byte) error {
 		entries = append(entries, clusterSnapshotBucketEntry{
@@ -484,6 +488,7 @@ func importClusterSlotStreamEntryTx(tx *storage.Tx, r io.Reader, entry *clusterS
 			Expansion:       entry.Bloom.Expansion,
 			Flags:           entry.Bloom.Flags,
 			SubFilterCount:  entry.Bloom.SubFilterCount,
+			StorageFormat:   redisKeyStorageShared,
 		}
 		bucket, bucketErr := ensureRedisBloomDataBucketTx(tx, ns, meta)
 		if bucketErr != nil {
@@ -506,12 +511,13 @@ func importClusterSlotStreamEntryTx(tx *storage.Tx, r io.Reader, entry *clusterS
 			return idErr
 		}
 		meta := &redisTopKMeta{
-			ID:        id,
-			K:         entry.TopK.K,
-			Width:     entry.TopK.Width,
-			Depth:     entry.TopK.Depth,
-			HeapSize:  entry.TopK.HeapSize,
-			DecayBits: entry.TopK.DecayBits,
+			ID:            id,
+			K:             entry.TopK.K,
+			Width:         entry.TopK.Width,
+			Depth:         entry.TopK.Depth,
+			HeapSize:      entry.TopK.HeapSize,
+			DecayBits:     entry.TopK.DecayBits,
+			StorageFormat: redisKeyStorageShared,
 		}
 		bucket, bucketErr := ensureRedisTopKDataBucketTx(tx, ns, meta)
 		if bucketErr != nil {
@@ -641,6 +647,9 @@ func putRedisStringReaderTx(tx *storage.Tx, ns redisNamespace, key []byte, r io.
 		return err
 	}
 	if err = bucket.PutReader(key, r, valueLen); err != nil {
+		return err
+	}
+	if err = saveRedisKeyMetaForTypeTx(tx, ns, key, redisKeyTypeString, 0); err != nil {
 		return err
 	}
 	if err = ensureRedisSlotIndexEntryTx(tx, ns, key); err != nil {

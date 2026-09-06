@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"log/slog"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -18,6 +19,7 @@ import (
 const (
 	clusterStateBucketNameConst = "__pirin_cluster_meta__"
 	clusterStateKeyNameConst    = "state"
+	clusterStateSchemaVersion   = 1
 
 	clusterMoveStageCopying = "copying"
 	clusterMoveStageCatchup = "catchup"
@@ -40,16 +42,17 @@ type clusterPendingMove struct {
 }
 
 type clusterState struct {
-	ClusterID    string              `json:"cluster_id"`
-	Version      uint64              `json:"version"`
-	Epoch        uint64              `json:"epoch"`
-	TopologyName string              `json:"topology_name,omitempty"`
-	TopologyHash string              `json:"topology_hash,omitempty"`
-	SlotCount    int                 `json:"slot_count"`
-	Nodes        []clusterNodeState  `json:"nodes"`
-	SlotOwners   []string            `json:"slot_owners"`
-	Rebalancing  bool                `json:"rebalancing"`
-	PendingMove  *clusterPendingMove `json:"pending_move,omitempty"`
+	SchemaVersion int                 `json:"schema_version"`
+	ClusterID     string              `json:"cluster_id"`
+	Version       uint64              `json:"version"`
+	Epoch         uint64              `json:"epoch"`
+	TopologyName  string              `json:"topology_name,omitempty"`
+	TopologyHash  string              `json:"topology_hash,omitempty"`
+	SlotCount     int                 `json:"slot_count"`
+	Nodes         []clusterNodeState  `json:"nodes"`
+	SlotOwners    []string            `json:"slot_owners"`
+	Rebalancing   bool                `json:"rebalancing"`
+	PendingMove   *clusterPendingMove `json:"pending_move,omitempty"`
 }
 
 type clusterSlotRange struct {
@@ -65,13 +68,32 @@ type clusterRoute struct {
 }
 
 type ClusterManager struct {
-	DB          *storage.DB
-	Logger      *slog.Logger
-	LocalNodeID string
-	Topology    *ClusterTopologyConfig
+	DB              *storage.DB
+	Logger          *slog.Logger
+	LocalNodeID     string
+	Topology        *ClusterTopologyConfig
+	TopologyFile    string
+	TopologyManaged bool
 
 	mu    sync.RWMutex
 	state *clusterState
+}
+
+func validateClusterHTTPAddress(address string) error {
+	if strings.TrimSpace(address) == "" {
+		return errors.New("cluster HTTP address is required")
+	}
+	parsed, err := url.Parse(address)
+	if err != nil {
+		return fmt.Errorf("invalid cluster HTTP address: %w", err)
+	}
+	if parsed.Scheme != "http" || parsed.Host == "" {
+		return errors.New("cluster HTTP address must use http://")
+	}
+	if parsed.User != nil || (parsed.Path != "" && parsed.Path != "/") || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return errors.New("cluster HTTP address must contain only an http:// host and optional port")
+	}
+	return nil
 }
 
 func validateClusterConfig(cfg *Config) error {
@@ -107,6 +129,9 @@ func validateClusterConfig(cfg *Config) error {
 		if node.HTTPAddress == "" {
 			return fmt.Errorf("cluster node %q http_address is required", node.ID)
 		}
+		if err := validateClusterHTTPAddress(node.HTTPAddress); err != nil {
+			return fmt.Errorf("cluster node %q http_address: %w", node.ID, err)
+		}
 		if _, exists := seenNodeIDs[node.ID]; exists {
 			return fmt.Errorf("cluster node id %q is duplicated", node.ID)
 		}
@@ -130,10 +155,12 @@ func NewClusterManager(cfg *Config, db *storage.DB, logger *slog.Logger) (*Clust
 		return nil, nil
 	}
 	manager := &ClusterManager{
-		DB:          db,
-		Logger:      logger,
-		LocalNodeID: cfg.Cluster.NodeID,
-		Topology:    cloneClusterTopology(cfg.Cluster.Topology),
+		DB:              db,
+		Logger:          logger,
+		LocalNodeID:     cfg.Cluster.NodeID,
+		Topology:        cloneClusterTopology(cfg.Cluster.Topology),
+		TopologyFile:    strings.TrimSpace(cfg.Cluster.TopologyFile),
+		TopologyManaged: cfg.Cluster.Topology != nil || strings.TrimSpace(cfg.Cluster.TopologyFile) != "",
 	}
 	if err := manager.loadOrInitialize(cfg.Cluster); err != nil {
 		return nil, err
@@ -436,25 +463,42 @@ func buildClusterStateFromTopology(topology *ClusterTopologyConfig) (*clusterSta
 	}
 	clusterID := fmt.Sprintf("pirin-%08x", crc32.ChecksumIEEE(clusterIDInput))
 	return &clusterState{
-		ClusterID:    clusterID,
-		Version:      1,
-		Epoch:        1,
-		TopologyName: topology.Name,
-		TopologyHash: clusterTopologyHash(topology),
-		SlotCount:    topology.SlotCount,
-		Nodes:        nodes,
-		SlotOwners:   owners,
+		SchemaVersion: clusterStateSchemaVersion,
+		ClusterID:     clusterID,
+		Version:       1,
+		Epoch:         1,
+		TopologyName:  topology.Name,
+		TopologyHash:  clusterTopologyHash(topology),
+		SlotCount:     topology.SlotCount,
+		Nodes:         nodes,
+		SlotOwners:    owners,
 	}, nil
 }
 
 func encodeClusterState(state *clusterState) ([]byte, error) {
-	return json.Marshal(state)
+	if state == nil {
+		return nil, errors.New("missing cluster state")
+	}
+	normalized := state.Clone()
+	if normalized.SchemaVersion == 0 {
+		normalized.SchemaVersion = clusterStateSchemaVersion
+	}
+	if normalized.SchemaVersion != clusterStateSchemaVersion {
+		return nil, fmt.Errorf("unsupported cluster state schema version %d", normalized.SchemaVersion)
+	}
+	return json.Marshal(normalized)
 }
 
 func decodeClusterState(raw []byte) (*clusterState, error) {
 	var state clusterState
 	if err := json.Unmarshal(raw, &state); err != nil {
 		return nil, err
+	}
+	if state.SchemaVersion == 0 {
+		state.SchemaVersion = clusterStateSchemaVersion
+	}
+	if state.SchemaVersion != clusterStateSchemaVersion {
+		return nil, fmt.Errorf("unsupported cluster state schema version %d", state.SchemaVersion)
 	}
 	return &state, validateClusterState(state.Clone())
 }
@@ -544,6 +588,9 @@ func validateClusterState(state *clusterState) error {
 	if state == nil {
 		return errors.New("missing cluster state")
 	}
+	if state.SchemaVersion != 0 && state.SchemaVersion != clusterStateSchemaVersion {
+		return fmt.Errorf("unsupported cluster state schema version %d", state.SchemaVersion)
+	}
 	if state.ClusterID == "" {
 		return errors.New("cluster id is required")
 	}
@@ -560,6 +607,9 @@ func validateClusterState(state *clusterState) error {
 	for _, node := range state.Nodes {
 		if node.ID == "" || node.RedisAddress == "" || node.HTTPAddress == "" {
 			return errors.New("cluster nodes must include id, redis address, and http address")
+		}
+		if err := validateClusterHTTPAddress(node.HTTPAddress); err != nil {
+			return fmt.Errorf("cluster node %q http address: %w", node.ID, err)
 		}
 		nodeByID[node.ID] = node
 	}
@@ -685,15 +735,16 @@ func (state *clusterState) Clone() *clusterState {
 		return nil
 	}
 	cloned := &clusterState{
-		ClusterID:    state.ClusterID,
-		Version:      state.Version,
-		Epoch:        state.Epoch,
-		TopologyName: state.TopologyName,
-		TopologyHash: state.TopologyHash,
-		SlotCount:    state.SlotCount,
-		Nodes:        append([]clusterNodeState(nil), state.Nodes...),
-		SlotOwners:   append([]string(nil), state.SlotOwners...),
-		Rebalancing:  state.Rebalancing,
+		SchemaVersion: state.SchemaVersion,
+		ClusterID:     state.ClusterID,
+		Version:       state.Version,
+		Epoch:         state.Epoch,
+		TopologyName:  state.TopologyName,
+		TopologyHash:  state.TopologyHash,
+		SlotCount:     state.SlotCount,
+		Nodes:         append([]clusterNodeState(nil), state.Nodes...),
+		SlotOwners:    append([]string(nil), state.SlotOwners...),
+		Rebalancing:   state.Rebalancing,
 	}
 	if state.PendingMove != nil {
 		move := *state.PendingMove
@@ -703,6 +754,9 @@ func (state *clusterState) Clone() *clusterState {
 }
 
 func (manager *ClusterManager) persistState(state *clusterState) error {
+	if state != nil && state.SchemaVersion == 0 {
+		state.SchemaVersion = clusterStateSchemaVersion
+	}
 	if err := validateClusterState(state); err != nil {
 		return err
 	}
@@ -736,18 +790,45 @@ func (manager *ClusterManager) ConfiguredTopology() *ClusterTopologyConfig {
 	if manager == nil {
 		return nil
 	}
+	manager.mu.RLock()
+	defer manager.mu.RUnlock()
 	return cloneClusterTopology(manager.Topology)
+}
+
+func (manager *ClusterManager) RefreshConfiguredTopology() (*ClusterTopologyConfig, error) {
+	if manager == nil {
+		return nil, errors.New("cluster mode is disabled")
+	}
+	if strings.TrimSpace(manager.TopologyFile) == "" {
+		manager.mu.RLock()
+		defer manager.mu.RUnlock()
+		return cloneClusterTopology(manager.Topology), nil
+	}
+	topology, err := loadClusterTopologyFile(manager.TopologyFile)
+	if err != nil {
+		return nil, err
+	}
+	manager.mu.Lock()
+	manager.Topology = cloneClusterTopology(topology)
+	manager.mu.Unlock()
+	return cloneClusterTopology(topology), nil
 }
 
 func (manager *ClusterManager) ReconcileConfiguredTopology() (*clusterState, error) {
 	if manager == nil {
 		return nil, errors.New("cluster mode is disabled")
 	}
+	if _, err := manager.RefreshConfiguredTopology(); err != nil {
+		return nil, err
+	}
 	state := manager.Snapshot()
 	if state == nil {
 		return nil, errors.New("cluster state is unavailable")
 	}
-	reconciled, changed, err := reconcileMembershipFromTopology(state, manager.Topology)
+	manager.mu.RLock()
+	topology := cloneClusterTopology(manager.Topology)
+	manager.mu.RUnlock()
+	reconciled, changed, err := reconcileMembershipFromTopology(state, topology)
 	if err != nil {
 		return nil, err
 	}
@@ -766,6 +847,9 @@ func (manager *ClusterManager) AddNode(node clusterNodeState) (*clusterState, er
 	}
 	if node.ID == "" || node.RedisAddress == "" || node.HTTPAddress == "" {
 		return nil, errors.New("cluster node must include id, redis address, and http address")
+	}
+	if err := validateClusterHTTPAddress(node.HTTPAddress); err != nil {
+		return nil, err
 	}
 
 	state := manager.Snapshot()
@@ -789,6 +873,58 @@ func (manager *ClusterManager) AddNode(node clusterNodeState) (*clusterState, er
 	sort.Slice(state.Nodes, func(i, j int) bool {
 		return state.Nodes[i].ID < state.Nodes[j].ID
 	})
+	state.Version++
+	if state.Epoch == 0 {
+		state.Epoch = 1
+	}
+	state.Epoch++
+	if err := manager.persistState(state); err != nil {
+		return nil, err
+	}
+	return state, nil
+}
+
+func (manager *ClusterManager) RemoveNode(nodeID string) (*clusterState, error) {
+	if manager == nil {
+		return nil, errors.New("cluster mode is disabled")
+	}
+	nodeID = strings.TrimSpace(nodeID)
+	if nodeID == "" {
+		return nil, errors.New("cluster node id is required")
+	}
+	if nodeID == manager.LocalNodeID {
+		return nil, errors.New("cannot remove the local node from cluster membership")
+	}
+	state := manager.Snapshot()
+	if state == nil {
+		return nil, errors.New("cluster state is unavailable")
+	}
+	if _, ok := state.NodeByID(nodeID); !ok {
+		return nil, fmt.Errorf("cluster node %q does not exist", nodeID)
+	}
+	if containsString(state.SlotOwners, nodeID) {
+		return nil, fmt.Errorf("cannot remove node %q while it still owns slots", nodeID)
+	}
+	if state.PendingMove != nil && (state.PendingMove.SourceNodeID == nodeID || state.PendingMove.DestinationNodeID == nodeID) {
+		return nil, fmt.Errorf("cannot remove node %q while it participates in a pending move", nodeID)
+	}
+	if manager.TopologyManaged && manager.Topology != nil {
+		for _, node := range manager.Topology.Nodes {
+			if node != nil && node.ID == nodeID {
+				return nil, fmt.Errorf("cannot remove node %q while it still exists in configured topology", nodeID)
+			}
+		}
+	}
+	filtered := make([]clusterNodeState, 0, len(state.Nodes)-1)
+	for _, node := range state.Nodes {
+		if node.ID != nodeID {
+			filtered = append(filtered, node)
+		}
+	}
+	if len(filtered) == 0 {
+		return nil, errors.New("cannot remove the last cluster node")
+	}
+	state.Nodes = filtered
 	state.Version++
 	if state.Epoch == 0 {
 		state.Epoch = 1

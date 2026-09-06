@@ -9,11 +9,7 @@ import (
 )
 
 func BuildURL(settings *Settings, endpoint string) string {
-	protocol := "http"
-	if settings.UseHTTPS {
-		protocol = "https"
-	}
-	return fmt.Sprintf("%s://%s:%d%s", protocol, settings.Host, settings.Port, endpoint)
+	return fmt.Sprintf("http://%s:%d%s", settings.Host, settings.Port, endpoint)
 }
 
 func PrintJSONResponse(resp *http.Response) {

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -64,7 +65,7 @@ func redisCommandKeys(args [][]byte) ([][]byte, error) {
 	case "BF.ADD", "BF.EXISTS", "BF.MADD", "BF.MEXISTS", "BF.RESERVE",
 		"TOPK.ADD", "TOPK.COUNT", "TOPK.INFO", "TOPK.INCRBY", "TOPK.LIST", "TOPK.QUERY", "TOPK.RESERVE",
 		"DECR", "DECRBY", "EXPIRE", "GET", "GETSET", "HDEL", "HEXISTS", "HGET", "HGETALL", "HKEYS", "HLEN", "HSET", "HVALS",
-		"INCR", "INCRBY", "LINDEX", "LLEN", "LPOP", "LPUSH", "LRANGE", "LREM", "LSET", "LTRIM",
+		"INCR", "INCRBY", "LINDEX", "LLEN", "LPOP", "LPUSH", "LRANGE", "LREM", "LSET", "LTRIM", "RPOP", "RPUSH",
 		"PERSIST", "PEXPIRE", "PTTL", "SET", "TTL", "TYPE", "ZADD", "ZCARD", "ZREM", "ZRANGEBYSCORE", "ZREVRANGEBYSCORE",
 		"ZRANGEBYLEX", "ZREVRANGEBYLEX", "ZREMRANGEBYSCORE", "ZREMRANGEBYLEX", "ZSCORE":
 		return [][]byte{args[1]}, nil
@@ -215,12 +216,139 @@ func (srv *RedisServer) executeClusterCommand(args [][]byte) (redisReply, error)
 	switch strings.ToUpper(string(args[1])) {
 	case "KEYSLOT":
 		return redisIntegerReply{value: int64(ClusterKeySlot(args[2], state.SlotCount))}, nil
+	case "INFO":
+		return buildRedisClusterInfoReply(state)
+	case "NODES":
+		return buildRedisClusterNodesReply(state, srv.Cluster.LocalNodeID)
 	case "SLOTS":
-		return buildRedisClusterSlotsReply(srv.Cluster.SlotRanges())
+		return buildRedisClusterSlotsReply(clusterStateSlotRanges(state))
 	case "SHARDS":
-		return buildRedisClusterShardsReply(state.Nodes, srv.Cluster.SlotRanges())
+		return buildRedisClusterShardsReply(state.Nodes, clusterStateSlotRanges(state))
 	default:
 		return nil, fmt.Errorf("unsupported cluster subcommand '%s'", strings.ToLower(string(args[1])))
+	}
+}
+
+func buildRedisClusterInfoReply(state *clusterState) (redisReply, error) {
+	if state == nil {
+		return nil, errors.New("cluster state is unavailable")
+	}
+	if state.SlotCount <= 0 {
+		return nil, errors.New("cluster slot count must be greater than zero")
+	}
+
+	knownNodes := make(map[string]struct{}, len(state.Nodes))
+	for _, node := range state.Nodes {
+		knownNodes[node.ID] = struct{}{}
+	}
+
+	assignedSlots := 0
+	okSlots := 0
+	failedSlots := 0
+	slotServingNodes := make(map[string]struct{}, len(state.Nodes))
+	for slot := 0; slot < state.SlotCount; slot++ {
+		if slot >= len(state.SlotOwners) || state.SlotOwners[slot] == "" {
+			continue
+		}
+		assignedSlots++
+		ownerID := state.SlotOwners[slot]
+		if _, known := knownNodes[ownerID]; !known {
+			failedSlots++
+			continue
+		}
+		okSlots++
+		slotServingNodes[ownerID] = struct{}{}
+	}
+
+	clusterStateName := "ok"
+	if assignedSlots != state.SlotCount || failedSlots != 0 {
+		clusterStateName = "fail"
+	}
+
+	var builder strings.Builder
+	fmt.Fprintf(&builder, "cluster_state:%s\r\n", clusterStateName)
+	fmt.Fprintf(&builder, "cluster_slots_assigned:%d\r\n", assignedSlots)
+	fmt.Fprintf(&builder, "cluster_slots_ok:%d\r\n", okSlots)
+	builder.WriteString("cluster_slots_pfail:0\r\n")
+	fmt.Fprintf(&builder, "cluster_slots_fail:%d\r\n", failedSlots)
+	fmt.Fprintf(&builder, "cluster_known_nodes:%d\r\n", len(state.Nodes))
+	fmt.Fprintf(&builder, "cluster_size:%d\r\n", len(slotServingNodes))
+	fmt.Fprintf(&builder, "cluster_current_epoch:%d\r\n", state.Epoch)
+	fmt.Fprintf(&builder, "cluster_my_epoch:%d\r\n", state.Epoch)
+	builder.WriteString("cluster_stats_messages_sent:0\r\n")
+	builder.WriteString("cluster_stats_messages_received:0\r\n")
+	builder.WriteString("total_cluster_links_buffer_limit_exceeded:0\r\n")
+
+	return redisBulkReply{value: []byte(builder.String())}, nil
+}
+
+func buildRedisClusterNodesReply(state *clusterState, localNodeID string) (redisReply, error) {
+	if state == nil {
+		return nil, errors.New("cluster state is unavailable")
+	}
+
+	nodes := append([]clusterNodeState(nil), state.Nodes...)
+	sort.Slice(nodes, func(i, j int) bool {
+		return nodes[i].ID < nodes[j].ID
+	})
+
+	rangesByNode := make(map[string][]clusterSlotRange, len(nodes))
+	for _, slotRange := range clusterStateSlotRanges(state) {
+		rangesByNode[slotRange.Node.ID] = append(rangesByNode[slotRange.Node.ID], slotRange)
+	}
+
+	localNodeFound := false
+	var builder strings.Builder
+	for _, node := range nodes {
+		host, port, err := splitRedisAddress(node.RedisAddress)
+		if err != nil {
+			return nil, err
+		}
+		flags := "master"
+		if node.ID == localNodeID {
+			localNodeFound = true
+			flags = "myself,master"
+		}
+
+		// PirinDB has no separate Redis cluster bus, so its bus port is
+		// explicitly advertised as zero while retaining the standard field.
+		address := net.JoinHostPort(host, strconv.Itoa(port)) + "@0"
+		fmt.Fprintf(&builder, "%s %s %s - 0 0 %d connected", node.ID, address, flags, state.Epoch)
+		for _, slotRange := range rangesByNode[node.ID] {
+			builder.WriteByte(' ')
+			writeRedisClusterSlotRange(&builder, slotRange.StartSlot, slotRange.EndSlot)
+		}
+		writeRedisClusterMigrationSlots(&builder, state, node.ID, localNodeID)
+		builder.WriteByte('\n')
+	}
+	if !localNodeFound {
+		return nil, fmt.Errorf("local cluster node %q is not in cluster state", localNodeID)
+	}
+
+	return redisBulkReply{value: []byte(builder.String())}, nil
+}
+
+func writeRedisClusterSlotRange(builder *strings.Builder, startSlot int, endSlot int) {
+	if startSlot == endSlot {
+		fmt.Fprintf(builder, "%d", startSlot)
+		return
+	}
+	fmt.Fprintf(builder, "%d-%d", startSlot, endSlot)
+}
+
+func writeRedisClusterMigrationSlots(builder *strings.Builder, state *clusterState, nodeID string, localNodeID string) {
+	move := state.PendingMove
+	if move == nil || move.Stage != clusterMoveStageAsking || nodeID != localNodeID {
+		return
+	}
+
+	for slot := move.StartSlot; slot <= move.EndSlot; slot++ {
+		switch nodeID {
+		case move.SourceNodeID:
+			fmt.Fprintf(builder, " [%d->-%s]", slot, move.DestinationNodeID)
+		case move.DestinationNodeID:
+			fmt.Fprintf(builder, " [%d-<-%s]", slot, move.SourceNodeID)
+		}
 	}
 }
 

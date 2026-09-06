@@ -385,13 +385,13 @@ func TestBucketPutOverwriteReleasesOldBlobPages(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	before := len(db.dal.freelist.releasedPages)
+	before := db.dal.freelist.releasedPageN()
 	err = db.Update(func(tx *Tx) error {
 		bucket, _ := tx.GetBucket([]byte("foo"))
 		return bucket.Put([]byte("k"), big2)
 	})
 	require.NoError(t, err)
-	after := len(db.dal.freelist.releasedPages)
+	after := db.dal.freelist.releasedPageN()
 	require.Greater(t, after, before)
 
 	err = db.View(func(tx *Tx) error {
@@ -496,7 +496,7 @@ func TestBucketRemoveBlobReclaimsPages(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	before := len(db.dal.freelist.releasedPages)
+	before := db.dal.freelist.releasedPageN()
 	err = db.Update(func(tx *Tx) error {
 		bucket, err := tx.GetBucket([]byte("foo"))
 		require.NoError(t, err)
@@ -504,7 +504,7 @@ func TestBucketRemoveBlobReclaimsPages(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	after := len(db.dal.freelist.releasedPages)
+	after := db.dal.freelist.releasedPageN()
 	require.Greater(t, after, before)
 
 	err = db.View(func(tx *Tx) error {
@@ -517,4 +517,40 @@ func TestBucketRemoveBlobReclaimsPages(t *testing.T) {
 		return nil
 	})
 	require.NoError(t, err)
+}
+
+func TestMoveBucketRenamesCatalogEntryWithoutRewritingContents(t *testing.T) {
+	db, _ := CreateTestDB(t)
+	value := bytes.Repeat([]byte("m"), MaxValueSize+4096)
+	var sourceRoot uint64
+	require.NoError(t, db.Update(func(tx *Tx) error {
+		bucket, err := tx.CreateBucket([]byte("source"))
+		if err != nil {
+			return err
+		}
+		if err = bucket.Put([]byte("blob"), value); err != nil {
+			return err
+		}
+		sourceRoot = bucket.root
+		moved, err := tx.MoveBucket([]byte("source"), []byte("destination"))
+		if err != nil {
+			return err
+		}
+		require.Equal(t, sourceRoot, moved.root)
+		return nil
+	}))
+
+	require.NoError(t, db.View(func(tx *Tx) error {
+		_, err := tx.GetBucket([]byte("source"))
+		require.ErrorIs(t, err, ErrBucketNotFound)
+		bucket, err := tx.GetBucket([]byte("destination"))
+		if err != nil {
+			return err
+		}
+		require.Equal(t, sourceRoot, bucket.root)
+		actual, found := bucket.Get([]byte("blob"))
+		require.True(t, found)
+		require.Equal(t, value, actual)
+		return nil
+	}))
 }

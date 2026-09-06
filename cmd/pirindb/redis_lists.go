@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"math"
 
 	"github.com/timson/pirindb/storage"
 )
@@ -23,10 +24,11 @@ const (
 )
 
 type redisListMeta struct {
-	ID        uint64
-	Length    uint64
-	HeadSegID uint64
-	TailSegID uint64
+	ID            uint64
+	Length        uint64
+	HeadSegID     uint64
+	TailSegID     uint64
+	StorageFormat byte
 }
 
 type redisListSegment struct {
@@ -54,10 +56,11 @@ func deserializeRedisListMeta(buf []byte) (*redisListMeta, error) {
 		return nil, errors.New("corrupted redis list metadata")
 	}
 	return &redisListMeta{
-		ID:        binary.BigEndian.Uint64(buf[0:8]),
-		Length:    binary.BigEndian.Uint64(buf[8:16]),
-		HeadSegID: binary.BigEndian.Uint64(buf[16:24]),
-		TailSegID: binary.BigEndian.Uint64(buf[24:32]),
+		ID:            binary.BigEndian.Uint64(buf[0:8]),
+		Length:        binary.BigEndian.Uint64(buf[8:16]),
+		HeadSegID:     binary.BigEndian.Uint64(buf[16:24]),
+		TailSegID:     binary.BigEndian.Uint64(buf[24:32]),
+		StorageFormat: redisKeyStorageLegacy,
 	}, nil
 }
 
@@ -198,6 +201,10 @@ func loadRedisListMetaTx(tx *storage.Tx, ns redisNamespace, key []byte) (*redisL
 	if err != nil {
 		return nil, false, err
 	}
+	meta.StorageFormat, err = redisObjectStorageFormatTx(tx, ns, key, redisKeyTypeList, meta.ID)
+	if err != nil {
+		return nil, false, err
+	}
 	return meta, true, nil
 }
 
@@ -207,6 +214,9 @@ func saveRedisListMetaTx(tx *storage.Tx, ns redisNamespace, key []byte, meta *re
 		return err
 	}
 	if err = bucket.Put(key, meta.serialize()); err != nil {
+		return err
+	}
+	if err = saveRedisKeyMetaForTypeWithFormatTx(tx, ns, key, redisKeyTypeList, meta.ID, meta.StorageFormat); err != nil {
 		return err
 	}
 	return ensureRedisSlotIndexEntryTx(tx, ns, key)
@@ -225,6 +235,9 @@ func deleteRedisListMetaTx(tx *storage.Tx, ns redisNamespace, key []byte) error 
 		return nil
 	}
 	if err != nil {
+		return err
+	}
+	if err = deleteRedisKeyMetaTx(tx, ns, key); err != nil {
 		return err
 	}
 	return deleteRedisSlotIndexEntryTx(tx, ns, key)
@@ -259,12 +272,12 @@ func nextRedisListIDTx(tx *storage.Tx, ns redisNamespace) (uint64, error) {
 	return id, nil
 }
 
-func ensureRedisListDataBucketTx(tx *storage.Tx, ns redisNamespace, meta *redisListMeta) (*storage.Bucket, error) {
-	return tx.CreateBucketIfNotExists(redisListBucketName(ns, meta.ID))
+func ensureRedisListDataBucketTx(tx *storage.Tx, ns redisNamespace, meta *redisListMeta) (*redisObjectBucket, error) {
+	return openRedisObjectBucketTx(tx, ns.listDataBucket, redisListBucketName(ns, meta.ID), meta.ID, meta.StorageFormat, true)
 }
 
 func loadRedisListSegmentTx(tx *storage.Tx, ns redisNamespace, meta *redisListMeta, segmentID uint64) (*redisListSegment, error) {
-	bucket, err := tx.GetBucket(redisListBucketName(ns, meta.ID))
+	bucket, err := openRedisObjectBucketTx(tx, ns.listDataBucket, redisListBucketName(ns, meta.ID), meta.ID, meta.StorageFormat, false)
 	if err != nil {
 		return nil, err
 	}
@@ -284,7 +297,7 @@ func saveRedisListSegmentTx(tx *storage.Tx, ns redisNamespace, meta *redisListMe
 }
 
 func deleteRedisListSegmentTx(tx *storage.Tx, ns redisNamespace, meta *redisListMeta, segmentID uint64) error {
-	bucket, err := tx.GetBucket(redisListBucketName(ns, meta.ID))
+	bucket, err := openRedisObjectBucketTx(tx, ns.listDataBucket, redisListBucketName(ns, meta.ID), meta.ID, meta.StorageFormat, false)
 	if err != nil {
 		return err
 	}
@@ -304,9 +317,14 @@ func nextRedisListSegmentIDTx(tx *storage.Tx, ns redisNamespace, meta *redisList
 }
 
 func deleteRedisListTx(tx *storage.Tx, ns redisNamespace, key []byte, meta *redisListMeta) error {
-	err := tx.DeleteBucket(redisListBucketName(ns, meta.ID))
+	store, err := openRedisObjectBucketTx(tx, ns.listDataBucket, redisListBucketName(ns, meta.ID), meta.ID, meta.StorageFormat, false)
 	if err != nil && !errors.Is(err, storage.ErrBucketNotFound) {
 		return err
+	}
+	if err == nil {
+		if err = deleteRedisObjectBucketTx(tx, store, redisListBucketName(ns, meta.ID)); err != nil {
+			return err
+		}
 	}
 	if err = deleteRedisListMetaTx(tx, ns, key); err != nil {
 		return err
@@ -336,7 +354,7 @@ func initRedisListMetaTx(tx *storage.Tx, ns redisNamespace, key []byte, nowMs in
 		return nil, err
 	}
 
-	meta := &redisListMeta{ID: id}
+	meta := &redisListMeta{ID: id, StorageFormat: redisKeyStorageShared}
 	if _, err = ensureRedisListDataBucketTx(tx, ns, meta); err != nil {
 		return nil, err
 	}
@@ -405,6 +423,135 @@ func normalizeRedisListRange(length int64, start int64, stop int64) (int64, int6
 		return 0, 0, false
 	}
 	return start, stop, true
+}
+
+type redisListSegmentLocation struct {
+	ID      uint64
+	Segment *redisListSegment
+	Offset  int
+}
+
+func locateRedisListSegmentTx(tx *storage.Tx, ns redisNamespace, meta *redisListMeta, index int64) (redisListSegmentLocation, error) {
+	if meta == nil || index < 0 || index >= meta.Len() || meta.HeadSegID == 0 || meta.TailSegID == 0 {
+		return redisListSegmentLocation{}, errors.New("corrupted redis list segment")
+	}
+
+	visited := make(map[uint64]struct{})
+	if index < meta.Len()/2 {
+		remaining := index
+		segmentID := meta.HeadSegID
+		expectedPrev := uint64(0)
+		for segmentID != 0 {
+			if _, exists := visited[segmentID]; exists {
+				return redisListSegmentLocation{}, errors.New("corrupted redis list segment")
+			}
+			visited[segmentID] = struct{}{}
+			segment, err := loadRedisListSegmentTx(tx, ns, meta, segmentID)
+			if err != nil {
+				return redisListSegmentLocation{}, err
+			}
+			if len(segment.Values) == 0 || segment.PrevID != expectedPrev {
+				return redisListSegmentLocation{}, errors.New("corrupted redis list segment")
+			}
+			if remaining < int64(len(segment.Values)) {
+				return redisListSegmentLocation{ID: segmentID, Segment: segment, Offset: int(remaining)}, nil
+			}
+			remaining -= int64(len(segment.Values))
+			expectedPrev = segmentID
+			segmentID = segment.NextID
+		}
+		return redisListSegmentLocation{}, errors.New("corrupted redis list segment")
+	}
+
+	remaining := meta.Len() - 1 - index
+	segmentID := meta.TailSegID
+	expectedNext := uint64(0)
+	for segmentID != 0 {
+		if _, exists := visited[segmentID]; exists {
+			return redisListSegmentLocation{}, errors.New("corrupted redis list segment")
+		}
+		visited[segmentID] = struct{}{}
+		segment, err := loadRedisListSegmentTx(tx, ns, meta, segmentID)
+		if err != nil {
+			return redisListSegmentLocation{}, err
+		}
+		if len(segment.Values) == 0 || segment.NextID != expectedNext {
+			return redisListSegmentLocation{}, errors.New("corrupted redis list segment")
+		}
+		if remaining < int64(len(segment.Values)) {
+			offset := len(segment.Values) - 1 - int(remaining)
+			return redisListSegmentLocation{ID: segmentID, Segment: segment, Offset: offset}, nil
+		}
+		remaining -= int64(len(segment.Values))
+		expectedNext = segmentID
+		segmentID = segment.PrevID
+	}
+	return redisListSegmentLocation{}, errors.New("corrupted redis list segment")
+}
+
+func replaceRedisListSegmentValues(segment *redisListSegment, values [][]byte) {
+	segment.Values = make([][]byte, 0, len(values))
+	segment.payloadBytes = 0
+	for _, value := range values {
+		segment.appendValue(value)
+	}
+}
+
+func deleteRedisListSegmentChainTx(tx *storage.Tx, ns redisNamespace, meta *redisListMeta, startID uint64, stopBeforeID uint64) error {
+	visited := make(map[uint64]struct{})
+	segmentID := startID
+	for segmentID != 0 && segmentID != stopBeforeID {
+		if _, exists := visited[segmentID]; exists {
+			return errors.New("corrupted redis list segment")
+		}
+		visited[segmentID] = struct{}{}
+		segment, err := loadRedisListSegmentTx(tx, ns, meta, segmentID)
+		if err != nil {
+			return err
+		}
+		nextID := segment.NextID
+		if err = deleteRedisListSegmentTx(tx, ns, meta, segmentID); err != nil {
+			return err
+		}
+		segmentID = nextID
+	}
+	if stopBeforeID != 0 && segmentID != stopBeforeID {
+		return errors.New("corrupted redis list segment")
+	}
+	return nil
+}
+
+func removeRedisListSegmentValues(values [][]byte, element []byte, limit int64, reverse bool) ([][]byte, int64) {
+	if limit <= 0 || len(values) == 0 {
+		return values, 0
+	}
+	remove := make([]bool, len(values))
+	var removed int64
+	if reverse {
+		for i := len(values) - 1; i >= 0 && removed < limit; i-- {
+			if bytes.Equal(values[i], element) {
+				remove[i] = true
+				removed++
+			}
+		}
+	} else {
+		for i := 0; i < len(values) && removed < limit; i++ {
+			if bytes.Equal(values[i], element) {
+				remove[i] = true
+				removed++
+			}
+		}
+	}
+	if removed == 0 {
+		return values, 0
+	}
+	remaining := make([][]byte, 0, len(values)-int(removed))
+	for i, value := range values {
+		if !remove[i] {
+			remaining = append(remaining, value)
+		}
+	}
+	return remaining, removed
 }
 
 func readRedisListValuesTx(tx *storage.Tx, ns redisNamespace, meta *redisListMeta) ([][]byte, []uint64, error) {
@@ -510,11 +657,11 @@ func redisListIndexTx(tx *storage.Tx, ns redisNamespace, key []byte, index int64
 		return nil, false, nil
 	}
 
-	values, _, err := readRedisListValuesTx(tx, ns, meta)
+	location, err := locateRedisListSegmentTx(tx, ns, meta, index)
 	if err != nil {
 		return nil, false, err
 	}
-	return cloneBytes(values[int(index)]), true, nil
+	return cloneBytes(location.Segment.Values[location.Offset]), true, nil
 }
 
 func redisListRangeTx(tx *storage.Tx, ns redisNamespace, key []byte, start int64, stop int64, nowMs int64) ([][]byte, error) {
@@ -528,14 +675,45 @@ func redisListRangeTx(tx *storage.Tx, ns redisNamespace, key []byte, start int64
 		return [][]byte{}, nil
 	}
 
-	values, _, err := readRedisListValuesTx(tx, ns, meta)
+	location, err := locateRedisListSegmentTx(tx, ns, meta, start)
 	if err != nil {
 		return nil, err
 	}
 
 	result := make([][]byte, 0, int(stop-start+1))
-	for i := start; i <= stop; i++ {
-		result = append(result, cloneBytes(values[int(i)]))
+	remaining := stop - start + 1
+	segmentID := location.ID
+	segment := location.Segment
+	offset := location.Offset
+	visited := make(map[uint64]struct{})
+	expectedPrev := segment.PrevID
+	for remaining > 0 {
+		if segmentID == 0 {
+			return nil, errors.New("corrupted redis list segment")
+		}
+		if _, exists := visited[segmentID]; exists {
+			return nil, errors.New("corrupted redis list segment")
+		}
+		visited[segmentID] = struct{}{}
+		if segment.PrevID != expectedPrev || offset < 0 || offset >= len(segment.Values) {
+			return nil, errors.New("corrupted redis list segment")
+		}
+		for offset < len(segment.Values) && remaining > 0 {
+			result = append(result, cloneBytes(segment.Values[offset]))
+			offset++
+			remaining--
+		}
+		if remaining == 0 {
+			break
+		}
+		expectedPrev = segmentID
+		segmentID = segment.NextID
+		var loadErr error
+		segment, loadErr = loadRedisListSegmentTx(tx, ns, meta, segmentID)
+		if loadErr != nil {
+			return nil, loadErr
+		}
+		offset = 0
 	}
 	return result, nil
 }
@@ -565,12 +743,69 @@ func redisListSetTx(tx *storage.Tx, ns redisNamespace, key []byte, index int64, 
 		return errRedisBadIndex
 	}
 
-	values, segmentIDs, err := readRedisListValuesTx(tx, ns, meta)
+	location, err := locateRedisListSegmentTx(tx, ns, meta, index)
 	if err != nil {
 		return err
 	}
-	values[int(index)] = cloneBytes(value)
-	return rewriteRedisListValuesTx(tx, ns, key, meta, segmentIDs, values)
+	values := make([][]byte, len(location.Segment.Values))
+	copy(values, location.Segment.Values)
+	values[location.Offset] = cloneBytes(value)
+
+	oldPrevID := location.Segment.PrevID
+	oldNextID := location.Segment.NextID
+	segmentIDs := []uint64{location.ID}
+	segments := make([]*redisListSegment, 0, 2)
+	var current *redisListSegment
+	for _, entry := range values {
+		if current == nil || !current.canFit(entry) {
+			if current != nil {
+				segments = append(segments, current)
+				newID, idErr := nextRedisListSegmentIDTx(tx, ns, meta)
+				if idErr != nil {
+					return idErr
+				}
+				segmentIDs = append(segmentIDs, newID)
+			}
+			current = &redisListSegment{}
+		}
+		current.appendValue(entry)
+	}
+	segments = append(segments, current)
+
+	for i, segment := range segments {
+		if i == 0 {
+			segment.PrevID = oldPrevID
+		} else {
+			segment.PrevID = segmentIDs[i-1]
+		}
+		if i+1 < len(segments) {
+			segment.NextID = segmentIDs[i+1]
+		} else {
+			segment.NextID = oldNextID
+		}
+		if err = saveRedisListSegmentTx(tx, ns, meta, segmentIDs[i], segment); err != nil {
+			return err
+		}
+	}
+
+	lastID := segmentIDs[len(segmentIDs)-1]
+	if oldNextID != 0 && lastID != location.ID {
+		nextSegment, loadErr := loadRedisListSegmentTx(tx, ns, meta, oldNextID)
+		if loadErr != nil {
+			return loadErr
+		}
+		if nextSegment.PrevID != location.ID {
+			return errors.New("corrupted redis list segment")
+		}
+		nextSegment.PrevID = lastID
+		if err = saveRedisListSegmentTx(tx, ns, meta, oldNextID, nextSegment); err != nil {
+			return err
+		}
+	}
+	if meta.TailSegID == location.ID {
+		meta.TailSegID = lastID
+	}
+	return saveRedisListMetaTx(tx, ns, key, meta)
 }
 
 func redisListTrimTx(tx *storage.Tx, ns redisNamespace, key []byte, start int64, stop int64, nowMs int64) error {
@@ -593,21 +828,62 @@ func redisListTrimTx(tx *storage.Tx, ns redisNamespace, key []byte, start int64,
 		return nil
 	}
 
-	values, segmentIDs, err := readRedisListValuesTx(tx, ns, meta)
+	start, stop, ok := normalizeRedisListRange(meta.Len(), start, stop)
+	if !ok {
+		_, err = unlinkRedisKeyByRawTypeTx(tx, ns, key, redisKeyTypeList, nowMs)
+		return err
+	}
+	startLocation, err := locateRedisListSegmentTx(tx, ns, meta, start)
+	if err != nil {
+		return err
+	}
+	stopLocation, err := locateRedisListSegmentTx(tx, ns, meta, stop)
 	if err != nil {
 		return err
 	}
 
-	start, stop, ok := normalizeRedisListRange(meta.Len(), start, stop)
-	if !ok {
-		return rewriteRedisListValuesTx(tx, ns, key, meta, segmentIDs, nil)
+	oldHeadID := meta.HeadSegID
+	oldRightStartID := stopLocation.Segment.NextID
+	if startLocation.ID == stopLocation.ID {
+		values := startLocation.Segment.Values[startLocation.Offset : stopLocation.Offset+1]
+		replaceRedisListSegmentValues(startLocation.Segment, values)
+		startLocation.Segment.PrevID = 0
+		startLocation.Segment.NextID = 0
+		if _, err = enqueueRedisListChainGCTx(tx, ns, meta, oldHeadID, startLocation.ID, nowMs); err != nil {
+			return err
+		}
+		if _, err = enqueueRedisListChainGCTx(tx, ns, meta, oldRightStartID, 0, nowMs); err != nil {
+			return err
+		}
+		if err = saveRedisListSegmentTx(tx, ns, meta, startLocation.ID, startLocation.Segment); err != nil {
+			return err
+		}
+		meta.HeadSegID = startLocation.ID
+		meta.TailSegID = startLocation.ID
+	} else {
+		startValues := startLocation.Segment.Values[startLocation.Offset:]
+		replaceRedisListSegmentValues(startLocation.Segment, startValues)
+		startLocation.Segment.PrevID = 0
+		stopValues := stopLocation.Segment.Values[:stopLocation.Offset+1]
+		replaceRedisListSegmentValues(stopLocation.Segment, stopValues)
+		stopLocation.Segment.NextID = 0
+		if _, err = enqueueRedisListChainGCTx(tx, ns, meta, oldHeadID, startLocation.ID, nowMs); err != nil {
+			return err
+		}
+		if _, err = enqueueRedisListChainGCTx(tx, ns, meta, oldRightStartID, 0, nowMs); err != nil {
+			return err
+		}
+		if err = saveRedisListSegmentTx(tx, ns, meta, startLocation.ID, startLocation.Segment); err != nil {
+			return err
+		}
+		if err = saveRedisListSegmentTx(tx, ns, meta, stopLocation.ID, stopLocation.Segment); err != nil {
+			return err
+		}
+		meta.HeadSegID = startLocation.ID
+		meta.TailSegID = stopLocation.ID
 	}
-
-	trimmed := make([][]byte, 0, int(stop-start+1))
-	for i := start; i <= stop; i++ {
-		trimmed = append(trimmed, values[int(i)])
-	}
-	return rewriteRedisListValuesTx(tx, ns, key, meta, segmentIDs, trimmed)
+	meta.Length = uint64(stop - start + 1)
+	return saveRedisListMetaTx(tx, ns, key, meta)
 }
 
 func redisListRemTx(tx *storage.Tx, ns redisNamespace, key []byte, count int64, element []byte, nowMs int64) (int64, error) {
@@ -630,53 +906,176 @@ func redisListRemTx(tx *storage.Tx, ns redisNamespace, key []byte, count int64, 
 		return 0, nil
 	}
 
-	values, segmentIDs, err := readRedisListValuesTx(tx, ns, meta)
-	if err != nil {
-		return 0, err
-	}
-
-	removed := int64(0)
-	var remaining [][]byte
-	switch {
-	case count == 0:
-		remaining = make([][]byte, 0, len(values))
-		for _, value := range values {
-			if bytes.Equal(value, element) {
-				removed++
-				continue
-			}
-			remaining = append(remaining, value)
-		}
-	case count > 0:
-		remaining = make([][]byte, 0, len(values))
-		for _, value := range values {
-			if removed < count && bytes.Equal(value, element) {
-				removed++
-				continue
-			}
-			remaining = append(remaining, value)
-		}
-	default:
-		limit := -count
-		reversed := make([][]byte, 0, len(values))
-		for i := len(values) - 1; i >= 0; i-- {
-			value := values[i]
-			if removed < limit && bytes.Equal(value, element) {
-				removed++
-				continue
-			}
-			reversed = append(reversed, value)
-		}
-		remaining = make([][]byte, 0, len(reversed))
-		for i := len(reversed) - 1; i >= 0; i-- {
-			remaining = append(remaining, reversed[i])
+	limit := count
+	reverse := false
+	if count == 0 {
+		limit = meta.Len()
+	} else if count < 0 {
+		reverse = true
+		if count == math.MinInt64 {
+			limit = math.MaxInt64
+		} else {
+			limit = -count
 		}
 	}
 
-	if removed == 0 {
-		return 0, nil
+	var removed int64
+	if !reverse {
+		segmentID := meta.HeadSegID
+		expectedOriginalPrev := uint64(0)
+		previousRetainedID := uint64(0)
+		var previousRetained *redisListSegment
+		previousDirty := false
+		newHeadID := uint64(0)
+		visited := make(map[uint64]struct{})
+		for segmentID != 0 {
+			if _, exists := visited[segmentID]; exists {
+				return 0, errors.New("corrupted redis list segment")
+			}
+			visited[segmentID] = struct{}{}
+			segment, loadErr := loadRedisListSegmentTx(tx, ns, meta, segmentID)
+			if loadErr != nil {
+				return 0, loadErr
+			}
+			if segment.PrevID != expectedOriginalPrev || len(segment.Values) == 0 {
+				return 0, errors.New("corrupted redis list segment")
+			}
+			nextID := segment.NextID
+			expectedOriginalPrev = segmentID
+			remaining, segmentRemoved := removeRedisListSegmentValues(segment.Values, element, limit-removed, false)
+			removed += segmentRemoved
+			if len(remaining) == 0 {
+				if err = deleteRedisListSegmentTx(tx, ns, meta, segmentID); err != nil {
+					return 0, err
+				}
+				segmentID = nextID
+				continue
+			}
+			dirty := segmentRemoved > 0
+			if dirty {
+				replaceRedisListSegmentValues(segment, remaining)
+			}
+			if segment.PrevID != previousRetainedID {
+				segment.PrevID = previousRetainedID
+				dirty = true
+			}
+			if newHeadID == 0 {
+				newHeadID = segmentID
+			}
+			if previousRetained != nil {
+				if previousRetained.NextID != segmentID {
+					previousRetained.NextID = segmentID
+					previousDirty = true
+				}
+				if previousDirty {
+					if err = saveRedisListSegmentTx(tx, ns, meta, previousRetainedID, previousRetained); err != nil {
+						return 0, err
+					}
+				}
+			}
+			previousRetainedID = segmentID
+			previousRetained = segment
+			previousDirty = dirty
+			segmentID = nextID
+		}
+		if removed == 0 {
+			return 0, nil
+		}
+		if previousRetained == nil {
+			return removed, deleteRedisListTx(tx, ns, key, meta)
+		}
+		if previousRetained.NextID != 0 {
+			previousRetained.NextID = 0
+			previousDirty = true
+		}
+		if previousDirty {
+			if err = saveRedisListSegmentTx(tx, ns, meta, previousRetainedID, previousRetained); err != nil {
+				return 0, err
+			}
+		}
+		meta.HeadSegID = newHeadID
+		meta.TailSegID = previousRetainedID
+	} else {
+		segmentID := meta.TailSegID
+		expectedOriginalNext := uint64(0)
+		nextRetainedID := uint64(0)
+		var nextRetained *redisListSegment
+		nextDirty := false
+		newTailID := uint64(0)
+		newHeadID := uint64(0)
+		visited := make(map[uint64]struct{})
+		for segmentID != 0 {
+			if _, exists := visited[segmentID]; exists {
+				return 0, errors.New("corrupted redis list segment")
+			}
+			visited[segmentID] = struct{}{}
+			segment, loadErr := loadRedisListSegmentTx(tx, ns, meta, segmentID)
+			if loadErr != nil {
+				return 0, loadErr
+			}
+			if segment.NextID != expectedOriginalNext || len(segment.Values) == 0 {
+				return 0, errors.New("corrupted redis list segment")
+			}
+			prevID := segment.PrevID
+			expectedOriginalNext = segmentID
+			remaining, segmentRemoved := removeRedisListSegmentValues(segment.Values, element, limit-removed, true)
+			removed += segmentRemoved
+			if len(remaining) == 0 {
+				if err = deleteRedisListSegmentTx(tx, ns, meta, segmentID); err != nil {
+					return 0, err
+				}
+				segmentID = prevID
+				continue
+			}
+			dirty := segmentRemoved > 0
+			if dirty {
+				replaceRedisListSegmentValues(segment, remaining)
+			}
+			if segment.NextID != nextRetainedID {
+				segment.NextID = nextRetainedID
+				dirty = true
+			}
+			if newTailID == 0 {
+				newTailID = segmentID
+			}
+			newHeadID = segmentID
+			if nextRetained != nil {
+				if nextRetained.PrevID != segmentID {
+					nextRetained.PrevID = segmentID
+					nextDirty = true
+				}
+				if nextDirty {
+					if err = saveRedisListSegmentTx(tx, ns, meta, nextRetainedID, nextRetained); err != nil {
+						return 0, err
+					}
+				}
+			}
+			nextRetainedID = segmentID
+			nextRetained = segment
+			nextDirty = dirty
+			segmentID = prevID
+		}
+		if removed == 0 {
+			return 0, nil
+		}
+		if nextRetained == nil {
+			return removed, deleteRedisListTx(tx, ns, key, meta)
+		}
+		if nextRetained.PrevID != 0 {
+			nextRetained.PrevID = 0
+			nextDirty = true
+		}
+		if nextDirty {
+			if err = saveRedisListSegmentTx(tx, ns, meta, nextRetainedID, nextRetained); err != nil {
+				return 0, err
+			}
+		}
+		meta.HeadSegID = newHeadID
+		meta.TailSegID = newTailID
 	}
-	if err = rewriteRedisListValuesTx(tx, ns, key, meta, segmentIDs, remaining); err != nil {
+
+	meta.Length -= uint64(removed)
+	if err = saveRedisListMetaTx(tx, ns, key, meta); err != nil {
 		return 0, err
 	}
 	return removed, nil
@@ -871,6 +1270,39 @@ func redisPopTx(tx *storage.Tx, ns redisNamespace, key []byte, left bool, nowMs 
 }
 
 func redisMoveTx(tx *storage.Tx, ns redisNamespace, source, destination []byte, nowMs int64) ([]byte, bool, error) {
+	if bytes.Equal(source, destination) {
+		if _, err := purgeExpiredRedisKeyTx(tx, ns, source, nowMs); err != nil {
+			return nil, false, err
+		}
+		meta, found, err := loadRedisListMetaTx(tx, ns, source)
+		if err != nil {
+			return nil, false, err
+		}
+		if !found {
+			keyType, typeErr := redisRawKeyTypeTx(tx, ns, source)
+			if typeErr != nil {
+				return nil, false, typeErr
+			}
+			if keyType != redisKeyTypeNone {
+				return nil, false, errRedisWrongType
+			}
+			return nil, false, nil
+		}
+		if meta.Length == 1 {
+			if meta.HeadSegID == 0 || meta.HeadSegID != meta.TailSegID {
+				return nil, false, errors.New("corrupted redis list segment")
+			}
+			segment, loadErr := loadRedisListSegmentTx(tx, ns, meta, meta.HeadSegID)
+			if loadErr != nil {
+				return nil, false, loadErr
+			}
+			if len(segment.Values) != 1 || segment.PrevID != 0 || segment.NextID != 0 {
+				return nil, false, errors.New("corrupted redis list segment")
+			}
+			return cloneBytes(segment.Values[0]), true, nil
+		}
+	}
+
 	value, found, err := redisPopTx(tx, ns, source, false, nowMs)
 	if err != nil || !found {
 		return value, found, err

@@ -2,9 +2,11 @@ package storage
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"hash"
 	"hash/crc32"
+	"io"
 	"os"
 	"sync"
 	"time"
@@ -41,7 +43,8 @@ import (
 
 const (
 	txLogMagicValue        = "PTLG"
-	txLogVersion    uint16 = 2
+	txLogVersion    uint16 = 3
+	txLogVersionV2  uint16 = 2
 
 	txLogActiveSlotUnset = 0xFF
 
@@ -67,7 +70,12 @@ const (
 	txLogHeaderSlot0CapOffset    = txLogHeaderSlot0OffsetOffset + txLogHeaderSlotOffsetSize
 	txLogHeaderSlot1OffsetOffset = txLogHeaderSlot0CapOffset + txLogHeaderSlotCapacitySize
 	txLogHeaderSlot1CapOffset    = txLogHeaderSlot1OffsetOffset + txLogHeaderSlotOffsetSize
-	txLogHeaderSize              = txLogHeaderSlot1CapOffset + txLogHeaderSlotCapacitySize + txLogHeaderPaddingSize
+	txLogV2HeaderSize            = txLogHeaderSlot1CapOffset + txLogHeaderSlotCapacitySize + txLogHeaderPaddingSize
+	txLogHeaderGenerationOffset  = txLogV2HeaderSize
+	txLogHeaderChecksumOffset    = txLogHeaderGenerationOffset + UInt64Size
+	txLogHeaderSize              = txLogHeaderChecksumOffset + UInt32Size
+	txLogHeaderCopies            = 2
+	txLogDataOffset              = txLogHeaderCopies * txLogHeaderSize
 
 	txLogLegacyNumPagesSize = UInt64Size
 	txLogLegacyPageSizeSize = UInt16Size
@@ -83,6 +91,8 @@ const (
 
 	txLogPageOffset = 0
 	txLogPageNumber = txLogPageOffset + txLogPageOffsetSize
+
+	txLogReusableBodyLimit = 1 << 20
 )
 
 type txLogHeader struct {
@@ -92,6 +102,7 @@ type txLogHeader struct {
 	crc            uint32
 	slotOffsets    [2]uint64
 	slotCapacities [2]uint64
+	generation     uint64
 }
 
 type txLogBufferedPage struct {
@@ -112,6 +123,14 @@ type TxLog struct {
 	headerLoaded      bool
 	lastCommittedSlot byte
 	bufferedPages     []txLogBufferedPage
+	bodyBuffer        []byte
+	openErr           error
+	beforeWriteHook   func() error
+	headerCopy        int
+	headerVersion     uint16
+	entryHeader       txLogHeader
+	entryLastSlot     byte
+	entryValid        bool
 }
 
 type txLogWriteStats struct {
@@ -128,8 +147,8 @@ func newTxLogHeader(pageSize int) txLogHeader {
 		activeSlot: txLogActiveSlotUnset,
 		pageSize:   uint16(pageSize),
 		slotOffsets: [2]uint64{
-			uint64(txLogHeaderSize),
-			uint64(txLogHeaderSize),
+			uint64(txLogDataOffset),
+			uint64(txLogDataOffset),
 		},
 	}
 }
@@ -140,6 +159,11 @@ func (h txLogHeader) isActive() bool {
 
 func NewTxLog(filename string, mode os.FileMode, pageSize uint64) *TxLog {
 	file, err := os.OpenFile(filename, os.O_RDWR|os.O_CREATE, mode)
+	if err == nil && (pageSize == 0 || pageSize > uint64(^uint16(0))) {
+		err = fmt.Errorf("invalid transaction-log page size %d", pageSize)
+		_ = file.Close()
+		file = nil
+	}
 	if err != nil {
 		logger.Error("Failed to open log file", "filename", filename, "error", err)
 	}
@@ -150,7 +174,24 @@ func NewTxLog(filename string, mode os.FileMode, pageSize uint64) *TxLog {
 		table:             crc32.MakeTable(crc32.IEEE),
 		header:            newTxLogHeader(int(pageSize)),
 		lastCommittedSlot: txLogActiveSlotUnset,
+		openErr:           err,
+		headerCopy:        -1,
+		headerVersion:     txLogVersion,
 	}
+}
+
+func (txlog *TxLog) Close() error {
+	if txlog == nil {
+		return nil
+	}
+	txlog.lock.Lock()
+	defer txlog.lock.Unlock()
+	if txlog.file == nil {
+		return txlog.openErr
+	}
+	err := txlog.file.Close()
+	txlog.file = nil
+	return err
 }
 
 func (txlog *TxLog) ensureHeaderLoaded() error {
@@ -202,24 +243,72 @@ func (txlog *TxLog) readCurrentHeader() (txLogHeader, bool, error) {
 	if err != nil {
 		return txLogHeader{}, false, err
 	}
-	if info.Size() < txLogHeaderSize {
+	var bestHeader txLogHeader
+	bestCopy := -1
+	sawV3 := false
+	for copyIndex := 0; copyIndex < txLogHeaderCopies; copyIndex++ {
+		offset := int64(copyIndex * txLogHeaderSize)
+		if info.Size() < offset+txLogHeaderSize {
+			continue
+		}
+		data := make([]byte, txLogHeaderSize)
+		if _, readErr := txlog.file.ReadAt(data, offset); readErr != nil {
+			continue
+		}
+		if string(data[txLogMagicOffset:txLogMagicOffset+txLogMagicSize]) != txLogMagicValue || binary.LittleEndian.Uint16(data[txLogVersionOffset:]) != txLogVersion {
+			continue
+		}
+		sawV3 = true
+		expectedChecksum := binary.LittleEndian.Uint32(data[txLogHeaderChecksumOffset:])
+		actualChecksum := crc32.ChecksumIEEE(data[:txLogHeaderChecksumOffset])
+		if expectedChecksum != actualChecksum {
+			continue
+		}
+		header, decodeErr := decodeTxLogHeader(data, true)
+		if decodeErr != nil {
+			continue
+		}
+		if bestCopy == -1 || header.generation > bestHeader.generation {
+			bestHeader = header
+			bestCopy = copyIndex
+		}
+	}
+	if bestCopy >= 0 {
+		txlog.headerCopy = bestCopy
+		txlog.headerVersion = txLogVersion
+		return bestHeader, true, nil
+	}
+	if sawV3 {
+		return txLogHeader{}, false, fmt.Errorf("both transaction-log headers are corrupted")
+	}
+
+	if info.Size() < txLogV2HeaderSize {
 		return txLogHeader{}, false, nil
 	}
-
-	data := make([]byte, txLogHeaderSize)
-	_, err = txlog.file.ReadAt(data, 0)
-	if err != nil {
+	data := make([]byte, txLogV2HeaderSize)
+	if _, err = txlog.file.ReadAt(data, 0); err != nil {
 		return txLogHeader{}, false, err
 	}
-
 	if string(data[txLogMagicOffset:txLogMagicOffset+txLogMagicSize]) != txLogMagicValue {
 		return txLogHeader{}, false, nil
 	}
 	version := binary.LittleEndian.Uint16(data[txLogVersionOffset:])
-	if version != txLogVersion {
+	if version != txLogVersionV2 {
 		return txLogHeader{}, false, fmt.Errorf("unsupported tx log version %d", version)
 	}
+	header, err := decodeTxLogHeader(data, false)
+	if err != nil {
+		return txLogHeader{}, false, err
+	}
+	txlog.headerCopy = -1
+	txlog.headerVersion = txLogVersionV2
+	return header, true, nil
+}
 
+func decodeTxLogHeader(data []byte, withGeneration bool) (txLogHeader, error) {
+	if len(data) < txLogV2HeaderSize {
+		return txLogHeader{}, fmt.Errorf("transaction-log header is truncated")
+	}
 	header := txLogHeader{
 		activeSlot: data[txLogActiveSlotOffset],
 		numPages:   binary.LittleEndian.Uint64(data[txLogHeaderNumPagesOffset:]),
@@ -234,13 +323,40 @@ func (txlog *TxLog) readCurrentHeader() (txLogHeader, bool, error) {
 			binary.LittleEndian.Uint64(data[txLogHeaderSlot1CapOffset:]),
 		},
 	}
+	if withGeneration {
+		if len(data) < txLogHeaderSize {
+			return txLogHeader{}, fmt.Errorf("transaction-log v3 header is truncated")
+		}
+		header.generation = binary.LittleEndian.Uint64(data[txLogHeaderGenerationOffset:])
+	}
 	if header.pageSize == 0 {
-		return txLogHeader{}, false, fmt.Errorf("invalid page size in tx log header: %d", header.pageSize)
+		return txLogHeader{}, fmt.Errorf("invalid page size in tx log header: %d", header.pageSize)
 	}
 	if header.activeSlot != txLogActiveSlotUnset && header.activeSlot > 1 {
-		return txLogHeader{}, false, fmt.Errorf("invalid tx log active slot %d", header.activeSlot)
+		return txLogHeader{}, fmt.Errorf("invalid tx log active slot %d", header.activeSlot)
 	}
-	return header, true, nil
+	if (header.activeSlot == txLogActiveSlotUnset) != (header.numPages == 0) {
+		return txLogHeader{}, fmt.Errorf("inconsistent transaction-log active state")
+	}
+	minimumOffset := uint64(txLogV2HeaderSize)
+	if withGeneration {
+		minimumOffset = uint64(txLogDataOffset)
+	}
+	maxFileOffset := uint64(^uint64(0) >> 1)
+	for slot := range 2 {
+		if header.slotOffsets[slot] < minimumOffset || header.slotOffsets[slot] > maxFileOffset ||
+			header.slotCapacities[slot] > maxFileOffset || header.slotOffsets[slot] > maxFileOffset-header.slotCapacities[slot] {
+			return txLogHeader{}, fmt.Errorf("invalid transaction-log slot %d bounds", slot)
+		}
+	}
+	if header.slotCapacities[0] > 0 && header.slotCapacities[1] > 0 {
+		end0 := header.slotOffsets[0] + header.slotCapacities[0]
+		end1 := header.slotOffsets[1] + header.slotCapacities[1]
+		if header.slotOffsets[0] < end1 && header.slotOffsets[1] < end0 {
+			return txLogHeader{}, fmt.Errorf("transaction-log slots overlap")
+		}
+	}
+	return header, nil
 }
 
 func (txlog *TxLog) writeCurrentHeader(header txLogHeader, sync bool) error {
@@ -248,6 +364,28 @@ func (txlog *TxLog) writeCurrentHeader(header txLogHeader, sync bool) error {
 		return fmt.Errorf("tx log file is nil")
 	}
 
+	header.generation = txlog.header.generation + 1
+	data := marshalTxLogHeader(header)
+
+	writeCopy := 0
+	if txlog.headerCopy == 0 {
+		writeCopy = 1
+	}
+	if _, err := txlog.file.WriteAt(data, int64(writeCopy*txLogHeaderSize)); err != nil {
+		return err
+	}
+	if sync {
+		if err := txlog.file.Sync(); err != nil {
+			return err
+		}
+	}
+	txlog.header = header
+	txlog.headerCopy = writeCopy
+	txlog.headerVersion = txLogVersion
+	return nil
+}
+
+func marshalTxLogHeader(header txLogHeader) []byte {
 	data := make([]byte, txLogHeaderSize)
 	copy(data[txLogMagicOffset:], []byte(txLogMagicValue))
 	binary.LittleEndian.PutUint16(data[txLogVersionOffset:], txLogVersion)
@@ -259,8 +397,18 @@ func (txlog *TxLog) writeCurrentHeader(header txLogHeader, sync bool) error {
 	binary.LittleEndian.PutUint64(data[txLogHeaderSlot0CapOffset:], header.slotCapacities[0])
 	binary.LittleEndian.PutUint64(data[txLogHeaderSlot1OffsetOffset:], header.slotOffsets[1])
 	binary.LittleEndian.PutUint64(data[txLogHeaderSlot1CapOffset:], header.slotCapacities[1])
+	binary.LittleEndian.PutUint64(data[txLogHeaderGenerationOffset:], header.generation)
+	binary.LittleEndian.PutUint32(data[txLogHeaderChecksumOffset:], crc32.ChecksumIEEE(data[:txLogHeaderChecksumOffset]))
+	return data
+}
 
-	if _, err := txlog.file.WriteAt(data, 0); err != nil {
+func (txlog *TxLog) mirrorCurrentHeader(sync bool) error {
+	if txlog.file == nil || txlog.headerCopy < 0 {
+		return nil
+	}
+	data := marshalTxLogHeader(txlog.header)
+	mirrorCopy := txlog.headerCopy ^ 1
+	if _, err := txlog.file.WriteAt(data, int64(mirrorCopy*txLogHeaderSize)); err != nil {
 		return err
 	}
 	if sync {
@@ -275,11 +423,29 @@ func (txlog *TxLog) enter() error {
 	if err := txlog.ensureHeaderLoaded(); err != nil {
 		return err
 	}
+	if txlog.headerCopy < 0 {
+		if err := txlog.writeCurrentHeader(txlog.header, true); err != nil {
+			return err
+		}
+		if err := txlog.mirrorCurrentHeader(false); err != nil {
+			return err
+		}
+	}
+	txlog.entryHeader = txlog.header
+	txlog.entryLastSlot = txlog.lastCommittedSlot
+	txlog.entryValid = true
 	txlog.active = true
 	txlog.crc = crc32.New(txlog.table)
 	txlog.numPages = 0
-	txlog.bufferedPages = txlog.bufferedPages[:0]
+	txlog.clearBufferedPages()
 	return nil
+}
+
+func (txlog *TxLog) clearBufferedPages() {
+	// Retain the small entry slice for reuse, but do not retain references to
+	// every page buffer from the largest transaction ever committed.
+	clear(txlog.bufferedPages)
+	txlog.bufferedPages = txlog.bufferedPages[:0]
 }
 
 func (txlog *TxLog) chooseWriteSlot() int {
@@ -291,27 +457,27 @@ func (txlog *TxLog) chooseWriteSlot() int {
 
 func (txlog *TxLog) prepareWriteSlot(slot int, requiredBytes uint64) uint64 {
 	if slot < 0 || slot > 1 {
-		return uint64(txLogHeaderSize)
+		return uint64(txLogDataOffset)
 	}
 
 	offset := txlog.header.slotOffsets[slot]
-	if offset < uint64(txLogHeaderSize) {
-		offset = uint64(txLogHeaderSize)
+	if offset < uint64(txLogDataOffset) {
+		offset = uint64(txLogDataOffset)
 	}
 	if requiredBytes == 0 {
 		txlog.header.slotOffsets[slot] = offset
 		return offset
 	}
-	if txlog.header.slotCapacities[slot] >= requiredBytes && offset >= uint64(txLogHeaderSize) {
+	if txlog.header.slotCapacities[slot] >= requiredBytes && offset >= uint64(txLogDataOffset) {
 		txlog.header.slotOffsets[slot] = offset
 		return offset
 	}
 
 	otherSlot := slot ^ 1
-	newOffset := uint64(txLogHeaderSize)
+	newOffset := uint64(txLogDataOffset)
 	otherOffset := txlog.header.slotOffsets[otherSlot]
 	otherCapacity := txlog.header.slotCapacities[otherSlot]
-	if otherOffset >= uint64(txLogHeaderSize) && otherCapacity > 0 {
+	if otherOffset >= uint64(txLogDataOffset) && otherCapacity > 0 {
 		newOffset = otherOffset + otherCapacity
 	}
 	txlog.header.slotOffsets[slot] = newOffset
@@ -319,12 +485,27 @@ func (txlog *TxLog) prepareWriteSlot(slot int, requiredBytes uint64) uint64 {
 	return newOffset
 }
 
-func (txlog *TxLog) marshalBufferedPages() []byte {
+func (txlog *TxLog) marshalBufferedPages() ([]byte, error) {
 	if txlog.numPages == 0 {
-		return nil
+		return nil, nil
 	}
-	bodySize := txlog.numPages * (txLogPageHeaderSize + txlog.pageSize)
-	body := make([]byte, bodySize)
+	if txlog.numPages != len(txlog.bufferedPages) || txlog.pageSize <= 0 {
+		return nil, fmt.Errorf("invalid transaction-log buffer state")
+	}
+	entrySize := txLogPageHeaderSize + txlog.pageSize
+	if txlog.numPages > int(^uint(0)>>1)/entrySize {
+		return nil, fmt.Errorf("transaction-log body is too large")
+	}
+	bodySize := txlog.numPages * entrySize
+	var body []byte
+	if bodySize <= txLogReusableBodyLimit {
+		if cap(txlog.bodyBuffer) < bodySize {
+			txlog.bodyBuffer = make([]byte, bodySize)
+		}
+		body = txlog.bodyBuffer[:bodySize]
+	} else {
+		body = make([]byte, bodySize)
+	}
 	cursor := 0
 	for _, entry := range txlog.bufferedPages {
 		binary.LittleEndian.PutUint64(body[cursor:], entry.offset)
@@ -334,7 +515,7 @@ func (txlog *TxLog) marshalBufferedPages() []byte {
 		copy(body[cursor:cursor+txlog.pageSize], entry.data)
 		cursor += txlog.pageSize
 	}
-	return body
+	return body, nil
 }
 
 func (txlog *TxLog) writeBuffered(sync bool) (txLogWriteStats, error) {
@@ -343,10 +524,37 @@ func (txlog *TxLog) writeBuffered(sync bool) (txLogWriteStats, error) {
 		txlog.active = false
 		txlog.numPages = 0
 		txlog.crc = nil
-		txlog.bufferedPages = txlog.bufferedPages[:0]
+		txlog.clearBufferedPages()
 	}()
 	if txlog.file == nil {
 		return stats, fmt.Errorf("tx log file is nil")
+	}
+	if txlog.beforeWriteHook != nil {
+		if err := txlog.beforeWriteHook(); err != nil {
+			return stats, err
+		}
+	}
+
+	writeStart := time.Now()
+	var body []byte
+	if txlog.numPages > 0 {
+		var err error
+		body, err = txlog.marshalBufferedPages()
+		if err != nil {
+			return stats, err
+		}
+		writeSlot := txlog.chooseWriteSlot()
+		required := uint64(len(body))
+		if !txlog.header.isActive() && txlog.header.slotCapacities[writeSlot] < required {
+			if err = txlog.compact(); err != nil {
+				return stats, err
+			}
+			if required > ^uint64(0)-uint64(txLogDataOffset) {
+				return stats, fmt.Errorf("transaction-log slot size overflows")
+			}
+			txlog.header.slotOffsets = [2]uint64{uint64(txLogDataOffset), uint64(txLogDataOffset) + required}
+			txlog.header.slotCapacities = [2]uint64{required, required}
+		}
 	}
 
 	nextHeader := txlog.header
@@ -361,17 +569,19 @@ func (txlog *TxLog) writeBuffered(sync bool) (txLogWriteStats, error) {
 		if err := txlog.writeCurrentHeader(nextHeader, sync); err != nil {
 			return stats, err
 		}
+		if mirrorErr := txlog.mirrorCurrentHeader(false); mirrorErr != nil {
+			logger.Error("failed to mirror transaction-log header", "error", mirrorErr)
+		}
 		if sync {
 			stats.syncDuration = time.Since(syncStart)
 		}
-		txlog.header = nextHeader
 		return stats, nil
 	}
 
-	writeStart := time.Now()
-	body := txlog.marshalBufferedPages()
 	writeSlot := txlog.chooseWriteSlot()
 	writeOffset := txlog.prepareWriteSlot(writeSlot, uint64(len(body)))
+	nextHeader.slotOffsets = txlog.header.slotOffsets
+	nextHeader.slotCapacities = txlog.header.slotCapacities
 	if _, err := txlog.file.WriteAt(body, int64(writeOffset)); err != nil {
 		return stats, err
 	}
@@ -384,17 +594,46 @@ func (txlog *TxLog) writeBuffered(sync bool) (txLogWriteStats, error) {
 	if err := txlog.writeCurrentHeader(nextHeader, sync); err != nil {
 		return stats, err
 	}
+	if mirrorErr := txlog.mirrorCurrentHeader(false); mirrorErr != nil {
+		logger.Error("failed to mirror transaction-log header", "error", mirrorErr)
+	}
 	if sync {
 		stats.syncDuration = time.Since(syncStart)
 	}
 
-	txlog.header = nextHeader
 	txlog.lastCommittedSlot = byte(writeSlot)
 	return stats, nil
 }
 
 func (txlog *TxLog) abort() error {
-	return txlog.reset(true)
+	defer func() {
+		txlog.active = false
+		txlog.numPages = 0
+		txlog.crc = nil
+		txlog.clearBufferedPages()
+		txlog.entryValid = false
+	}()
+	if !txlog.entryValid {
+		return txlog.reset(true)
+	}
+	// A failed header sync can still have placed the attempted generation on
+	// disk. Skip that generation so the restored header always wins.
+	txlog.header.generation++
+	if err := txlog.writeCurrentHeader(txlog.entryHeader, true); err != nil {
+		return fmt.Errorf("restore previous transaction-log header: %w", err)
+	}
+	if err := txlog.mirrorCurrentHeader(false); err != nil {
+		return fmt.Errorf("mirror restored transaction-log header: %w", err)
+	}
+	txlog.lastCommittedSlot = txlog.entryLastSlot
+	return nil
+}
+
+func (txlog *TxLog) abortError(operationErr error) error {
+	if abortErr := txlog.abort(); abortErr != nil {
+		return errors.Join(operationErr, fmt.Errorf("%w: %v", ErrJournalRestoreFailed, abortErr))
+	}
+	return operationErr
 }
 
 func (txlog *TxLog) reset(sync bool) error {
@@ -402,7 +641,7 @@ func (txlog *TxLog) reset(sync bool) error {
 		txlog.active = false
 		txlog.numPages = 0
 		txlog.crc = nil
-		txlog.bufferedPages = txlog.bufferedPages[:0]
+		txlog.clearBufferedPages()
 	}()
 	if err := txlog.ensureHeaderLoaded(); err != nil {
 		return err
@@ -416,14 +655,50 @@ func (txlog *TxLog) reset(sync bool) error {
 	if err := txlog.writeCurrentHeader(nextHeader, sync); err != nil {
 		return err
 	}
-	txlog.header = nextHeader
+	if mirrorErr := txlog.mirrorCurrentHeader(false); mirrorErr != nil {
+		logger.Error("failed to mirror transaction-log header", "error", mirrorErr)
+	}
 	return nil
 }
 
 func (txlog *TxLog) Clear() error {
 	txlog.lock.Lock()
 	defer txlog.lock.Unlock()
-	return txlog.reset(true)
+	if err := txlog.reset(true); err != nil {
+		return err
+	}
+	return txlog.compact()
+}
+
+func (txlog *TxLog) compact() error {
+	if txlog.file == nil {
+		return fmt.Errorf("tx log file is nil")
+	}
+	info, err := txlog.file.Stat()
+	if err != nil {
+		return err
+	}
+	if info.Size() <= int64(txLogDataOffset) {
+		txlog.lastCommittedSlot = txLogActiveSlotUnset
+		return nil
+	}
+	if err = txlog.file.Truncate(int64(txLogDataOffset)); err != nil {
+		return fmt.Errorf("truncate transaction log: %w", err)
+	}
+	nextHeader := txlog.header
+	nextHeader.activeSlot = txLogActiveSlotUnset
+	nextHeader.numPages = 0
+	nextHeader.crc = 0
+	nextHeader.slotOffsets = [2]uint64{uint64(txLogDataOffset), uint64(txLogDataOffset)}
+	nextHeader.slotCapacities = [2]uint64{}
+	if err = txlog.writeCurrentHeader(nextHeader, true); err != nil {
+		return fmt.Errorf("persist compacted transaction log: %w", err)
+	}
+	if mirrorErr := txlog.mirrorCurrentHeader(false); mirrorErr != nil {
+		logger.Error("failed to mirror compacted transaction-log header", "error", mirrorErr)
+	}
+	txlog.lastCommittedSlot = txLogActiveSlotUnset
+	return nil
 }
 
 // ClearFast marks the journal inactive without forcing a durability barrier.
@@ -445,7 +720,30 @@ func (txlog *TxLog) Sync() error {
 	return txlog.file.Sync()
 }
 
+func (txlog *TxLog) Size() (int64, error) {
+	txlog.lock.Lock()
+	defer txlog.lock.Unlock()
+	if txlog.file == nil {
+		return 0, fmt.Errorf("tx log file is nil")
+	}
+	info, err := txlog.file.Stat()
+	if err != nil {
+		return 0, err
+	}
+	return info.Size(), nil
+}
+
 func (txlog *TxLog) writePage(offset uint64, page *Page) error {
+	return txlog.writePageInternal(offset, page, true)
+}
+
+func (txlog *TxLog) writePageInternal(offset uint64, page *Page, copyData bool) error {
+	if page == nil {
+		return fmt.Errorf("cannot journal a nil page")
+	}
+	if !txlog.active || txlog.crc == nil {
+		return fmt.Errorf("transaction log is not active")
+	}
 	if len(page.Data) != txlog.pageSize {
 		return fmt.Errorf("unexpected tx log page size %d, expected %d", len(page.Data), txlog.pageSize)
 	}
@@ -454,15 +752,18 @@ func (txlog *TxLog) writePage(offset uint64, page *Page) error {
 	binary.LittleEndian.PutUint64(entryHeader, offset)
 	binary.LittleEndian.PutUint64(entryHeader[txLogPageNumber:], page.PageNumber)
 
-	pageCopy := append([]byte(nil), page.Data...)
+	pageData := page.Data
+	if copyData {
+		pageData = append([]byte(nil), page.Data...)
+	}
 	txlog.bufferedPages = append(txlog.bufferedPages, txLogBufferedPage{
 		offset:     offset,
 		pageNumber: page.PageNumber,
-		data:       pageCopy,
+		data:       pageData,
 	})
 
 	_, _ = txlog.crc.Write(entryHeader)
-	_, _ = txlog.crc.Write(pageCopy)
+	_, _ = txlog.crc.Write(pageData)
 	txlog.numPages++
 	return nil
 }
@@ -491,9 +792,11 @@ func (txlog *TxLog) ReplaceWithPages(pages []*Page, sync bool) (txLogWriteStats,
 
 	writeStart := time.Now()
 	for _, page := range pages {
-		if err := txlog.writePage(page.PageNumber*uint64(txlog.pageSize), page); err != nil {
-			_ = txlog.abort()
-			return stats, err
+		if page == nil || page.PageNumber > ^uint64(0)/uint64(txlog.pageSize) {
+			return stats, txlog.abortError(fmt.Errorf("invalid page in transaction log"))
+		}
+		if err := txlog.writePageInternal(page.PageNumber*uint64(txlog.pageSize), page, false); err != nil {
+			return stats, txlog.abortError(err)
 		}
 	}
 	stats.writeDuration = time.Since(writeStart)
@@ -504,8 +807,7 @@ func (txlog *TxLog) ReplaceWithPages(pages []*Page, sync bool) (txLogWriteStats,
 	stats.bufferedPages = leaveStats.bufferedPages
 	stats.bufferedBytes = leaveStats.bufferedBytes
 	if err != nil {
-		_ = txlog.abort()
-		return stats, err
+		return stats, txlog.abortError(err)
 	}
 
 	return stats, nil
@@ -513,6 +815,9 @@ func (txlog *TxLog) ReplaceWithPages(pages []*Page, sync bool) (txLogWriteStats,
 
 func (txlog *TxLog) withStats(fn func() error) (txLogWriteStats, error) {
 	var stats txLogWriteStats
+	if fn == nil {
+		return stats, fmt.Errorf("transaction-log callback is nil")
+	}
 	txlog.lock.Lock()
 	defer txlog.lock.Unlock()
 
@@ -529,8 +834,7 @@ func (txlog *TxLog) withStats(fn func() error) (txLogWriteStats, error) {
 
 	writeStart := time.Now()
 	if err := fn(); err != nil {
-		_ = txlog.abort()
-		return stats, err
+		return stats, txlog.abortError(err)
 	}
 	stats.writeDuration = time.Since(writeStart)
 
@@ -540,53 +844,55 @@ func (txlog *TxLog) withStats(fn func() error) (txLogWriteStats, error) {
 	stats.bufferedPages = leaveStats.bufferedPages
 	stats.bufferedBytes = leaveStats.bufferedBytes
 	if err != nil {
-		_ = txlog.abort()
-		return stats, err
+		return stats, txlog.abortError(err)
 	}
 
 	return stats, nil
 }
 
-func (txlog *TxLog) recoverFromBuffer(data []byte, numPages, pageSize int, expectedCRC uint32, callback PageRecoveryCallback) error {
+func (txlog *TxLog) recoverFromFile(dataOffset, dataSize int64, numPages, pageSize int, expectedCRC uint32, callback PageRecoveryCallback) error {
+	if dataOffset < 0 || dataSize < 0 || numPages < 0 || pageSize <= 0 {
+		return fmt.Errorf("invalid transaction-log recovery bounds")
+	}
+	expectedDataSize := int64(numPages) * int64(txLogPageHeaderSize+pageSize)
+	if expectedDataSize != dataSize {
+		return fmt.Errorf("tx log size mismatch: expected %d, got %d", expectedDataSize, dataSize)
+	}
+
 	crc := crc32.New(txlog.table)
-	_, _ = crc.Write(data)
-	actualCRC := crc.Sum32()
-	if actualCRC != expectedCRC {
+	section := io.NewSectionReader(txlog.file, dataOffset, dataSize)
+	buffer := make([]byte, 1024*1024)
+	copied, err := io.CopyBuffer(crc, section, buffer)
+	if err != nil {
+		return fmt.Errorf("read transaction log for CRC: %w", err)
+	}
+	if copied != dataSize {
+		return fmt.Errorf("short transaction-log body: read %d of %d bytes", copied, dataSize)
+	}
+	if actualCRC := crc.Sum32(); actualCRC != expectedCRC {
 		return fmt.Errorf("CRC mismatch: expected %08x, got %08x", expectedCRC, actualCRC)
 	}
 
-	expectedDataSize := int64(numPages) * int64(txLogPageHeaderSize+pageSize)
-	if expectedDataSize != int64(len(data)) {
-		return fmt.Errorf("tx log size mismatch: expected %d, got %d", expectedDataSize, len(data))
-	}
-
-	cursor := 0
+	entryHeader := make([]byte, txLogPageHeaderSize)
+	cursor := dataOffset
 	for range numPages {
-		if cursor+txLogPageHeaderSize+pageSize > len(data) {
-			return fmt.Errorf("tx log entry overflow at cursor %d", cursor)
+		if _, err := txlog.file.ReadAt(entryHeader, cursor); err != nil {
+			return err
 		}
-		offset := binary.LittleEndian.Uint64(data[cursor : cursor+txLogPageOffsetSize])
-		cursor += txLogPageOffsetSize
-		pageNum := binary.LittleEndian.Uint64(data[cursor : cursor+txLogPageNumberSize])
-		cursor += txLogPageNumberSize
+		cursor += txLogPageHeaderSize
+		offset := binary.LittleEndian.Uint64(entryHeader[txLogPageOffset : txLogPageOffset+txLogPageOffsetSize])
+		pageNum := binary.LittleEndian.Uint64(entryHeader[txLogPageNumber : txLogPageNumber+txLogPageNumberSize])
 		if offset%uint64(pageSize) != 0 {
 			return fmt.Errorf("tx log offset %d is not aligned to page size %d", offset, pageSize)
 		}
-		expectedPageNum := offset / uint64(pageSize)
-		if expectedPageNum != pageNum {
-			return fmt.Errorf(
-				"tx log offset/page mismatch: offset=%d page_num=%d expected_page_num=%d",
-				offset, pageNum, expectedPageNum,
-			)
+		if expectedPageNum := offset / uint64(pageSize); expectedPageNum != pageNum {
+			return fmt.Errorf("tx log offset/page mismatch: offset=%d page_num=%d expected_page_num=%d", offset, pageNum, expectedPageNum)
 		}
-
-		page := &Page{
-			PageNumber: pageNum,
-			Data:       make([]byte, pageSize),
+		page := &Page{PageNumber: pageNum, Data: make([]byte, pageSize)}
+		if _, err := txlog.file.ReadAt(page.Data, cursor); err != nil {
+			return err
 		}
-		copy(page.Data, data[cursor:cursor+pageSize])
-		cursor += pageSize
-
+		cursor += int64(pageSize)
 		if err := callback(offset, page); err != nil {
 			return err
 		}
@@ -606,29 +912,38 @@ func (txlog *TxLog) recoverCurrent(header txLogHeader, totalSize int64, callback
 	}
 
 	pageSize := int(header.pageSize)
+	if pageSize != txlog.pageSize {
+		return fmt.Errorf("tx log page size %d does not match database page size %d", pageSize, txlog.pageSize)
+	}
+	entrySize := uint64(txLogPageHeaderSize + pageSize)
+	if header.numPages > uint64(^uint64(0)>>1)/entrySize {
+		return fmt.Errorf("tx log page count %d overflows body size", header.numPages)
+	}
+	dataSizeU := header.numPages * entrySize
+	if dataSizeU > uint64(^uint64(0)>>1) || header.numPages > uint64(^uint(0)>>1) {
+		return fmt.Errorf("tx log body is too large")
+	}
 	numPages := int(header.numPages)
-	dataSize := int64(numPages) * int64(txLogPageHeaderSize+pageSize)
+	dataSize := int64(dataSizeU)
+	if header.slotOffsets[header.activeSlot] > uint64(^uint64(0)>>1) || header.slotCapacities[header.activeSlot] > uint64(^uint64(0)>>1) {
+		return fmt.Errorf("tx log slot metadata overflows file offsets")
+	}
 	slotOffset := int64(header.slotOffsets[header.activeSlot])
 	slotCapacity := int64(header.slotCapacities[header.activeSlot])
-	if slotOffset < txLogHeaderSize {
+	minimumOffset := int64(txLogDataOffset)
+	if txlog.headerVersion == txLogVersionV2 {
+		minimumOffset = txLogV2HeaderSize
+	}
+	if slotOffset < minimumOffset {
 		return fmt.Errorf("invalid tx log slot offset %d", slotOffset)
 	}
 	if slotCapacity > 0 && dataSize > slotCapacity {
 		return fmt.Errorf("tx log slot capacity mismatch: need %d, have %d", dataSize, slotCapacity)
 	}
-	if slotOffset+dataSize > totalSize {
+	if dataSize > totalSize || slotOffset > totalSize-dataSize {
 		return fmt.Errorf("tx log body exceeds file size: end=%d size=%d", slotOffset+dataSize, totalSize)
 	}
-	if dataSize > int64(^uint(0)>>1) {
-		return fmt.Errorf("tx log data too large: %d", dataSize)
-	}
-
-	data := make([]byte, int(dataSize))
-	_, err := txlog.file.ReadAt(data, slotOffset)
-	if err != nil {
-		return err
-	}
-	return txlog.recoverFromBuffer(data, numPages, pageSize, header.crc, callback)
+	return txlog.recoverFromFile(slotOffset, dataSize, numPages, pageSize, header.crc, callback)
 }
 
 func (txlog *TxLog) recoverLegacy(totalSize int64, callback PageRecoveryCallback) error {
@@ -642,30 +957,33 @@ func (txlog *TxLog) recoverLegacy(totalSize int64, callback PageRecoveryCallback
 		return err
 	}
 
-	numPages := int(binary.LittleEndian.Uint64(header[txLogLegacyNumPages:]))
+	numPagesU := binary.LittleEndian.Uint64(header[txLogLegacyNumPages:])
 	pageSize := int(binary.LittleEndian.Uint16(header[txLogLegacyPageSize:]))
 	expectedCRC := binary.LittleEndian.Uint32(header[txLogLegacyCRC:])
 	if pageSize <= 0 {
 		return fmt.Errorf("invalid page size in tx log: %d", pageSize)
 	}
-	if numPages == 0 {
+	if numPagesU == 0 {
 		return nil
 	}
+	if numPagesU > uint64(^uint(0)>>1) {
+		return fmt.Errorf("legacy tx log page count is too large: %d", numPagesU)
+	}
+	if numPagesU > uint64(^uint64(0)>>1)/uint64(txLogPageHeaderSize+pageSize) {
+		return fmt.Errorf("legacy tx log body size overflows")
+	}
+	numPages := int(numPagesU)
 
 	dataSize := totalSize - txLogLegacyHeaderSize
 	if dataSize <= 0 {
 		return fmt.Errorf("tx log has pages in header but no body data")
 	}
-	if dataSize > int64(^uint(0)>>1) {
-		return fmt.Errorf("tx log data too large: %d", dataSize)
+	expectedSize := int64(numPages) * int64(txLogPageHeaderSize+pageSize)
+	if expectedSize != dataSize {
+		return fmt.Errorf("legacy tx log size mismatch: expected %d, got %d", expectedSize, dataSize)
 	}
 
-	data := make([]byte, int(dataSize))
-	_, err = txlog.file.ReadAt(data, txLogLegacyHeaderSize)
-	if err != nil {
-		return err
-	}
-	return txlog.recoverFromBuffer(data, numPages, pageSize, expectedCRC, callback)
+	return txlog.recoverFromFile(txLogLegacyHeaderSize, dataSize, numPages, pageSize, expectedCRC, callback)
 }
 
 func (txlog *TxLog) Recover(callback PageRecoveryCallback) error {
@@ -673,6 +991,9 @@ func (txlog *TxLog) Recover(callback PageRecoveryCallback) error {
 	defer txlog.lock.Unlock()
 	if txlog.file == nil {
 		return fmt.Errorf("tx log file is nil")
+	}
+	if callback == nil {
+		return fmt.Errorf("transaction-log recovery callback is nil")
 	}
 
 	info, err := txlog.file.Stat()

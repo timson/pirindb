@@ -12,6 +12,11 @@ const (
 	redisSlotIndexPrefixSize = 4
 )
 
+var (
+	errRedisSlotIterationStopBefore = errors.New("stop redis slot iteration before current key")
+	errRedisSlotIterationStopAfter  = errors.New("stop redis slot iteration after current key")
+)
+
 func redisSlotIndexKey(slot int, key []byte) []byte {
 	buf := make([]byte, redisSlotIndexPrefixSize+len(key))
 	binary.BigEndian.PutUint32(buf[:redisSlotIndexPrefixSize], uint32(slot))
@@ -39,7 +44,11 @@ func ensureRedisSlotIndexEntryTx(tx *storage.Tx, ns redisNamespace, key []byte) 
 		return err
 	}
 	slot := ClusterKeySlot(key, ns.slotCount)
-	return bucket.Put(redisSlotIndexKey(slot, key), []byte{})
+	indexKey := redisSlotIndexKey(slot, key)
+	if _, found := bucket.Get(indexKey); found {
+		return nil
+	}
+	return bucket.Put(indexKey, []byte{})
 }
 
 func deleteRedisSlotIndexEntryTx(tx *storage.Tx, ns redisNamespace, key []byte) error {
@@ -130,6 +139,16 @@ func forEachRedisKeyBySlotRangeFromIndexKeyTx(tx *storage.Tx, ns redisNamespace,
 			break
 		}
 		if err := fn(key); err != nil {
+			if errors.Is(err, errRedisSlotIterationStopBefore) {
+				exhausted = false
+				break
+			}
+			if errors.Is(err, errRedisSlotIterationStopAfter) {
+				yielded++
+				lastIndexKey = cloneBytes(indexKey)
+				exhausted = false
+				break
+			}
 			return yielded, cloneBytes(lastIndexKey), false, err
 		}
 		yielded++

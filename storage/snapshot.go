@@ -182,7 +182,10 @@ func importSnapshotFromPath(db *DB, path string, targetScope snapshotScope, targ
 func writeSnapshotTx(tx *Tx, w io.Writer, scope snapshotScope, bucketName []byte, stats *SnapshotExportStats) error {
 	switch scope {
 	case snapshotScopeDB:
-		buckets := tx.Buckets()
+		buckets, err := tx.BucketsE()
+		if err != nil {
+			return err
+		}
 		header := snapshotHeader{
 			Version:      snapshotVersion,
 			Scope:        snapshotScopeDB,
@@ -244,6 +247,9 @@ func writeSnapshotBucket(w io.Writer, bucketName []byte, bucket *Bucket, stats *
 		}
 		stats.KeysExported++
 	}
+	if err := cursor.Err(); err != nil {
+		return err
+	}
 	stats.BucketsExported++
 	return nil
 }
@@ -298,7 +304,11 @@ func readSnapshotTx(tx *Tx, r io.Reader, targetScope snapshotScope, targetBucket
 }
 
 func replaceAllBucketsTx(tx *Tx) error {
-	for _, bucketName := range tx.Buckets() {
+	buckets, err := tx.BucketsE()
+	if err != nil {
+		return err
+	}
+	for _, bucketName := range buckets {
 		if err := tx.DeleteBucket(bucketName); err != nil && !errors.Is(err, ErrBucketNotFound) {
 			return err
 		}

@@ -130,7 +130,7 @@ func TestRedisZSetPipelineRollbackOnWrongType(t *testing.T) {
 	reader := bufio.NewReader(conn)
 	writer := bufio.NewWriter(conn)
 
-	writeRedisCommand(t, writer, "PIPELINE")
+	writeRedisCommand(t, writer, "PIRIN.BATCH")
 	require.Equal(t, "OK", readRedisReply(t, reader))
 
 	writeRedisCommand(t, writer, "ZADD", "scores", "1", "alice")
@@ -139,8 +139,8 @@ func TestRedisZSetPipelineRollbackOnWrongType(t *testing.T) {
 	writeRedisCommand(t, writer, "HSET", "scores", "field", "value")
 	require.Equal(t, "QUEUED", readRedisReply(t, reader))
 
-	writeRedisCommand(t, writer, "EXEC")
-	require.Equal(t, redisTestError("ERR pipeline aborted at command 2 (hset): WRONGTYPE Operation against a key holding the wrong kind of value"), readRedisReply(t, reader))
+	writeRedisCommand(t, writer, "PIRIN.EXEC")
+	require.Equal(t, redisTestError("ERR PirinDB batch aborted at command 2 (hset): WRONGTYPE Operation against a key holding the wrong kind of value"), readRedisReply(t, reader))
 
 	writeRedisCommand(t, writer, "TYPE", "scores")
 	require.Equal(t, "none", readRedisReply(t, reader))

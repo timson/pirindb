@@ -12,7 +12,7 @@ import (
 func createNode(keys [][]byte, children []uint64, pageNum uint64) *BNode {
 	items := make([]*Item, len(keys))
 	for i, key := range keys {
-		items[i] = &Item{Key: key, Value: []byte(strings.Repeat("x", 1024))}
+		items[i] = &Item{Key: key, Value: append([]byte{ValueSimple}, []byte(strings.Repeat("x", 1023))...)}
 	}
 	return &BNode{items: items, childNodes: children, PageNum: pageNum}
 }
@@ -97,7 +97,7 @@ func TestRemoveItemFromInternal(t *testing.T) {
 	//      /   \
 	//  [A,B]   [X,Z]
 	//
-	tx := db.Begin(false)
+	tx := db.Begin(true)
 	parentNode := createNode([][]byte{
 		[]byte("M")}, []uint64{1, 2}, 0,
 	)
@@ -112,7 +112,7 @@ func TestRemoveItemFromInternal(t *testing.T) {
 	tx.writeNodes(parentNode, leftChild, rightChild)
 
 	t.Run("Remove internal node item with left subtree replacement", func(t *testing.T) {
-		_, err := parentNode.removeItemFromInternal(tx, 0) // Remove "M", should be replaced by "B"
+		_, _, err := parentNode.removeItemFromInternal(tx, 0) // Remove "M", should be replaced by "B"
 		require.NoError(t, err)
 
 		expectedParent := [][]byte{[]byte("B")}
@@ -136,7 +136,7 @@ func TestRemoveItemFromInternal(t *testing.T) {
 		[]byte("M")}, []uint64{1, 2}, 0,
 	)
 	leftChild = createNode([][]byte{
-		[]byte("A"), []byte("B")}, []uint64{3}, 1)
+		[]byte("A"), []byte("B")}, []uint64{4, 5, 3}, 1)
 
 	rightChild = createNode([][]byte{
 		[]byte("X"), []byte("Z")}, nil, 2)
@@ -147,7 +147,7 @@ func TestRemoveItemFromInternal(t *testing.T) {
 	tx.writeNodes(parentNode, leftChild, deepLeftChild)
 
 	t.Run("Remove internal node item with deep left subtree replacement", func(t *testing.T) {
-		_, err := parentNode.removeItemFromInternal(tx, 0) // Remove "M", should be replaced by "D"
+		_, _, err := parentNode.removeItemFromInternal(tx, 0) // Remove "M", should be replaced by "D"
 		require.NoError(t, err)
 		expectedParent := [][]byte{[]byte("D")}
 		expectedDeepLeft := [][]byte{[]byte("C")}
@@ -175,10 +175,10 @@ func TestBNodeLookupInNode(t *testing.T) {
 func TestBNodeSerialize(t *testing.T) {
 	node := NewBNode()
 
-	idx := node.insertItemAt(&Item{Key: []byte("test1"), Value: []byte("123")}, 0)
+	idx := node.insertItemAt(&Item{Key: []byte("test1"), Value: append([]byte{ValueSimple}, []byte("123")...)}, 0)
 	require.Equal(t, idx, 0)
 
-	idx = node.insertItemAt(&Item{Key: []byte("test2"), Value: []byte("123")}, 1)
+	idx = node.insertItemAt(&Item{Key: []byte("test2"), Value: append([]byte{ValueSimple}, []byte("123")...)}, 1)
 	require.Equal(t, idx, 1)
 
 	data := make([]byte, BTreePageSize)
@@ -186,7 +186,7 @@ func TestBNodeSerialize(t *testing.T) {
 	require.NoError(t, err, "unable to Serialize")
 
 	nodeDst := NewBNode()
-	nodeDst.Deserialize(data)
+	require.NoError(t, nodeDst.Deserialize(data))
 
 	equalItems := reflect.DeepEqual(node.items, nodeDst.items)
 	require.True(t, equalItems, "items not equal after deserialization")
@@ -197,18 +197,19 @@ func TestBNodeSerialize(t *testing.T) {
 
 func TestSplitChild(t *testing.T) {
 	db, _ := CreateTestDB(t)
-	tx := db.Begin(false)
+	tx := db.Begin(true)
+	defer tx.Rollback()
 
 	// Create a full node (before splitting) with 5 keys
 	fullNode := createNode([][]byte{
 		[]byte("A"), []byte("B"), []byte("C"), []byte("D"), []byte("E"),
-	}, nil, 0)
+	}, nil, 1)
 
 	// Create the parent node (initially empty)
 	parentNode := createNode(nil, []uint64{1}, 0) // One child (fullNode)
 
 	// Perform the split operation
-	parentNode.splitChild(tx, fullNode, 0)
+	require.NoError(t, parentNode.splitChild(tx, fullNode, 0))
 
 	// Verify that the middle key moved to the parent node
 	expectedMiddle := []byte("C")

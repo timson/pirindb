@@ -3,10 +3,13 @@ package main
 import (
 	"encoding/binary"
 	"errors"
+	"math"
 	"time"
 
 	"github.com/timson/pirindb/storage"
 )
+
+var errRedisExpireTimeOutOfRange = errors.New("expire time is out of range")
 
 const (
 	redisExpireMetaSize        = 8
@@ -20,8 +23,25 @@ type redisExpireIndexEntry struct {
 	expireAtMs int64
 }
 
+type redisExpirySweepResult struct {
+	EntriesExamined int
+	KeysRemoved     int
+	StaleRemoved    int
+	MoreDue         bool
+}
+
 func redisNowUnixMilli(t time.Time) int64 {
 	return t.UnixMilli()
+}
+
+func redisExpirationDeadline(nowMs int64, durationMs int64) (int64, error) {
+	if durationMs <= 0 {
+		return nowMs, nil
+	}
+	if nowMs > math.MaxInt64-durationMs {
+		return 0, errRedisExpireTimeOutOfRange
+	}
+	return nowMs + durationMs, nil
 }
 
 func encodeRedisExpireAtMs(expireAtMs int64) []byte {
@@ -112,7 +132,10 @@ func deleteRedisExpireAtMsTx(tx *storage.Tx, ns redisNamespace, key []byte) erro
 		return err
 	}
 
-	return deleteRedisExpireIndexEntryTx(tx, ns, redisExpireIndexKey(expireAtMs, key))
+	if err = deleteRedisExpireIndexEntryTx(tx, ns, redisExpireIndexKey(expireAtMs, key)); err != nil {
+		return err
+	}
+	return updateRedisKeyMetaExpiryTx(tx, ns, key, -1)
 }
 
 func setRedisExpireAtMsTx(tx *storage.Tx, ns redisNamespace, key []byte, expireAtMs int64) error {
@@ -132,7 +155,10 @@ func setRedisExpireAtMsTx(tx *storage.Tx, ns redisNamespace, key []byte, expireA
 	if err != nil {
 		return err
 	}
-	return indexBucket.Put(redisExpireIndexKey(expireAtMs, key), []byte{})
+	if err = indexBucket.Put(redisExpireIndexKey(expireAtMs, key), []byte{}); err != nil {
+		return err
+	}
+	return updateRedisKeyMetaExpiryTx(tx, ns, key, expireAtMs)
 }
 
 func redisKeyExpiredTx(tx *storage.Tx, ns redisNamespace, key []byte, nowMs int64) (bool, error) {
@@ -144,6 +170,20 @@ func redisKeyExpiredTx(tx *storage.Tx, ns redisNamespace, key []byte, nowMs int6
 }
 
 func redisRawKeyTypeTx(tx *storage.Tx, ns redisNamespace, key []byte) (string, error) {
+	keyMeta, found, err := loadRedisKeyMetaTx(tx, ns, key)
+	if err != nil {
+		return redisKeyTypeNone, err
+	}
+	if found {
+		return redisKeyTypeFromMetaCode(keyMeta.Type)
+	}
+	active, err := redisKeyDirectoryActiveTx(tx, ns)
+	if err != nil {
+		return redisKeyTypeNone, err
+	}
+	if active {
+		return redisKeyTypeNone, nil
+	}
 	if _, found, err := loadRedisHashMetaTx(tx, ns, key); err != nil {
 		return redisKeyTypeNone, err
 	} else if found {
@@ -169,7 +209,7 @@ func redisRawKeyTypeTx(tx *storage.Tx, ns redisNamespace, key []byte) (string, e
 	} else if found {
 		return redisKeyTypeList, nil
 	}
-	found, err := redisStringKeyExistsTx(tx, ns, key)
+	found, err = redisStringKeyExistsTx(tx, ns, key)
 	if err != nil {
 		return redisKeyTypeNone, err
 	}
@@ -215,6 +255,9 @@ func deleteRedisKeyByRawTypeTx(tx *storage.Tx, ns redisNamespace, key []byte, ke
 			return false, err
 		}
 		removed = true
+		if err := deleteRedisKeyMetaTx(tx, ns, key); err != nil {
+			return false, err
+		}
 		if err := deleteRedisSlotIndexEntryTx(tx, ns, key); err != nil {
 			return false, err
 		}
@@ -288,6 +331,146 @@ func deleteRedisKeyByRawTypeTx(tx *storage.Tx, ns redisNamespace, key []byte, ke
 	return removed, nil
 }
 
+func enqueueRedisObjectForDeletionTx(tx *storage.Tx, ns redisNamespace, storageFormat byte, objectID uint64, sharedBucket, legacyBucket []byte, nowMs int64) error {
+	if storageFormat == redisKeyStorageShared {
+		_, err := enqueueRedisObjectPrefixGCTx(tx, ns, sharedBucket, objectID, nowMs)
+		return err
+	}
+	_, err := enqueueRedisPrivateBucketGCTx(tx, ns, legacyBucket, nowMs)
+	return err
+}
+
+func unlinkRedisKeyByRawTypeTx(tx *storage.Tx, ns redisNamespace, key []byte, keyType string, nowMs int64) (bool, error) {
+	removed := false
+	switch keyType {
+	case redisKeyTypeNone:
+	case redisKeyTypeString:
+		if _, err := enqueueRedisExactKeyGCTx(tx, ns, ns.stringBucket, key, nowMs); err != nil {
+			return false, err
+		}
+		if err := deleteRedisKeyMetaTx(tx, ns, key); err != nil {
+			return false, err
+		}
+		if err := deleteRedisSlotIndexEntryTx(tx, ns, key); err != nil {
+			return false, err
+		}
+		removed = true
+	case redisKeyTypeList:
+		meta, found, err := loadRedisListMetaTx(tx, ns, key)
+		if err != nil || !found {
+			return false, err
+		}
+		if err = enqueueRedisObjectForDeletionTx(tx, ns, meta.StorageFormat, meta.ID, ns.listDataBucket, redisListBucketName(ns, meta.ID), nowMs); err != nil {
+			return false, err
+		}
+		if err = deleteRedisListMetaTx(tx, ns, key); err != nil {
+			return false, err
+		}
+		removed = true
+	case redisKeyTypeHash:
+		meta, found, err := loadRedisHashMetaTx(tx, ns, key)
+		if err != nil || !found {
+			return false, err
+		}
+		if err = enqueueRedisObjectForDeletionTx(tx, ns, meta.StorageFormat, meta.ID, ns.hashDataBucket, redisHashBucketName(ns, meta.ID), nowMs); err != nil {
+			return false, err
+		}
+		if err = deleteRedisHashMetaTx(tx, ns, key); err != nil {
+			return false, err
+		}
+		removed = true
+	case redisKeyTypeZSet:
+		meta, found, err := loadRedisZSetMetaTx(tx, ns, key)
+		if err != nil || !found {
+			return false, err
+		}
+		if err = enqueueRedisObjectForDeletionTx(tx, ns, meta.StorageFormat, meta.ID, ns.zsetMemberBucket, redisZSetMemberBucketName(ns, meta.ID), nowMs); err != nil {
+			return false, err
+		}
+		if err = enqueueRedisObjectForDeletionTx(tx, ns, meta.StorageFormat, meta.ID, ns.zsetScoreBucket, redisZSetScoreBucketName(ns, meta.ID), nowMs); err != nil {
+			return false, err
+		}
+		if err = deleteRedisZSetMetaTx(tx, ns, key); err != nil {
+			return false, err
+		}
+		removed = true
+	case redisKeyTypeBloom:
+		meta, found, err := loadRedisBloomMetaTx(tx, ns, key)
+		if err != nil || !found {
+			return false, err
+		}
+		if err = enqueueRedisObjectForDeletionTx(tx, ns, meta.StorageFormat, meta.ID, ns.bloomDataBucket, redisBloomDataBucketName(ns, meta.ID), nowMs); err != nil {
+			return false, err
+		}
+		if err = deleteRedisBloomMetaTx(tx, ns, key); err != nil {
+			return false, err
+		}
+		removed = true
+	case redisKeyTypeTopK:
+		meta, found, err := loadRedisTopKMetaTx(tx, ns, key)
+		if err != nil || !found {
+			return false, err
+		}
+		if err = enqueueRedisObjectForDeletionTx(tx, ns, meta.StorageFormat, meta.ID, ns.topkDataBucket, redisTopKDataBucketName(ns, meta.ID), nowMs); err != nil {
+			return false, err
+		}
+		if err = deleteRedisTopKMetaTx(tx, ns, key); err != nil {
+			return false, err
+		}
+		removed = true
+	default:
+		return false, errors.New("unsupported redis key type")
+	}
+	if err := deleteRedisExpireAtMsTx(tx, ns, key); err != nil {
+		return false, err
+	}
+	return removed, nil
+}
+
+func redisKeyPhysicalDeleteShouldQueueTx(tx *storage.Tx, ns redisNamespace, key []byte, keyType string) (bool, error) {
+	const collectionRecordThreshold = uint64(4096)
+	switch keyType {
+	case redisKeyTypeString:
+		bucket, err := optionalRedisBucket(tx, ns.stringBucket)
+		if err != nil || bucket == nil {
+			return false, err
+		}
+		length, found, err := bucket.ValueLen(key)
+		return found && length > 4*1024*1024, err
+	case redisKeyTypeList:
+		meta, found, err := loadRedisListMetaTx(tx, ns, key)
+		return found && meta.Length > collectionRecordThreshold, err
+	case redisKeyTypeHash:
+		meta, found, err := loadRedisHashMetaTx(tx, ns, key)
+		return found && meta.FieldCount > collectionRecordThreshold, err
+	case redisKeyTypeZSet:
+		meta, found, err := loadRedisZSetMetaTx(tx, ns, key)
+		return found && meta.Cardinality > collectionRecordThreshold, err
+	case redisKeyTypeBloom:
+		meta, found, err := loadRedisBloomMetaTx(tx, ns, key)
+		return found && (meta.InitialCapacity > collectionRecordThreshold || meta.SubFilterCount > 4), err
+	case redisKeyTypeTopK:
+		meta, found, err := loadRedisTopKMetaTx(tx, ns, key)
+		if err != nil || !found {
+			return false, err
+		}
+		return meta.Width > 0 && meta.Depth > collectionRecordThreshold/meta.Width, nil
+	default:
+		return false, nil
+	}
+}
+
+func deleteRedisKeyAdaptivelyTx(tx *storage.Tx, ns redisNamespace, key []byte, keyType string, nowMs int64) (bool, error) {
+	queued, err := redisKeyPhysicalDeleteShouldQueueTx(tx, ns, key, keyType)
+	if err != nil {
+		return false, err
+	}
+	if queued {
+		return unlinkRedisKeyByRawTypeTx(tx, ns, key, keyType, nowMs)
+	}
+	return deleteRedisKeyByRawTypeTx(tx, ns, key, keyType)
+}
+
 func purgeExpiredRedisKeyTx(tx *storage.Tx, ns redisNamespace, key []byte, nowMs int64) (bool, error) {
 	expired, err := redisKeyExpiredTx(tx, ns, key, nowMs)
 	if err != nil || !expired {
@@ -299,7 +482,7 @@ func purgeExpiredRedisKeyTx(tx *storage.Tx, ns redisNamespace, key []byte, nowMs
 		return false, err
 	}
 
-	_, err = deleteRedisKeyByRawTypeTx(tx, ns, key, keyType)
+	_, err = unlinkRedisKeyByRawTypeTx(tx, ns, key, keyType, nowMs)
 	return true, err
 }
 
@@ -317,7 +500,7 @@ func redisExpireKeyAtTx(tx *storage.Tx, ns redisNamespace, key []byte, expireAtM
 	}
 
 	if expireAtMs <= nowMs {
-		_, err = deleteRedisKeyByRawTypeTx(tx, ns, key, keyType)
+		_, err = unlinkRedisKeyByRawTypeTx(tx, ns, key, keyType, nowMs)
 		if err != nil {
 			return 0, err
 		}
@@ -385,13 +568,33 @@ func redisTTLTx(tx *storage.Tx, ns redisNamespace, key []byte, nowMs int64) (int
 	return pttl / 1000, nil
 }
 
-func sweepExpiredRedisKeysTx(tx *storage.Tx, ns redisNamespace, nowMs int64, limit int) (int, error) {
+func redisExpiryDueTx(tx *storage.Tx, ns redisNamespace, nowMs int64) (bool, error) {
 	indexBucket, err := tx.GetBucket(ns.expireIndexBucket)
 	if errors.Is(err, storage.ErrBucketNotFound) {
-		return 0, nil
+		return false, nil
 	}
 	if err != nil {
-		return 0, err
+		return false, err
+	}
+	indexKey, _ := indexBucket.Cursor().First()
+	if indexKey == nil {
+		return false, nil
+	}
+	expireAtMs, _, err := decodeRedisExpireIndexKey(indexKey)
+	if err != nil {
+		return false, err
+	}
+	return expireAtMs <= nowMs, nil
+}
+
+func sweepExpiredRedisKeysBatchTx(tx *storage.Tx, ns redisNamespace, nowMs int64, limit int) (redisExpirySweepResult, error) {
+	var result redisExpirySweepResult
+	indexBucket, err := tx.GetBucket(ns.expireIndexBucket)
+	if errors.Is(err, storage.ErrBucketNotFound) {
+		return result, nil
+	}
+	if err != nil {
+		return result, err
 	}
 
 	entries := make([]redisExpireIndexEntry, 0)
@@ -399,9 +602,13 @@ func sweepExpiredRedisKeysTx(tx *storage.Tx, ns redisNamespace, nowMs int64, lim
 	for indexKey, _ := cursor.First(); indexKey != nil; indexKey, _ = cursor.Next() {
 		expireAtMs, key, decodeErr := decodeRedisExpireIndexKey(indexKey)
 		if decodeErr != nil {
-			return 0, decodeErr
+			return result, decodeErr
 		}
 		if expireAtMs > nowMs {
+			break
+		}
+		if limit > 0 && len(entries) >= limit {
+			result.MoreDue = true
 			break
 		}
 		entries = append(entries, redisExpireIndexEntry{
@@ -409,30 +616,33 @@ func sweepExpiredRedisKeysTx(tx *storage.Tx, ns redisNamespace, nowMs int64, lim
 			key:        key,
 			expireAtMs: expireAtMs,
 		})
-		if limit > 0 && len(entries) >= limit {
-			break
-		}
 	}
+	result.EntriesExamined = len(entries)
 
-	swept := 0
 	for _, entry := range entries {
 		expireAtMs, found, err := loadRedisExpireAtMsTx(tx, ns, entry.key)
 		if err != nil {
-			return swept, err
+			return result, err
 		}
 		if !found || expireAtMs != entry.expireAtMs {
 			if err = deleteRedisExpireIndexEntryTx(tx, ns, entry.indexKey); err != nil {
-				return swept, err
+				return result, err
 			}
+			result.StaleRemoved++
 			continue
 		}
 		if _, err = purgeExpiredRedisKeyTx(tx, ns, entry.key, nowMs); err != nil {
-			return swept, err
+			return result, err
 		}
-		swept++
+		result.KeysRemoved++
 	}
 
-	return swept, nil
+	return result, nil
+}
+
+func sweepExpiredRedisKeysTx(tx *storage.Tx, ns redisNamespace, nowMs int64, limit int) (int, error) {
+	result, err := sweepExpiredRedisKeysBatchTx(tx, ns, nowMs, limit)
+	return result.KeysRemoved, err
 }
 
 func SweepExpiredRedisDB(db *storage.DB, ns redisNamespace, nowMs int64, limit int) error {

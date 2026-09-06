@@ -16,6 +16,7 @@ Project contains:
  - Storage engine with BoltDB-like API
  - Database server
  - CLI client
+ - Kubernetes operator
 
 ## Features
 
@@ -51,14 +52,14 @@ as a production-grade database. Instead, it's a playground for those interested 
 exploring the inner workings of database management systems.
 
 ## Quick Start
-You need Go 1.22 or later to build PirinDB.
+You need Go 1.26 or later to build PirinDB.
 
 To build PirinDB server and client, run:
 
 ```bash
 $ make build
 ```
-It will create two binaries in the `bin` directory: `pirindb` and `pirindb-cli`.
+It creates three binaries in the `bin` directory: `pirindb`, `pirin-cli`, and `pirindb-operator`.
 
 To start the server, run:
 
@@ -81,11 +82,13 @@ Storage durability mode is also configurable:
 $ ./bin/pirindb --sync-policy=strict
 $ ./bin/pirindb --sync-policy=journal --checkpoint-tx-threshold=64
 $ ./bin/pirindb --sync-policy=group --group-commit-tx-threshold=16 --group-commit-window-ms=1
+$ ./bin/pirindb --node-cache-mb=64
 ```
 
 - `strict` is the default double-write mode: one durable journal sync and one durable main DB sync per write transaction.
 - `journal` keeps full crash recovery semantics, but only fsyncs the journal on each transaction and checkpoints the main DB file every `N` committed write transactions.
 - `group` batches concurrent write transactions into one durable flush group. Readers are held back until the batch becomes durable, so committed writers share one `txlog + db` sync cycle.
+- `node-cache-mb` bounds the shared immutable B-tree cache (32 MiB by default); set it to `0` for memory-constrained deployments.
 
 The same settings can be supplied via environment variables:
 
@@ -101,6 +104,11 @@ Internal cluster mode is also available for Redis traffic. It uses fixed hash sl
 enabled = true
 node_id = "node-a"
 topology_file = "/etc/pirindb/topology.toml"
+require_auth = true
+admin_token_file = "/run/secrets/pirindb/cluster-token"
+transfer_chunk_target_bytes = 33554432
+transfer_chunk_max_bytes = 67108864
+transfer_chunk_max_records = 65536
 ```
 
 Shared topology file:
@@ -135,13 +143,19 @@ In cluster mode:
 - Single-key requests are accepted only on the owning shard; other shards return `MOVED slot host:port`.
 - Multi-key Redis requests are accepted only when every key hashes to the same slot; otherwise PirinDB returns `CROSSSLOT`.
 - `KEYS`, `SCAN`, `DBSIZE`, `FLUSHDB`, and `FLUSHALL` operate on the local shard only.
-- Rebalancing is offline: writes are rejected with `TRYAGAIN` while a slot move is in progress.
+- Rebalancing streams bounded protocol-v2 frames while normal writes continue. Writes for the moving range are fenced only during final dirty-key catch-up and cutover.
+- Transfer requests target 32 MiB and stop at logical-key boundaries; every value frame is capped independently. If one indivisible logical key exceeds the 64 MiB request ceiling, it is streamed with bounded memory and reported through `oversized_logical_key_chunks` rather than materialized in RAM.
 - Nodes may exist in cluster metadata with zero owned slots. This is the expected starting state for a newly added shard before any slot ranges are moved onto it.
+- Cluster mode is sharding only: there is no shard replication or automatic failover. Losing a shard volume loses the slots stored on it.
+
+A runnable loopback three-node fixture is under [`examples/cluster`](examples/cluster/README.md). It includes a zero-slot third node for local rebalance testing and keeps generated databases out of version control.
+
+All mutating cluster endpoints and every internal endpoint require `Authorization: Bearer <token>` when authentication is enabled. Inter-node requests use the same credential automatically. Cluster HTTP communication is plain `http://` only and has no certificate configuration. See [Cluster Operations](docs/cluster-operations.md) for Kubernetes installation, credential rotation, storage retention, scaling, and the exact failure model. The verified v0.1 operating envelope and known limitations are recorded in the [cluster release notes](docs/cluster-release-v0.1.md).
 
 To start the CLI client, run:
 
 ```bash
-$ ./bin/pirindb-cli
+$ ./bin/pirin-cli
 ```
 
 CLI client provides a simple interface to interact with the server. It supports the following commands:
@@ -203,13 +217,28 @@ Cluster admin endpoints:
 - `GET /api/v1/cluster/topology`
 - `POST /api/v1/cluster/reconcile-topology`
 - `POST /api/v1/cluster/nodes/join`
+- `POST /api/v1/cluster/nodes/remove`
 - `POST /api/v1/cluster/rebalance/plan`
+- `POST /api/v1/cluster/rebalance/plan-for-node`
 - `POST /api/v1/cluster/rebalance/execute`
+- `POST /api/v1/cluster/rebalance/auto`
+- `POST /api/v1/cluster/rebalance/plan-drain-node`
+- `POST /api/v1/cluster/rebalance/drain`
+- `GET /api/v1/cluster/rebalance/auto/{jobID}`
+- `GET /api/v1/cluster/rebalance/drain/{jobID}`
 - `GET /api/v1/cluster/rebalance/{jobID}`
 
 `GET /api/v1/cluster/topology` returns the configured shared topology plus the current runtime topology hash/version stored in the DB.
 
 `POST /api/v1/cluster/reconcile-topology` applies the configured topology membership to the live runtime state without resetting slot ownership. This is the preferred way to add a new node after updating the shared topology file.
+When a topology file path is configured, PirinDB reloads that file from disk during `reconcile-topology`, so mounted ConfigMap updates become visible without restarting every shard first.
+
+`GET /api/v1/cluster/status` now includes machine-friendly `conditions` and per-node `node_statuses` summaries. The current condition set is:
+
+- `Available`
+- `TopologyAligned`
+- `Rebalancing`
+- `SlotBalanced`
 
 Join a new node before rebalancing any slots onto it:
 
@@ -232,15 +261,70 @@ The rebalance endpoints move one slot range from one shard to another. Submit `P
 }
 ```
 
-PirinDB copies the Redis keys in that slot range to the destination shard, updates cluster ownership metadata on all configured nodes, and then removes the old source copy.
+PirinDB stages and streams the Redis keys in that slot range, catches up compact dirty-key markers, verifies the destination, updates ownership on all nodes, and only then removes the old source copy.
+
+`POST /api/v1/cluster/rebalance/plan-for-node` computes a deterministic rebalance plan for a destination node. It gathers per-slot key and byte estimates concurrently from every current owner, validates a common epoch, balances estimated bytes first, and retains key and slot counts as guardrails. Missing metrics fail automatic planning; a manual request may explicitly set `allow_slot_count_fallback`. Example:
+
+```json
+{
+  "destination_node_id": "node-c",
+  "max_bytes_per_move": 67108864
+}
+```
+
+The response includes metric freshness, current/target slot, key, and byte counts, the weight metric used, and the exact contiguous slot ranges to move from each donor shard. Automatic scale and drain jobs require complete cluster-wide metrics, preserve the original move limits across restarts, and recalculate after every completed move.
+
+## Kubernetes operator
+
+Build versioned images, create the cluster credential, and install the generated CRD and operator:
+
+```bash
+$ docker build --target pirindb -t ghcr.io/timson/pirindb:v0.1.0 .
+$ docker build --target operator -t ghcr.io/timson/pirindb-operator:v0.1.0 .
+$ make generate-crd
+$ kubectl apply -k operator/manifests
+$ export PIRINDB_CLUSTER_ADMIN_TOKEN=local-cluster-admin-token
+$ kubectl -n default create secret generic demo-cluster-admin --from-literal=token="$PIRINDB_CLUSTER_ADMIN_TOKEN"
+$ kubectl apply -f operator/manifests/sample-cluster.yaml
+```
+
+`spec.adminSecretRef` is required. The operator performs unattended, restart-safe scale-up and drain-before-scale-down. Optional NetworkPolicy and PodDisruptionBudget examples are under `operator/manifests/`.
+
+`POST /api/v1/cluster/rebalance/auto` uses that same planner and then executes the planned moves sequentially by submitting rebalance jobs to the relevant source shards. Poll `GET /api/v1/cluster/rebalance/auto/{jobID}` until `status` becomes `done` or `failed`.
+
+Drain a node before removing it from the cluster:
+
+```json
+{
+  "node_id": "node-a"
+}
+```
+
+- `POST /api/v1/cluster/rebalance/plan-drain-node` returns the slot ranges required to drain that node.
+- `POST /api/v1/cluster/rebalance/drain` executes the drain sequentially and returns an auto-job.
+- poll `GET /api/v1/cluster/rebalance/drain/{jobID}` until it becomes `done`
+- after the node owns zero slots, `POST /api/v1/cluster/nodes/remove` can remove it from runtime membership
+
+Example remove request:
+
+```json
+{
+  "id": "node-a"
+}
+```
+
+For topology-managed clusters, remove the node from the shared topology file first and then call `POST /api/v1/cluster/reconcile-topology` or `POST /api/v1/cluster/nodes/remove`. Runtime removal is rejected while the node is still present in the configured topology.
 
 ## Redis Interface
 
-PirinDB now exposes a Redis-compatible RESP endpoint intended for simple cache and key-value integrations.
+PirinDB exposes a durable Redis-compatible RESP2 subset. Exact compatibility, durability, size limits, and unsupported command families are documented in [docs/redis-compatibility.md](docs/redis-compatibility.md).
 Currently supported commands are:
 
 - `ASKING`
+- `CLIENT GETNAME|ID|SETINFO|SETNAME`
 - `COMMAND`
+- `ECHO message`
+- `HELLO [2]`
 - `BF.ADD key item`
 - `BF.EXISTS key item`
 - `BF.MADD key item [item ...]`
@@ -249,7 +333,9 @@ Currently supported commands are:
 - `BLPOP key [key ...] timeout`
 - `BRPOPLPUSH source destination timeout`
 - `BRPOP key [key ...] timeout`
+- `CLUSTER INFO`
 - `CLUSTER KEYSLOT key`
+- `CLUSTER NODES`
 - `CLUSTER SHARDS`
 - `CLUSTER SLOTS`
 - `CONFIG GET pattern`
@@ -297,7 +383,6 @@ Currently supported commands are:
 - `RENAMENX key newkey`
 - `SCAN cursor [MATCH pattern] [COUNT n]`
 - `SELECT db`
-- `SSCAN key cursor [MATCH pattern] [COUNT n]`
 - `TTL key`
 - `TOPK.ADD key item [item ...]`
 - `TOPK.COUNT key item [item ...]`
@@ -317,11 +402,11 @@ Currently supported commands are:
 - `ZRANGEBYLEX key min max [LIMIT offset count]`
 - `ZRANGEBYSCORE key min max [LIMIT offset count]`
 - `ZSCORE key member`
-- `PIPELINE` / `MULTI`
-- `EXEC`
+- `MULTI` / `EXEC` / `DISCARD`
+- `PIRIN.BATCH` / `PIRIN.EXEC` / `PIRIN.DISCARD`
+- `PIRIN.CHECK`
 - `FLUSHALL`
 - `FLUSHDB`
-- `DISCARD`
 
 Example with `redis-cli`:
 
@@ -338,32 +423,32 @@ $ redis-cli -p 6379 GET hello
 (nil)
 ```
 
-Atomic batched execution:
+PirinDB rollback-on-any-error batch extension:
 
 ```bash
 $ redis-cli -p 6379
-127.0.0.1:6379> PIPELINE
+127.0.0.1:6379> PIRIN.BATCH
 OK
 127.0.0.1:6379> SET a 1
 QUEUED
 127.0.0.1:6379> GET a
 QUEUED
-127.0.0.1:6379> EXEC
+127.0.0.1:6379> PIRIN.EXEC
 1) "OK"
 2) "1"
 ```
 
 > [!NOTE]
-> `SSCAN` is implemented as a compatibility alias over PirinDB's single keyspace scan. PirinDB does not currently implement Redis set data types.
+> `SSCAN` is not advertised because PirinDB does not currently implement the Redis set type. It returns an unsupported-command error rather than scanning unrelated database keys.
 
 > [!NOTE]
-> `PIPELINE` and `MULTI` are aliases. Queued commands are executed atomically on `EXEC` inside one PirinDB transaction, and the whole batch is rolled back if any command fails.
+> Standard client pipelining requires no server command. `MULTI`/`EXEC` follows Redis queue-time and runtime-error behavior. PirinDB's rollback-on-any-error semantics are available only under the `PIRIN.BATCH` extension names shown above.
 
 > [!NOTE]
 > For write-heavy Redis workloads, `--sync-policy=journal` can significantly reduce per-command latency by checkpointing the main database file less often while keeping recovery through the durable journal.
 
 > [!NOTE]
-> `--sync-policy=group` is intended for concurrent write-heavy workloads. A single client issuing one write at a time may not benefit, because group commit needs overlapping writers to amortize the flush cost.
+> `--sync-policy=group` allows independently durable writes already buffered on one connection to share a flush. Replies remain ordered and are emitted only after their transactions are durable.
 
 > [!NOTE]
 > `BLPOP` and `BRPOP` are supported for queue-style consumers. They block the client connection until one of the requested lists receives a value or the timeout expires.
@@ -372,7 +457,7 @@ QUEUED
 > `RPOPLPUSH` and `BRPOPLPUSH` are supported for simple reliable-worker patterns: one connection can atomically move a job from `queue` into `processing`, so the job is no longer lost between pop and re-enqueue.
 
 > [!NOTE]
-> `KEYS`, `SCAN`, and `SSCAN` traverse the selected Redis DB keyspace and include string, list, hash, bloom, topk, and sorted-set keys. `SSCAN` remains a compatibility alias because PirinDB does not implement Redis set data types yet.
+> `KEYS` and `SCAN` traverse the selected Redis DB keyspace and include string, list, hash, Bloom, TopK, and sorted-set keys.
 
 > [!NOTE]
 > `CONFIG` is currently read-only in PirinDB. `CONFIG GET`, `CONFIG HELP`, and `CONFIG RESETSTAT` are supported; `CONFIG SET` and `CONFIG REWRITE` return an error.

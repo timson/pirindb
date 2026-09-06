@@ -220,6 +220,8 @@ func (srv *RedisServer) executeBlockingMove(selectedDB int, args [][]byte) (redi
 }
 
 func (srv *RedisServer) tryPopAny(selectedDB int, keys [][]byte, left bool) (redisBlockingPopResult, error) {
+	unlock := srv.mutationLocks.lockKeys(selectedDB, keys, false)
+	defer unlock()
 	ns := srv.redisNamespace(selectedDB)
 	nowMs := srv.nowUnixMilli()
 	var result redisBlockingPopResult
@@ -247,6 +249,8 @@ func (srv *RedisServer) tryPopAny(selectedDB int, keys [][]byte, left bool) (red
 }
 
 func (srv *RedisServer) tryMove(selectedDB int, source, destination []byte) (redisBlockingMoveResult, error) {
+	unlock := srv.mutationLocks.lockKeys(selectedDB, [][]byte{source, destination}, false)
+	defer unlock()
 	ns := srv.redisNamespace(selectedDB)
 	nowMs := srv.nowUnixMilli()
 	var result redisBlockingMoveResult

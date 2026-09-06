@@ -3,6 +3,7 @@ package storage
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"io"
 )
 
@@ -26,6 +27,7 @@ const (
 
 type Bucket struct {
 	name       []byte
+	nameKey    string
 	root       uint64
 	counter    uint64
 	itemsN     uint64
@@ -34,41 +36,79 @@ type Bucket struct {
 	tx         *Tx
 }
 
+func (bucket *Bucket) markDirty() {
+	if bucket == nil || bucket.tx == nil || len(bucket.name) == 0 {
+		return
+	}
+	if bucket.tx.dirtyBuckets == nil {
+		bucket.tx.dirtyBuckets = make(map[string]*Bucket)
+	}
+	bucket.tx.dirtyBuckets[bucket.nameKey] = bucket
+}
+
 func newBucket(name []byte) *Bucket {
+	ownedName := cloneBytes(name)
 	return &Bucket{
-		root: 0,
-		name: name,
+		root:    0,
+		name:    ownedName,
+		nameKey: string(ownedName),
 	}
 }
 
 func (bucket *Bucket) Get(key []byte) ([]byte, bool) {
+	value, found, err := bucket.GetE(key)
+	if err != nil && bucket != nil && bucket.tx != nil {
+		bucket.tx.recordError(err)
+	}
+	return value, found
+}
+
+func (bucket *Bucket) GetE(key []byte) ([]byte, bool, error) {
 	value, found, err := bucket.getItem(key)
 	if err != nil || !found {
-		return nil, false
+		if err != nil && bucket != nil && bucket.tx != nil && bucket.tx.write {
+			bucket.tx.recordError(err)
+		}
+		return nil, found, err
 	}
 	v, getErr := value.getValue(bucket.tx)
 	if getErr != nil {
-		return nil, false
+		if bucket.tx.write {
+			bucket.tx.recordError(getErr)
+		}
+		return nil, false, getErr
 	}
 
-	return v, true
+	return v, true, nil
 }
 
 func (bucket *Bucket) ValueLen(key []byte) (int, bool, error) {
 	item, found, err := bucket.getItem(key)
 	if err != nil || !found {
+		if err != nil && bucket != nil && bucket.tx != nil && bucket.tx.write {
+			bucket.tx.recordError(err)
+		}
 		return 0, found, err
 	}
 	valueLen, err := item.valueLen(bucket.tx)
 	if err != nil {
+		if bucket.tx.write {
+			bucket.tx.recordError(err)
+		}
 		return 0, false, err
 	}
 	return valueLen, true, nil
 }
 
 func (bucket *Bucket) WriteValueTo(key []byte, w io.Writer) (int64, bool, error) {
+	if w == nil {
+		return 0, false, fmt.Errorf("value writer is nil")
+	}
 	item, found, err := bucket.getItem(key)
 	if err != nil || !found {
+		if err != nil && bucket != nil && bucket.tx != nil && bucket.tx.write {
+			bucket.tx.recordError(err)
+		}
 		return 0, found, err
 	}
 	written, err := item.writeValueTo(bucket.tx, w)
@@ -79,8 +119,8 @@ func (bucket *Bucket) WriteValueTo(key []byte, w io.Writer) (int64, bool, error)
 }
 
 func (bucket *Bucket) getItem(key []byte) (*Item, bool, error) {
-	if bucket.tx == nil {
-		return nil, false, ErrTxClosed
+	if err := bucket.ensureOpen(); err != nil {
+		return nil, false, err
 	}
 	if bucket.root == 0 {
 		return nil, false, nil
@@ -89,7 +129,10 @@ func (bucket *Bucket) getItem(key []byte) (*Item, bool, error) {
 	if err != nil {
 		return nil, false, err
 	}
-	pos, foundNode, found := node.FindExact(bucket.tx, key)
+	pos, foundNode, found, findErr := node.FindExactE(bucket.tx, key)
+	if findErr != nil {
+		return nil, false, findErr
+	}
 	if !found {
 		return nil, false, nil
 	}
@@ -113,51 +156,63 @@ func (bucket *Bucket) serialize() *Item {
 	return &Item{bucket.name, b}
 }
 
-func (bucket *Bucket) deserialize(data []byte) {
-	if len(data) != 0 {
-		bucket.root = binary.LittleEndian.Uint64(data[BucketRootOffset:])
-		bucket.counter = binary.LittleEndian.Uint64(data[BucketCounterOffset:])
-		bucket.itemsN = binary.LittleEndian.Uint64(data[BucketItemNOffset:])
-		bucket.blobsN = binary.LittleEndian.Uint64(data[BucketBlobNOffset:])
-		bucket.bytesInUse = binary.LittleEndian.Uint64(data[BucketBytesInUseOffset:])
+func (bucket *Bucket) deserialize(data []byte) error {
+	if len(data) != BucketTotalSize {
+		return fmt.Errorf("%w: bucket descriptor has %d bytes, expected %d", ErrCorruptedNode, len(data), BucketTotalSize)
 	}
+	bucket.root = binary.LittleEndian.Uint64(data[BucketRootOffset:])
+	bucket.counter = binary.LittleEndian.Uint64(data[BucketCounterOffset:])
+	bucket.itemsN = binary.LittleEndian.Uint64(data[BucketItemNOffset:])
+	bucket.blobsN = binary.LittleEndian.Uint64(data[BucketBlobNOffset:])
+	bucket.bytesInUse = binary.LittleEndian.Uint64(data[BucketBytesInUseOffset:])
+	minimumRoot := uint64(legacyRootPageNumber)
+	if bucket.tx != nil && bucket.tx.db != nil && bucket.tx.db.dal.pageChecksums {
+		minimumRoot = rootPageNumber
+	}
+	if bucket.root < minimumRoot {
+		return fmt.Errorf("%w: invalid bucket root %d", ErrCorruptedNode, bucket.root)
+	}
+	if bucket.tx != nil && bucket.tx.db != nil && bucket.tx.db.dal != nil {
+		dal := bucket.tx.db.dal
+		if bucket.root >= dal.maxPages || bucket.root > dal.freelist.currentPage || dal.freelist.containsReleasedPage(bucket.root) || dal.freelist.isFreelistStoragePage(bucket.root) {
+			return fmt.Errorf("%w: bucket root %d is not a live data page", ErrCorruptedNode, bucket.root)
+		}
+	}
+	return nil
 }
 
-func (bucket *Bucket) getNodes(indexes []int) ([]*BNode, error) {
-	root, err := bucket.tx.getNode(bucket.root)
-	if err != nil {
-		return nil, err
-	}
-
-	nodes := []*BNode{root}
-	child := root
-	for i := 1; i < len(indexes); i++ {
-		if indexes[i] < 0 || indexes[i] >= len(child.childNodes) {
-			return nil, ErrNodeNotFound
-		}
-		child, err = bucket.tx.getNode(child.childNodes[indexes[i]])
-		if err != nil {
-			return nil, err
-		}
-		nodes = append(nodes, child)
-	}
-	return nodes, nil
-}
-
-func (bucket *Bucket) Put(key, value []byte) error {
-	item := Item{
-		Key:   key,
-		Value: value,
-	}
-	if err := item.setValue(bucket.tx); err != nil {
+func (bucket *Bucket) Put(key, value []byte) (returnErr error) {
+	if err := bucket.ensureWritable(); err != nil {
 		return err
 	}
-	return bucket.putEncodedValue(key, item.Value, len(value), len(value) > MaxValueSize)
+	if len(key) >= MaxKeySize {
+		return ErrKeyTooLarge
+	}
+	if len(value) >= OneGigabyte {
+		return ErrValueTooLarge
+	}
+	defer func() {
+		if returnErr != nil {
+			bucket.tx.recordError(returnErr)
+		}
+	}()
+	item := Item{Value: value}
+	if returnErr = item.setValue(bucket.tx); returnErr != nil {
+		return returnErr
+	}
+	returnErr = bucket.putEncodedValue(key, item.Value, len(value), len(value) > MaxValueSize)
+	if returnErr == nil {
+		returnErr = bucket.tx.ensureDirtyLimit()
+	}
+	if returnErr == nil {
+		bucket.markDirty()
+	}
+	return returnErr
 }
 
-func (bucket *Bucket) PutReader(key []byte, r io.Reader, valueLen int64) error {
-	if bucket.tx == nil {
-		return ErrTxClosed
+func (bucket *Bucket) PutReader(key []byte, r io.Reader, valueLen int64) (returnErr error) {
+	if err := bucket.ensureWritable(); err != nil {
+		return err
 	}
 	if len(key) >= MaxKeySize {
 		return ErrKeyTooLarge
@@ -168,6 +223,14 @@ func (bucket *Bucket) PutReader(key []byte, r io.Reader, valueLen int64) error {
 	if valueLen >= OneGigabyte {
 		return ErrValueTooLarge
 	}
+	if r == nil {
+		return fmt.Errorf("value reader is nil")
+	}
+	defer func() {
+		if returnErr != nil {
+			bucket.tx.recordError(returnErr)
+		}
+	}()
 	if valueLen <= MaxValueSize {
 		buf := make([]byte, int(valueLen))
 		if _, err := io.ReadFull(r, buf); err != nil {
@@ -183,7 +246,14 @@ func (bucket *Bucket) PutReader(key []byte, r io.Reader, valueLen int64) error {
 	encodedValue := make([]byte, 1+UInt64Size)
 	encodedValue[0] = ValueBlob
 	binary.LittleEndian.PutUint64(encodedValue[1:], pageNum)
-	return bucket.putEncodedValue(key, encodedValue, int(valueLen), true)
+	returnErr = bucket.putEncodedValue(key, encodedValue, int(valueLen), true)
+	if returnErr == nil {
+		returnErr = bucket.tx.ensureDirtyLimit()
+	}
+	if returnErr == nil {
+		bucket.markDirty()
+	}
+	return returnErr
 }
 
 func (bucket *Bucket) putEncodedValue(key []byte, encodedValue []byte, logicalValueLen int, newIsBlob bool) error {
@@ -192,8 +262,8 @@ func (bucket *Bucket) putEncodedValue(key []byte, encodedValue []byte, logicalVa
 	var keyExists bool
 	newValueLen := logicalValueLen
 
-	if bucket.tx == nil {
-		return ErrTxClosed
+	if err := bucket.ensureWritable(); err != nil {
+		return err
 	}
 	if len(key) >= MaxKeySize {
 		return ErrKeyTooLarge
@@ -203,13 +273,19 @@ func (bucket *Bucket) putEncodedValue(key []byte, encodedValue []byte, logicalVa
 	}
 
 	item := Item{
-		Key:   key,
+		Key: cloneBytes(key),
+		// Both callers pass a newly allocated encoded value. Taking ownership
+		// avoids copying every value a second time while still isolating the
+		// stored item from caller-owned key/value buffers.
 		Value: encodedValue,
 	}
 
 	// First insert: no root exists yet. Create a root node and set it
 	if bucket.root == 0 {
-		root = bucket.tx.newNode([]*Item{&item}, []uint64{})
+		root, err = bucket.tx.newNode([]*Item{&item}, []uint64{})
+		if err != nil {
+			return err
+		}
 		bucket.tx.setNode(root)
 		bucket.root = root.PageNum
 		bucket.itemsN++
@@ -227,9 +303,15 @@ func (bucket *Bucket) putEncodedValue(key []byte, encodedValue []byte, logicalVa
 	}
 
 	// Traverse the tree to find the target node and index for insertion
-	insertionIndex, nodeToInsertIn, breadcrumbs, found := root.Find(bucket.tx, item.Key, false)
+	insertionIndex, nodeToInsertIn, breadcrumbs, nodesAlongPath, found, findErr := root.findPathReuseE(bucket.tx, item.Key, false)
+	if findErr != nil {
+		return findErr
+	}
 	if !found {
 		return ErrNodeNotFound
+	}
+	if nodeToInsertIn == nil || insertionIndex < 0 || insertionIndex > len(nodeToInsertIn.items) {
+		return fmt.Errorf("%w: invalid insertion result", ErrCorruptedNode)
 	}
 
 	// If the key already exists, update the value
@@ -260,28 +342,37 @@ func (bucket *Bucket) putEncodedValue(key []byte, encodedValue []byte, logicalVa
 	}
 	bucket.tx.setNode(nodeToInsertIn)
 
-	// Fetch all ancestor nodes along the path (breadcrumbs) to rebalance if needed
-	nodesAlongPath, err := bucket.getNodes(breadcrumbs)
-	if err != nil {
-		return err
-	}
-
 	// Rebalance from bottom-up, excluding root
 	for i := len(nodesAlongPath) - 2; i >= 0; i-- {
 		parentNode := nodesAlongPath[i]
 		node := nodesAlongPath[i+1]
 		nodeIndex := breadcrumbs[i+1]
-		if node.isOverPopulated(bucket.tx.db.dal.maxThreshold()) {
-			parentNode.splitChild(bucket.tx, node, nodeIndex)
+		overPopulated, sizeErr := node.isOverPopulated(bucket.tx.db.dal.maxThreshold())
+		if sizeErr != nil {
+			return sizeErr
+		}
+		if overPopulated {
+			if splitErr := parentNode.splitChild(bucket.tx, node, nodeIndex); splitErr != nil {
+				return splitErr
+			}
 		}
 	}
 
 	// Re-check root in case it was affected and needs splitting
 	rootNode := nodesAlongPath[0]
-	if rootNode.isOverPopulated(bucket.tx.db.dal.maxThreshold()) {
-		newRoot := bucket.tx.newNode([]*Item{}, []uint64{rootNode.PageNum})
+	rootOverPopulated, sizeErr := rootNode.isOverPopulated(bucket.tx.db.dal.maxThreshold())
+	if sizeErr != nil {
+		return sizeErr
+	}
+	if rootOverPopulated {
+		newRoot, newRootErr := bucket.tx.newNode([]*Item{}, []uint64{rootNode.PageNum})
+		if newRootErr != nil {
+			return newRootErr
+		}
 		logger.Debug("splitChild root node", "oldPageNum", rootNode.PageNum, "newPageNum", newRoot.PageNum)
-		newRoot.splitChild(bucket.tx, rootNode, 0)
+		if splitErr := newRoot.splitChild(bucket.tx, rootNode, 0); splitErr != nil {
+			return splitErr
+		}
 
 		// commit newly created root
 		bucket.tx.setNode(newRoot)
@@ -310,9 +401,9 @@ func (bucket *Bucket) putEncodedValue(key []byte, encodedValue []byte, logicalVa
 	return nil
 }
 
-func (bucket *Bucket) Remove(key []byte) error {
-	if bucket.tx == nil {
-		return ErrTxClosed
+func (bucket *Bucket) Remove(key []byte) (returnErr error) {
+	if err := bucket.ensureWritable(); err != nil {
+		return err
 	}
 	if bucket.root == 0 {
 		return ErrNodeNotFound
@@ -324,15 +415,25 @@ func (bucket *Bucket) Remove(key []byte) error {
 	}
 
 	// Search for the key and collect the path (nodesAlongPath) to the node
-	removeItemIndex, nodeToRemoveFrom, breadcrumbs, found := rootNode.Find(bucket.tx, key, true)
+	removeItemIndex, nodeToRemoveFrom, breadcrumbs, nodesAlongPath, found, findErr := rootNode.findPathReuseE(bucket.tx, key, true)
+	if findErr != nil {
+		return findErr
+	}
 	if !found {
 		return ErrNodeNotFound
 	}
 
-	// Defensive check: key was found, but index is invalid.
-	if removeItemIndex == -1 {
-		return nil
+	// Defensive check: key was reported found, but the result is malformed.
+	if nodeToRemoveFrom == nil || removeItemIndex < 0 || removeItemIndex >= len(nodeToRemoveFrom.items) {
+		err = fmt.Errorf("%w: invalid removal result", ErrCorruptedNode)
+		bucket.tx.recordError(err)
+		return err
 	}
+	defer func() {
+		if returnErr != nil {
+			bucket.tx.recordError(returnErr)
+		}
+	}()
 
 	// Attempt to delete the blob before removing the item
 	item := nodeToRemoveFrom.items[removeItemIndex]
@@ -346,27 +447,27 @@ func (bucket *Bucket) Remove(key []byte) error {
 		nodeToRemoveFrom.removeItemAtLeaf(removeItemIndex)
 	} else {
 		// If it's an internal node, handle deletion and restructure as needed
-		affectedNodes, removeErr := nodeToRemoveFrom.removeItemFromInternal(bucket.tx, removeItemIndex)
+		affectedIndexes, predecessorPath, removeErr := nodeToRemoveFrom.removeItemFromInternal(bucket.tx, removeItemIndex)
 		if removeErr != nil {
 			return removeErr
 		}
 		// Add any affected child nodes to the breadcrumb path
-		breadcrumbs = append(breadcrumbs, affectedNodes...)
+		breadcrumbs = append(breadcrumbs, affectedIndexes...)
+		nodesAlongPath = append(nodesAlongPath, predecessorPath...)
 	}
 
 	// Persist the updated node in the transaction state
 	bucket.tx.setNode(nodeToRemoveFrom)
 
-	nodesAlongPath, err := bucket.getNodes(breadcrumbs)
-	if err != nil {
-		return err
-	}
-
 	// Rebalance from the bottom-up (excluding the root node)
 	for i := len(nodesAlongPath) - 2; i >= 0; i-- {
 		parentNode := nodesAlongPath[i]
 		node := nodesAlongPath[i+1]
-		if node.isUnderPopulated(bucket.tx.db.dal.minThreshold()) {
+		underPopulated, sizeErr := node.isUnderPopulated(bucket.tx.db.dal.minThreshold())
+		if sizeErr != nil {
+			return sizeErr
+		}
+		if underPopulated {
 			err = parentNode.rebalanceRemove(bucket.tx, node, breadcrumbs[i+1])
 			if err != nil {
 				return err
@@ -378,7 +479,10 @@ func (bucket *Bucket) Remove(key []byte) error {
 	rootNode = nodesAlongPath[0]
 	if len(rootNode.items) == 0 && len(rootNode.childNodes) > 0 {
 		oldRootPage := rootNode.PageNum
-		bucket.root = nodesAlongPath[1].PageNum
+		if len(rootNode.childNodes) != 1 {
+			return ErrCorruptedNode
+		}
+		bucket.root = rootNode.childNodes[0]
 		bucket.tx.deletePage(oldRootPage)
 		if bucket.tx.db.dal.meta.root == oldRootPage {
 			bucket.tx.db.dal.meta.root = bucket.root
@@ -406,38 +510,55 @@ func (bucket *Bucket) Remove(key []byte) error {
 		}
 	}
 
-	return nil
+	returnErr = bucket.tx.ensureDirtyLimit()
+	if returnErr == nil {
+		bucket.markDirty()
+	}
+	return returnErr
 }
 
 func (bucket *Bucket) Cursor() *Cursor {
+	if bucket == nil {
+		return &Cursor{err: ErrTxClosed}
+	}
 	return &Cursor{bucket: bucket, tx: bucket.tx}
 }
 
 func (bucket *Bucket) ForEach(fn func(k, v []byte) error) error {
+	if fn == nil {
+		return fmt.Errorf("foreach callback is nil")
+	}
 	cursor := bucket.Cursor()
 	for k, v := cursor.First(); k != nil; k, v = cursor.Next() {
 		if err := fn(k, v); err != nil {
 			return err
 		}
 	}
-	return nil
+	return cursor.Err()
 }
 
 func (bucket *Bucket) NextSequence() (uint64, error) {
-	if bucket.tx == nil {
-		return 0, ErrTxClosed
+	if err := bucket.ensureWritable(); err != nil {
+		return 0, err
 	}
-	if !bucket.tx.write {
-		return 0, ErrWriteInRxTransaction
+	if bucket.counter == ^uint64(0) {
+		return 0, fmt.Errorf("bucket sequence overflow")
 	}
 	bucket.counter++
+	bucket.markDirty()
 	return bucket.counter, nil
 }
 
 func (bucket *Bucket) Sequence() uint64 {
+	if bucket == nil {
+		return 0
+	}
 	return bucket.counter
 }
 
 func (bucket *Bucket) ItemCount() uint64 {
+	if bucket == nil {
+		return 0
+	}
 	return bucket.itemsN
 }
