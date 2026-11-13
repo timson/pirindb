@@ -41,9 +41,8 @@ the release notes. Database test reports are local artifacts, not release assets
 
 For cluster releases, also validate generated CRDs/Kustomize manifests, transfer
 fuzzing, disposable kind E2E tests, scaling/drain, and restart preservation with
-the production images. See [cluster operations](cluster-operations.md) and the
-[cluster release envelope](cluster-release-v0.1.md). Cluster mode has no shard
-replication or automatic failover; losing a shard volume requires recovery from
+the production images. See the [cluster guide](cluster.md). Cluster mode has no
+shard replication or automatic failover; losing a shard volume requires recovery from
 backup. Coordinated cluster-wide point-in-time restore remains unsupported.
 
 The one-hour extended and full 24-hour local soak profiles must be recorded as

@@ -201,9 +201,7 @@ experiments. `examples/cluster/` contains local cluster configurations.
 
 ## Cluster and releases
 
-- [Cluster setup examples](examples/cluster/README.md)
-- [Cluster operations](docs/cluster-operations.md)
-- [Sharded cluster operating envelope](docs/cluster-release-v0.1.md)
+- [Cluster guide: local setup, Kubernetes, scaling, compatibility, and recovery](docs/cluster.md)
 - [Release preparation and qualification](docs/releasing.md)
 - [Changelog](CHANGELOG.md)
 
