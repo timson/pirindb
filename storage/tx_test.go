@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -27,6 +28,7 @@ func TestTxRollbackCreateBucket(t *testing.T) {
 	tx.Rollback()
 
 	tx = db.Begin(false)
+	defer tx.Rollback()
 	bucket, err = tx.GetBucket([]byte("test"))
 	require.Error(t, err)
 }
@@ -331,4 +333,68 @@ func TestDeleteBucketAfterReadOrWriteInSameTx(t *testing.T) {
 		return nil
 	})
 	require.NoError(t, err)
+}
+
+func TestCommitAsyncPublishesOrderedGroupTransactionsBeforeWaiting(t *testing.T) {
+	path := TempFileName(".db")
+	opts := DefaultOptions().
+		WithSyncPolicy(SyncPolicyGroup).
+		WithGroupCommitTxThreshold(8).
+		WithGroupCommitWindow(time.Second)
+	db, err := Open(path, opts)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_ = db.Close()
+		_ = os.Remove(path)
+		_ = os.Remove(opts.TxLogPath)
+	})
+
+	futures := make([]*CommitFuture, 0, 8)
+	started := time.Now()
+	for idx := 0; idx < 8; idx++ {
+		tx := db.Begin(true)
+		bucket, createErr := tx.CreateBucketIfNotExists([]byte("async"))
+		require.NoError(t, createErr)
+		require.NoError(t, bucket.Put([]byte(fmt.Sprintf("%02d", idx)), []byte("value")))
+		futures = append(futures, tx.CommitAsync())
+	}
+	require.Less(t, time.Since(started), 500*time.Millisecond, "submissions should not wait for the group window")
+	for _, future := range futures {
+		require.NoError(t, future.Wait())
+		require.NoError(t, future.Wait(), "commit futures must support repeated waits")
+	}
+	require.Equal(t, uint64(1), db.GroupCommitBatchCount())
+	require.NoError(t, db.View(func(tx *Tx) error {
+		bucket, getErr := tx.GetBucket([]byte("async"))
+		if getErr != nil {
+			return getErr
+		}
+		require.Equal(t, uint64(8), bucket.ItemCount())
+		return nil
+	}))
+}
+
+func TestCommitAsyncCompletesForEarlyCommitReturns(t *testing.T) {
+	db, _ := CreateTestDB(t)
+
+	readFuture := db.Begin(false).CommitAsync()
+	require.NoError(t, waitCommitFuture(t, readFuture))
+
+	closedTx := db.Begin(true)
+	closedTx.Rollback()
+	closedFuture := closedTx.CommitAsync()
+	require.ErrorIs(t, waitCommitFuture(t, closedFuture), ErrTxClosed)
+}
+
+func waitCommitFuture(t *testing.T, future *CommitFuture) error {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() { done <- future.Wait() }()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(time.Second):
+		t.Fatal("commit future did not complete")
+		return nil
+	}
 }

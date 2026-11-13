@@ -5,8 +5,8 @@ import (
 	"encoding/json"
 	"github.com/stretchr/testify/require"
 	"net/http"
-	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/timson/pirindb/storage"
@@ -14,7 +14,8 @@ import (
 
 func setupTestServer(t *testing.T) (*Server, string, string) {
 	t.Helper()
-	filename := "test.db"
+	dir := t.TempDir()
+	filename := filepath.Join(dir, "test.db")
 
 	cfg := &Config{
 		Server: &ServerConfig{
@@ -22,19 +23,30 @@ func setupTestServer(t *testing.T) (*Server, string, string) {
 			Port:     0, // random port
 			LogLevel: "ERROR",
 		},
-		DB: &DatabaseConfig{Filename: filename},
+		DB: &DatabaseConfig{
+			AdminToken: "test-database-admin", BackupDirectory: os.TempDir(), RestoreEnabled: true,
+			Filename:               filename,
+			SyncPolicy:             "strict",
+			CheckpointTxThreshold:  64,
+			GroupCommitTxThreshold: 16,
+			GroupCommitWindowMs:    1,
+		},
 	}
 
 	logger := createLogger(cfg.Server.LogLevel)
 	storage.SetLogger(logger)
 
-	_ = os.Remove("test.db")
-	db, err := storage.Open("test.db", nil)
+	db, err := storage.Open(filename, cfg.DB.StorageOptions())
 	if err != nil {
 		t.Fatalf("failed to open DB: %v", err)
 	}
+	srv := NewServer(cfg, db, logger)
+	t.Cleanup(func() {
+		_ = srv.Stop()
+		_ = db.Close()
+	})
 
-	return NewServer(cfg, db, logger), filename, db.GetOptions().TxLogPath
+	return srv, filename, db.GetOptions().TxLogPath
 }
 
 func TestCRUD(t *testing.T) {
@@ -45,8 +57,7 @@ func TestCRUD(t *testing.T) {
 	})
 
 	router := srv.buildRouter()
-	ts := httptest.NewServer(router)
-	defer ts.Close()
+	ts := newLocalTestHTTPServer(t, router)
 
 	key := "foo"
 	value := "bar"
@@ -97,8 +108,7 @@ func TestHealthCheck(t *testing.T) {
 	})
 
 	router := srv.buildRouter()
-	ts := httptest.NewServer(router)
-	defer ts.Close()
+	ts := newLocalTestHTTPServer(t, router)
 
 	resp, err := http.Get(ts.URL + "/health")
 	require.NoError(t, err)

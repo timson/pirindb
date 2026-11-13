@@ -1,24 +1,15 @@
 package storage
 
 import (
-	"github.com/stretchr/testify/require"
-	"math/rand"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/stretchr/testify/require"
 )
 
 var letters = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
-
-func randSeq(n int) string {
-	b := make([]rune, n)
-	for i := range b {
-		b[i] = letters[rand.Intn(len(letters))]
-	}
-	return string(b)
-}
 
 func TempFileName(suffix string) string {
 	return filepath.Join(os.TempDir(), uuid.New().String()+suffix)

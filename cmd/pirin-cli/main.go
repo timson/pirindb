@@ -7,9 +7,8 @@ import (
 )
 
 type Settings struct {
-	Host     string
-	Port     int
-	UseHTTPS bool
+	Host string
+	Port int
 }
 
 const (
@@ -42,8 +41,6 @@ func main() {
 
 	rootCmd.PersistentFlags().StringVar(&settings.Host, "host", "localhost", "Hostname for the server")
 	rootCmd.PersistentFlags().IntVar(&settings.Port, "port", 4321, "Port for the server")
-	rootCmd.PersistentFlags().BoolVar(&settings.UseHTTPS, "https", false, "Use HTTPS protocol")
-
 	for _, cmd := range CommandsRegistry {
 		command := cmd
 		rootCmd.AddCommand(&cobra.Command{

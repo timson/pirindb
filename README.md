@@ -1,202 +1,217 @@
 # PirinDB
 
-<img src="images/pirindb_logo.png" alt="PirinDB Logo" width="200">
+<img src="images/pirindb_logo.png" alt="PirinDB logo" width="200">
 
-**PirinDB** is a lightweight key-value database developed as a personal project to deepen my 
-understanding of database internals.  
-Storage engine is partial based on the implementation of [**LibraDB**](https://github.com/amit-davidson/LibraDB), 
-following the excellent article, and draws further inspiration from Alex Petrov’s [book](https://www.amazon.com/Database-Internals-Deep-Distributed-Systems/dp/1492040347) 
-and [**BoltDB**](https://github.com/boltdb/bolt) internals. **PirinDB** provides an approachable way to explore how B+Tree-based storage engines
-work under the hood.
+PirinDB is a Go key-value database with an embedded B-tree storage engine, an
+HTTP server, a Redis-compatible RESP2 interface, a CLI client, and a Kubernetes
+operator for sharding.
 
-Another goal of the project is to develop database server with simple HTTP API, with sharding and 
-replication support, to play with concepts of distributed systems.
+This is an experimental database. Local correctness tests are available, but
+production qualification requires sustained testing on the intended storage and
+verified restore drills. Cluster mode provides sharding, without replication or
+automatic failover.
 
-Project contains:
- - Storage engine with BoltDB-like API
- - Database server
- - CLI client
+## Build and run
 
-## Features
+Use Go 1.26 or later; the module requirement is in [go.mod](go.mod).
 
-**Storage Engine Features:**
-
-- **Small Codebase:** Designed to be easily readable.
-- **BoltDB like API:** Easy to integrate and experiment with.
-- **Persistence:** Data is stored on disk.
-- **Simple Transactional Support:** Ensures data consistency.
-- **Dynamic Freelist Management:** Automatic allocation and reuse of storage pages.
-- **Bucket Management:** Tools for organizing and managing buckets.
-- **Basic Cursor and Range Scanning:** Provides mechanisms to iterate over data ranges efficiently.
-- **View/Update Syntax Sugar:** Convenient API methods to simplify database interactions.
-- [x] **Blob Storage:** Supports for BLOBs.
-- [x] ~~**Copy on-write:** Support for copy-on-write~~ **Double write** (last transaction log) for data consistency and recovery.
-- [ ] **Simple ORM:** Basic object-relational mapping layer for data structures.
-- [x] **Statistics:** Built-in statistics.
-
-**Database server:**
-
-- [x] Simple HTTP server
-- [x] Basic key-value operations
-- [ ] Multi-key operations
-- [ ] Range scanning operations
-- [ ] Sharding support (naive or consistent hashing)
-- [ ] Replication support
-
-## Project Status
-
-**PirinDB** is intended purely as a hobby and educational project. It is not designed to be used  
-as a production-grade database. Instead, it's a playground for those interested in learning and  
-exploring the inner workings of database management systems.
-
-## Quick Start
-You need Go 1.22 or later to build PirinDB.
-
-To build PirinDB server and client, run:
-
-```bash
-$ make build
-```
-It will create two binaries in the `bin` directory: `pirindb` and `pirindb-cli`.
-
-To start the server, run:
-
-```bash
-$ ./bin/pirindb
-```
-It will run the server on port 4321, and you can access the server at `http://localhost:4321`.
-Database file (by default **pirin.db**) is stored in the current directory.
-
-To start the CLI client, run:
-
-```bash
-$ ./bin/pirindb-cli
+```sh
+make build
+./bin/pirindb
 ```
 
-CLI client provides a simple interface to interact with the server. It supports the following commands:
-- `get <key>`: Retrieves the value for the provided key.
-- `set <key> <value>`: Sets the value for the provided key.
-- `delete <key>`: Deletes the key-value pair.
-- `status`: Retrieves the server status.
-- `help`: Displays the help message.
+The build produces `pirindb`, `pirin-cli`, and `pirindb-operator` in `bin/`.
+By default the server listens on `127.0.0.1:4321` for HTTP and
+`127.0.0.1:6379` for RESP2. A new database uses `pirin.db` and
+`pirin.db.tlog` in the working directory. Existing legacy journal paths are
+detected; read the [migration guide](docs/storage-safety-operations.md) before
+opening an existing database with this version.
 
-
-
-## Storage API Quick Start
-
-To start using pirindb storage engine, you need install the package:
-
-```bash
-$ go get github.com/timson/pirindb/storage/...
+```sh
+./bin/pirindb --help
+./bin/pirindb --db /data/pirin.db --redis-enabled=false
+./bin/pirindb --sync-policy=group --group-commit-tx-threshold=16 --group-commit-window-ms=1
+./bin/pirin-cli --help
 ```
 
-```Go
+Configuration can be supplied through a TOML file (`--config`) and environment
+variables prefixed with `PIRINDB_`. For example:
+
+```sh
+PIRINDB_DB_SYNC_POLICY=journal PIRINDB_DB_CHECKPOINT_TX_THRESHOLD=64 ./bin/pirindb
+```
+
+Storage sync policies:
+
+- `strict` syncs the WAL body, publishes and syncs its commit header, then writes
+  and syncs the main database before acknowledging the transaction.
+- `journal` preserves acknowledged writes in the synced WAL and checkpoints the
+  main database according to its threshold and journal-size limits.
+- `group` batches independent transactions into a shared durable flush. Readers
+  wait for publication, and callers must wait for commit futures before treating
+  asynchronous writes as acknowledged.
+
+The shared node cache defaults to 32 MiB and can be configured with
+`--node-cache-mb`. Writes are serialized; long read transactions, including
+snapshot exports, block writers.
+
+## Server interfaces
+
+The HTTP API provides:
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| GET | `/health` | Lifecycle and fatal-storage health |
+| GET | `/api/v1/kv/{key}` | Read a value |
+| POST | `/api/v1/kv/{key}` | Store a plain-text value |
+| DELETE | `/api/v1/kv/{key}` | Delete a value |
+| GET | `/api/v1/db/status` | Database statistics |
+| POST | `/api/v1/db/export` | Start a logical snapshot export |
+| POST | `/api/v1/db/import` | Start a maintenance restore |
+| GET | `/api/v1/db/jobs/{jobID}` | Read transfer job status |
+
+```sh
+curl -X POST --data-binary 'hello' http://127.0.0.1:4321/api/v1/kv/example
+curl http://127.0.0.1:4321/api/v1/kv/example
+```
+
+Transfer administration requires a configured `db.admin_token` and
+`Authorization: Bearer <token>`. Paths are server-local and must remain inside
+`db.backup_directory`. Live imports additionally require `db.restore_enabled`,
+standalone mode, and the Redis listener disabled. A `202 Accepted` response means
+the job was queued; poll the authenticated job endpoint for completion.
+
+For exports, the JSON request is:
+
+```json
+{"path":"/backups/pirin.snapshot","scope":"db","overwrite":false}
+```
+
+Bucket exports use `"scope":"bucket"` and `"bucket":"users"`. Imports replace
+all database buckets or the selected target bucket. Follow the
+[backup and restore guide](docs/storage-safety-operations.md) for configuration,
+sequence-preserving snapshots, and recovery procedures.
+
+The RESP2 server implements strings, lists, hashes, sorted sets, Bloom filters,
+TopK sketches, expiry, transactions, and pipelines. It implements a Redis subset;
+full Redis compatibility is not a project requirement. `COMMAND` is the
+server's command advertisement. See the
+[compatibility and operating envelope](docs/redis-compatibility.md) for semantics
+and limits, and [performance notes](docs/redis-performance.md) for measurements.
+
+## Embedded storage
+
+```sh
+go get github.com/timson/pirindb/storage
+```
+
+```go
 package main
 
 import (
-	"log"
+    "log"
 
-	pirindb "github.com/timson/pirindb/storage"
+    "github.com/timson/pirindb/storage"
 )
 
 func main() {
-	db, err := pirindb.Open("test.db", pirindb.DefaultOptions())
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer func() {
-		_ = db.Close()
-	}()
+    db, err := storage.Open("example.db", storage.DefaultOptions())
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer func() {
+        if err := db.Close(); err != nil {
+            log.Print(err)
+        }
+    }()
+
+    err = db.Update(func(tx *storage.Tx) error {
+        bucket, err := tx.CreateBucketIfNotExists([]byte("users"))
+        if err != nil {
+            return err
+        }
+        return bucket.Put([]byte("alice"), []byte("hello"))
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    err = db.View(func(tx *storage.Tx) error {
+        bucket, err := tx.GetBucket([]byte("users"))
+        if err != nil {
+            return err
+        }
+        value, found, err := bucket.GetE([]byte("alice"))
+        if err != nil {
+            return err
+        }
+        log.Printf("found=%t value=%s", found, value)
+        return nil
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
 }
-
 ```
 
-### Modify and Read Data
+`Update` commits on success and rolls back on callback errors. `View` opens a
+read transaction. Manual transactions use `BeginE`, `Commit`, and `Rollback`.
+Buckets provide `GetE`, `Put`, `Remove`, `ForEach`, cursors, and sequences. Large
+values use blob pages; streaming APIs avoid materializing entire values.
+`DB.Check()` checks physical structure and freelist ownership.
 
-```Go
-db.Update(func(tx *pirindb.Tx) error {
-	bucket := tx.CreateBucket([]byte("foo"))
-    if err := bucket.Put([]byte("foo"), []byte("bar")); err != nil {
-        return err
-    }
-    return nil
-})
+Commit errors marked `ErrCommitUncertain` require recovery and outcome resolution
+before an application retries. See the [durability contract](docs/storage-safety-operations.md#errors-and-acknowledgement).
 
-db.View(func(tx *pirindb.Tx) error {)
-    bucket := tx.GetBucket([]byte("foo"))
-    value := bucket.Get([]byte("foo"))
-    log.Println(string(value))
-    return nil
-})
-```
-> [!NOTE]
-> If key value exceed the 1024 bytes, if automatically stored as a blob.
+## Backup and offline restore
 
+Snapshot v2 preserves bucket sequences and includes a SHA-256 content digest.
+Old snapshot v1 files must be re-exported or converted through a reviewed recovery
+procedure. New metadata v0.4 and WAL v4 are not readable by older binaries.
 
-### Manual transaction management
-
-```Go
-tx := db.Begin(true)
-defer tx.Rollback()
-bucket := tx.CreateBucket([]byte("foo"))
-bucket.Put([]byte("foo"), []byte("bar"))
-tx.Commit()
+```sh
+./bin/pirindb restore --snapshot /backups/pirin.snapshot --directory /data/restored
 ```
 
-### Cursors
+The destination must not exist. Restore uses bounded transactions and publishes
+a `READY` manifest only after validation and clean shutdown. It never replaces
+the running database. Keep the DB and WAL together when activating the restored
+directory; consult the [operations guide](docs/storage-safety-operations.md).
 
-Support for iterating over key-value pairs using cursors:
-- `First()`: Move to the first key-value pair.
-- `Next()`: Move to the next key-value pair.
-- `Seek()`: Move to the first key-value pair that is greater than or equal to the provided key.
-- `Last()`: Move to the last key-value pair.
-- `Prev()`: Move to the previous key-value pair.
+## Development and validation
 
-```Go
-db.View(func(tx *pirindb.Tx) error {
-    bucket := tx.GetBucket([]byte("foo"))
-    cursor := bucket.Cursor()
-    for k, v := cursor.First(); k != nil; k, v = cursor.Next() {
-        log.Printf("key: %s, value: %s", k, v)
-    }
-    return nil
-})
-```
-Range scanning is also supported:
-
-```Go
-db.View(func(tx *pirindb.Tx) error {
-    bucket := tx.GetBucket([]byte("foo"))
-    cursor := bucket.Cursor()
-    prefix := []byte("test")
-    for k, v := cursor.Seek([]byte("bar")); k != nil && bytes.HasPrefix(k, prefix); k, v = cursor.Next() {
-        log.Printf("key: %s, value: %s", k, v)
-    }
-    return nil
-})
+```sh
+make test
+make vet
+make test-db
+make test-db-extended SEED=42
+make test-db-soak DURATION=24h POLICY=group
+make test-db-replay CASE=tmp/dbtest/run-.../case-...
 ```
 
-> [!NOTE]
-> Next() and Prev() methods works correctly only if the cursor is positioned on a valid key-value pair using 
-> First(), Last() or Seek().
+The local suite runs without Redis, Docker, or a CI service. It covers transaction
+invariants, concurrent histories, modeled persistence faults, process crashes,
+freelist regressions, and backup/restore consistency. See the
+[local test guide](docs/local-database-tests.md) for reports, replay, and model
+limitations. A passing run is evidence for those scenarios, not universal ACID
+proof or hardware power-loss certification.
 
-### Bucket Management
+The `playground/` directory contains maintained dataset loaders and performance
+experiments. `examples/cluster/` contains local cluster configurations.
 
-PirinDB provides a simple mechanism for managing bucket of data.
+## Cluster and releases
 
-- `CreateBucket()`: Creates a new bucket with the provided name.
-- `GetBucket()`: Retrieves an existing bucket by name.
-- `DeleteBucket()`: Deletes a bucket by name.
-- `Buckets()`: Returns a list of all buckets in the database.
+- [Cluster setup examples](examples/cluster/README.md)
+- [Cluster operations](docs/cluster-operations.md)
+- [Sharded cluster operating envelope](docs/cluster-release-v0.1.md)
+- [Release preparation and qualification](docs/releasing.md)
+- [Changelog](CHANGELOG.md)
 
+## Credits
 
+The storage engine draws on [LibraDB](https://github.com/amit-davidson/LibraDB),
+[BoltDB](https://github.com/boltdb/bolt), and Alex Petrov's *Database Internals*.
 
-## Inspiration and Credits
+## License
 
-- [BoltDB](https://github.com/boltdb/bolt)
-- [LibraDB](https://github.com/amit-davidson/LibraDB)
-- [Database Internals](https://www.amazon.com/Database-Internals-Deep-Distributed-Systems/dp/1492040347) by Alex Petrov
-
-PirinDB was named after the Pirin Mountains. 
-The [Pirin](https://en.wikipedia.org/wiki/Pirin) Mountains are a mountain 
-range in southwestern Bulgaria.
+See [LICENSE](LICENSE).

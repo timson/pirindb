@@ -21,6 +21,9 @@ func New(db *storage.DB) *ORM {
 }
 
 func (orm *ORM) getModelInfo(v any) (*ModelInfo, error) {
+	if v == nil {
+		return nil, fmt.Errorf("model is nil")
+	}
 	name := reflect.TypeOf(v).String()
 	if modelInfo, ok := orm.metaOnce.Load(name); ok {
 		return modelInfo.(*ModelInfo), nil
@@ -38,8 +41,26 @@ func (orm *ORM) Save(models ...any) error {
 		return nil
 	}
 
+	// Generated identities become caller-visible only after commit succeeds.
+	// Work on copies so a later failure cannot leak an aborted ID into a retry.
+	staged := make(map[any]reflect.Value)
+	inputs := make([]any, len(models))
+	for i, model := range models {
+		rv := reflect.ValueOf(model)
+		if rv.Kind() == reflect.Pointer && !rv.IsNil() && rv.Elem().Kind() == reflect.Struct {
+			copy, ok := staged[model]
+			if !ok {
+				copy = reflect.New(rv.Elem().Type())
+				copy.Elem().Set(rv.Elem())
+				staged[model] = copy
+			}
+			inputs[i] = copy.Interface()
+		} else {
+			inputs[i] = model
+		}
+	}
 	err := orm.db.Update(func(tx *storage.Tx) error {
-		for _, model := range models {
+		for _, model := range inputs {
 			modelInfo, err := orm.getModelInfo(model)
 			if err != nil {
 				return err
@@ -54,6 +75,17 @@ func (orm *ORM) Save(models ...any) error {
 
 	})
 
+	if err == nil {
+		for original, copy := range staged {
+			info, infoErr := orm.getModelInfo(original)
+			if infoErr != nil {
+				continue
+			}
+			if info.pk.auto {
+				reflect.ValueOf(original).Elem().FieldByName(info.pk.fieldName).Set(copy.Elem().FieldByName(info.pk.fieldName))
+			}
+		}
+	}
 	return err
 }
 

@@ -1,0 +1,77 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: pirindb-control-plane
+  namespace: default
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: pirindb
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: pirindb
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: pirindb-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: pirindb-operator
+      ports:
+        - protocol: TCP
+          port: 4321
+    - from:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              pirindb.timson.dev/redis-client: "true"
+      ports:
+        - protocol: TCP
+          port: 6379
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: pirindb
+      ports:
+        - protocol: TCP
+          port: 4321
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: pirindb-operator-egress
+  namespace: pirindb-system
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: pirindb-operator
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: pirindb
+      ports:
+        - protocol: TCP
+          port: 4321
+    - ports:
+        - protocol: TCP
+          port: 443
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53

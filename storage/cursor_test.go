@@ -103,7 +103,7 @@ func TestCursorLastPrev(t *testing.T) {
 		for k, _ := cursor.Last(); k != nil; k, _ = cursor.Prev() {
 			testSlices = append(testSlices, string(k))
 		}
-		require.True(t, reflect.DeepEqual(reversedOriginal, testSlices))
+		require.Equal(t, reversedOriginal, testSlices)
 		return nil
 	})
 
@@ -117,7 +117,7 @@ func TestCursorLastPrev(t *testing.T) {
 		for k, _ := cursor.Seek(prefix); k != nil; k, _ = cursor.Prev() {
 			testSlices = append(testSlices, string(k))
 		}
-		require.True(t, reflect.DeepEqual(reversedOriginal, testSlices))
+		require.Equal(t, reversedOriginal, testSlices)
 		return nil
 	})
 }

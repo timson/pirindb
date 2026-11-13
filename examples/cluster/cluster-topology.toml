@@ -1,0 +1,26 @@
+[cluster]
+name = "cluster-demo"
+slot_count = 16384
+
+[[cluster.nodes]]
+id = "node-a"
+redis_address = "127.0.0.1:6379"
+http_address = "http://127.0.0.1:4321"
+
+[[cluster.nodes]]
+id = "node-b"
+redis_address = "127.0.0.1:6380"
+http_address = "http://127.0.0.1:4322"
+
+[[cluster.nodes]]
+id = "node-c"
+redis_address = "127.0.0.1:6381"
+http_address = "http://127.0.0.1:4323"
+
+[[cluster.bootstrap_slots]]
+node_id = "node-a"
+slots = ["0-8191"]
+
+[[cluster.bootstrap_slots]]
+node_id = "node-b"
+slots = ["8192-16383"]

@@ -85,7 +85,7 @@ func TestDALFreelist(t *testing.T) {
 	err = dal.ReleasePage(pageNum.PageNumber)
 	require.NoError(t, err)
 
-	releasedPages := dal.freelist.releasedPages
+	releasedExtents := append([]pageExtent(nil), dal.freelist.releasedExtents...)
 	err = WriteFreelist(dal, dal.freelist)
 	require.NoError(t, err)
 	err = dal.Close()
@@ -93,7 +93,7 @@ func TestDALFreelist(t *testing.T) {
 
 	dal, err = NewDal(testFileName, opts)
 	require.NoError(t, err)
-	require.Equal(t, releasedPages, dal.freelist.releasedPages)
+	require.Equal(t, releasedExtents, dal.freelist.releasedExtents)
 	err = dal.Close()
 	require.NoError(t, err)
 }
@@ -111,18 +111,46 @@ func TestDALReleasePageValidation(t *testing.T) {
 
 	require.Error(t, dal.ReleasePage(metaPageNumber))
 	require.Error(t, dal.ReleasePage(freelistPageNumber))
+	require.Error(t, dal.ReleasePage(dal.meta.root))
 
 	page, err := dal.AllocatePage()
 	require.NoError(t, err)
 	require.NoError(t, dal.ReleasePage(page.PageNumber))
 	require.NoError(t, dal.ReleasePage(page.PageNumber)) // idempotent duplicate release
 
-	dupCount := 0
-	for _, pageNum := range dal.freelist.releasedPages {
-		if pageNum == page.PageNumber {
-			dupCount++
-		}
-	}
-	require.Equal(t, 1, dupCount)
+	require.True(t, dal.freelist.containsReleasedPage(page.PageNumber))
+	require.EqualValues(t, 1, dal.freelist.releasedPageN())
 	require.Error(t, dal.ReleasePage(dal.freelist.currentPage+1))
+}
+
+func TestNewDatabaseRefusesExistingNonEmptyTransactionLog(t *testing.T) {
+	path := TempFileName(".db")
+	tlogPath := TempFileName(".tlog")
+	require.NoError(t, os.WriteFile(tlogPath, []byte("existing journal"), 0600))
+	t.Cleanup(func() {
+		_ = os.Remove(path)
+		_ = os.Remove(tlogPath)
+	})
+	_, err := Open(path, DefaultOptions().WithTxLogPath(tlogPath))
+	require.ErrorIs(t, err, ErrRecoveryRequired)
+	_, statErr := os.Stat(path)
+	require.ErrorIs(t, statErr, os.ErrNotExist)
+}
+
+func TestDifferentDatabasesCannotShareTransactionLog(t *testing.T) {
+	firstPath := TempFileName(".db")
+	secondPath := TempFileName(".db")
+	tlogPath := TempFileName(".tlog")
+	first, err := Open(firstPath, DefaultOptions().WithTxLogPath(tlogPath))
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_ = first.Close()
+		_ = os.Remove(firstPath)
+		_ = os.Remove(secondPath)
+		_ = os.Remove(tlogPath)
+	})
+	_, err = Open(secondPath, DefaultOptions().WithTxLogPath(tlogPath))
+	require.ErrorContains(t, err, "transaction log")
+	_, statErr := os.Stat(secondPath)
+	require.ErrorIs(t, statErr, os.ErrNotExist)
 }
