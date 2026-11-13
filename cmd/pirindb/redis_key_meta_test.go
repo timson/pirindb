@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -19,7 +20,7 @@ func openRedisKeyMetaTestDB(t *testing.T, path string) *storage.DB {
 }
 
 func TestRedisKeyDirectoryMigrationResumesAndActivates(t *testing.T) {
-	path := storage.TempFileName(".db")
+	path := filepath.Join(t.TempDir(), "test.db")
 	defer os.Remove(path)
 	defer os.Remove(path + ".tlog")
 	db := openRedisKeyMetaTestDB(t, path)
@@ -113,7 +114,7 @@ func TestRedisKeyDirectoryMigrationResumesAndActivates(t *testing.T) {
 }
 
 func TestRedisKeyDirectoryMigrationRejectsConflictingLegacyTypes(t *testing.T) {
-	path := storage.TempFileName(".db")
+	path := filepath.Join(t.TempDir(), "test.db")
 	defer os.Remove(path)
 	db := openRedisKeyMetaTestDB(t, path)
 	defer db.Close()

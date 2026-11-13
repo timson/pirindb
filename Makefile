@@ -57,8 +57,23 @@ fmt:
 	go fmt ./...
 
 run:
-	go run ./cmd/...
+	go run ./cmd/pirindb
 
 docker-build:
 	docker build --target pirindb -t pirindb:dev .
 	docker build --target operator -t pirindb-operator:dev .
+
+SEED ?= 1
+DURATION ?= 24h
+POLICY ?= strict
+WORKERS ?= 4
+ARTIFACT_DIR ?= tmp/dbtest
+.PHONY: test-db test-db-extended test-db-soak test-db-replay
+test-db:
+	go run ./cmd/dbtest --profile quick --seed "$(SEED)" --workers "$(WORKERS)" --artifacts "$(ARTIFACT_DIR)"
+test-db-extended:
+	go run ./cmd/dbtest --profile extended --seed "$(SEED)" --workers "$(WORKERS)" --artifacts "$(ARTIFACT_DIR)"
+test-db-soak:
+	go run ./cmd/dbtest --profile soak --duration "$(DURATION)" --policy "$(POLICY)" --seed "$(SEED)" --artifacts "$(ARTIFACT_DIR)"
+test-db-replay:
+	go run ./cmd/dbtest --profile replay --case "$(CASE)" --artifacts "$(ARTIFACT_DIR)"

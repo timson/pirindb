@@ -234,7 +234,7 @@ func TestLegacyV02RootPageAndFreelistRemainWritable(t *testing.T) {
 	require.NoError(t, file.Sync())
 	require.NoError(t, file.Close())
 
-	db, err := Open(path, nil)
+	db, err := Open(path, DefaultOptions().WithLegacyRecovery(true))
 	require.NoError(t, err)
 	tlogPath := db.dal.opts.TxLogPath
 	t.Cleanup(func() {
@@ -253,7 +253,7 @@ func TestLegacyV02RootPageAndFreelistRemainWritable(t *testing.T) {
 		return bucket.Put([]byte("key"), []byte("value"))
 	}))
 	require.NoError(t, db.Close())
-	db, err = Open(path, nil)
+	db, err = Open(path, DefaultOptions().WithLegacyRecovery(true))
 	require.NoError(t, err)
 	requireBucketValue(t, db, []byte("legacy"), []byte("key"), []byte("value"))
 	_, err = db.Check()

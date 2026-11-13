@@ -176,7 +176,7 @@ func TestTxLogRejectsWhenBothMirroredHeadersAreCorrupted(t *testing.T) {
 	require.NoError(t, err)
 	_, err = file.WriteAt([]byte("X"), txLogMagicOffset)
 	require.NoError(t, err)
-	_, err = file.WriteAt([]byte("Y"), int64(txLogHeaderSize+txLogMagicOffset))
+	_, err = file.WriteAt([]byte("Y"), int64(txLogHeaderStride+txLogMagicOffset))
 	require.NoError(t, err)
 	require.NoError(t, file.Sync())
 	require.NoError(t, file.Close())

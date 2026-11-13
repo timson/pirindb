@@ -242,6 +242,39 @@ func (srv *Server) validateDBTransferRequest(req *dbTransferRequest, isExport bo
 		return err
 	}
 	req.Path = absolutePath
+	if srv.Config == nil || srv.Config.DB == nil {
+		return errors.New("database administration unavailable")
+	}
+	root := strings.TrimSpace(srv.Config.DB.BackupDirectory)
+	if root == "" {
+		return errors.New("db.backup_directory must be configured")
+	}
+	canonicalRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return err
+	}
+	canonicalRoot, err = filepath.Abs(canonicalRoot)
+	if err != nil {
+		return err
+	}
+	parent, err := filepath.EvalSymlinks(filepath.Dir(req.Path))
+	if err != nil {
+		return err
+	}
+	candidate := filepath.Join(parent, filepath.Base(req.Path))
+	if resolved, e := filepath.EvalSymlinks(candidate); e == nil {
+		candidate = resolved
+	} else if !os.IsNotExist(e) {
+		return e
+	}
+	rel, err := filepath.Rel(canonicalRoot, candidate)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return errors.New("snapshot path must be inside db.backup_directory")
+	}
+	req.Path = candidate
+	if !isExport && (!srv.Config.DB.RestoreEnabled || (srv.Config.Redis != nil && srv.Config.Redis.Enabled) || (srv.Config.Cluster != nil && srv.Config.Cluster.Enabled)) {
+		return errors.New("restore requires db.restore_enabled and standalone mode with Redis disabled")
+	}
 
 	if isExport {
 		if err = srv.validateExportPath(req.Path, req.Overwrite); err != nil {
@@ -323,9 +356,9 @@ func (srv *Server) startDBTransferJob(kind string, req *dbTransferRequest, run f
 	if srv.importBusy {
 		return nil, errDBImportBusy
 	}
-	if kind == dbTransferKindImport {
-		srv.importBusy = true
-	}
+	// Serialize all transfers to bound writer blocking and filesystem races.
+	srv.importBusy = true
+	srv.restoreBusy = kind == dbTransferKindImport
 
 	job := &dbTransferJob{
 		ID:     uuid.NewString(),
@@ -335,21 +368,35 @@ func (srv *Server) startDBTransferJob(kind string, req *dbTransferRequest, run f
 		Path:   req.Path,
 		Status: dbTransferStatusQueued,
 	}
+	if len(srv.jobs) >= 128 {
+		for id, previous := range srv.jobs {
+			state := previous.snapshot()
+			if state.Status == dbTransferStatusDone || state.Status == dbTransferStatusFailed {
+				delete(srv.jobs, id)
+				break
+			}
+		}
+	}
 	srv.jobs[job.ID] = job
 
 	if err := srv.startBackgroundJob(func(ctx context.Context) {
 		srv.runDBTransferJob(ctx, job, run)
 	}); err != nil {
 		delete(srv.jobs, job.ID)
-		if kind == dbTransferKindImport {
-			srv.importBusy = false
-		}
+		srv.importBusy = false
+		srv.restoreBusy = false
 		return nil, err
 	}
 	return job, nil
 }
 
 func (srv *Server) runDBTransferJob(ctx context.Context, job *dbTransferJob, run func() (dbTransferJobStats, error)) {
+	defer func() {
+		srv.jobMu.Lock()
+		srv.importBusy = false
+		srv.restoreBusy = false
+		srv.jobMu.Unlock()
+	}()
 	if contextCancelled(ctx) {
 		finishedAt := time.Now()
 		job.mu.Lock()
@@ -366,11 +413,7 @@ func (srv *Server) runDBTransferJob(ctx context.Context, job *dbTransferJob, run
 	job.mu.Unlock()
 
 	defer func() {
-		if job.Kind == dbTransferKindImport {
-			srv.jobMu.Lock()
-			srv.importBusy = false
-			srv.jobMu.Unlock()
-		}
+
 		if recovered := recover(); recovered != nil {
 			finishedAt := time.Now()
 			job.mu.Lock()

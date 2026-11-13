@@ -31,6 +31,7 @@ type Server struct {
 	jobMu             sync.Mutex
 	jobs              map[string]*dbTransferJob
 	importBusy        bool
+	restoreBusy       bool
 	rebalanceMu       sync.Mutex
 	rebalanceJobs     map[string]*clusterRebalanceJob
 	autoMu            sync.Mutex
@@ -103,6 +104,7 @@ func (srv *Server) buildRouter() http.Handler {
 	r.Use(middleware.Recoverer)
 	r.Use(RequestLogger(srv.Logger))
 	r.Use(srv.rejectRequestsWhileStopping)
+	r.Use(srv.databaseAdministrationMiddleware)
 
 	r.Route("/health", func(r chi.Router) {
 		r.Get("/", srv.handleHealth)

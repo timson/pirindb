@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -14,7 +15,7 @@ import (
 
 func openRedisCoreBenchmarkDB(b *testing.B) *storage.DB {
 	b.Helper()
-	path := storage.TempFileName(".db")
+	path := filepath.Join(b.TempDir(), "test.db")
 	db, err := storage.Open(path, storage.DefaultOptions().
 		WithSyncPolicy(storage.SyncPolicyJournal).
 		WithCheckpointTxThreshold(1024))
@@ -147,7 +148,7 @@ func BenchmarkRedisListSetHead50000(b *testing.B) {
 
 func benchmarkRedisStandardPipeline(b *testing.B, depth int) {
 	b.Helper()
-	path := storage.TempFileName(".db")
+	path := filepath.Join(b.TempDir(), "test.db")
 	opts := storage.DefaultOptions().
 		WithSyncPolicy(storage.SyncPolicyGroup).
 		WithGroupCommitTxThreshold(16).

@@ -15,6 +15,7 @@ type Options struct {
 	FileMode               os.FileMode
 	PageSize               uint64
 	EnableRecovery         bool
+	AllowLegacyRecovery    bool
 	TxLogPath              string
 	CommitObserver         CommitObserver
 	SyncPolicy             SyncPolicy
@@ -141,3 +142,7 @@ func (o *Options) WithNodeCacheBytes(cacheBytes int64) *Options {
 	o.NodeCacheBytes = cacheBytes
 	return o
 }
+
+// WithLegacyRecovery explicitly trusts an unbound legacy DB/journal pair.
+// Use only for controlled migration of known matching files.
+func (o *Options) WithLegacyRecovery(allow bool) *Options { o.AllowLegacyRecovery = allow; return o }

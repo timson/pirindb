@@ -31,5 +31,8 @@ var (
 	ErrChecksumMismatch      = errors.New("page checksum mismatch")
 	ErrIntegrityCheckFailed  = errors.New("database integrity check failed")
 	ErrTransactionTooLarge   = errors.New("transaction exceeds configured memory limit")
+	ErrJournalIdentity       = errors.New("database/journal identity mismatch")
+	ErrLegacyRecovery        = errors.New("legacy journal has no verifiable database identity; explicit legacy recovery required")
+	ErrCommitUncertain       = errors.New("commit outcome uncertain; recover before retrying")
 	ErrJournalRestoreFailed  = errors.New("failed to restore previous recovery journal")
 )

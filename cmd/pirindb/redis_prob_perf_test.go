@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"os"
+	"path/filepath"
 	"strconv"
 	"testing"
 	"time"
@@ -28,7 +29,7 @@ const (
 func openRedisProbPerfDB(tb testing.TB) (*storage.DB, string) {
 	tb.Helper()
 
-	path := storage.TempFileName(".db")
+	path := filepath.Join(tb.TempDir(), "test.db")
 	opts := storage.DefaultOptions().
 		WithSyncPolicy(storage.SyncPolicyJournal).
 		WithCheckpointTxThreshold(redisProbPerfCheckpointWindow)

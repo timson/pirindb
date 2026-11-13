@@ -17,33 +17,35 @@ const (
 )
 
 type Tx struct {
-	dirtyNodes        map[uint64]*BNode
-	dirtyPages        map[uint64]*Page
-	dirtyBuckets      map[string]*Bucket
-	readNodes         map[uint64]*BNode
-	readPages         map[uint64]*Page
-	readBlobs         map[uint64]*Blob
-	readBlobBytes     int64
-	pagesToDelete     []uint64
-	pagesToDeleteSet  map[uint64]struct{}
-	allocatedPageNums []uint64
-	originalMetaRoot  uint64
-	write             bool
-	holdsGroupGate    bool
-	closed            bool
-	once              sync.Once
-	finishOnce        sync.Once
-	asyncPublishOnce  sync.Once
-	asyncPublished    chan struct{}
-	tracksLifecycle   bool
-	beginErr          error
-	errMu             sync.Mutex
-	stickyErr         error
-	bypassNodeCache   bool
-	btreePathIndexes  []int
-	btreePathNodes    []*BNode
-	db                *DB
-	buckets           map[string]*Bucket
+	dirtyNodes             map[uint64]*BNode
+	dirtyPages             map[uint64]*Page
+	dirtyBuckets           map[string]*Bucket
+	readNodes              map[uint64]*BNode
+	readPages              map[uint64]*Page
+	readBlobs              map[uint64]*Blob
+	readBlobBytes          int64
+	pagesToDelete          []uint64
+	pagesToDeleteSet       map[uint64]struct{}
+	allocatedPageNums      []uint64
+	originalMetaRoot       uint64
+	originalCommitSequence uint64
+	originalAllocator      Freelist
+	write                  bool
+	holdsGroupGate         bool
+	closed                 bool
+	once                   sync.Once
+	finishOnce             sync.Once
+	asyncPublishOnce       sync.Once
+	asyncPublished         chan struct{}
+	tracksLifecycle        bool
+	beginErr               error
+	errMu                  sync.Mutex
+	stickyErr              error
+	bypassNodeCache        bool
+	btreePathIndexes       []int
+	btreePathNodes         []*BNode
+	db                     *DB
+	buckets                map[string]*Bucket
 }
 
 // CommitFuture resolves when an asynchronously submitted transaction is
@@ -92,15 +94,17 @@ func (tx *Tx) CommitAsync() *CommitFuture {
 
 func newTx(db *DB, write bool) *Tx {
 	return &Tx{
-		pagesToDelete:     make([]uint64, 0),
-		allocatedPageNums: make([]uint64, 0),
-		originalMetaRoot:  db.dal.meta.root,
-		write:             write,
-		holdsGroupGate:    false,
-		closed:            false,
-		once:              sync.Once{},
-		finishOnce:        sync.Once{},
-		db:                db,
+		pagesToDelete:          make([]uint64, 0),
+		allocatedPageNums:      make([]uint64, 0),
+		originalMetaRoot:       db.dal.meta.root,
+		originalCommitSequence: db.dal.meta.commitSequence,
+		originalAllocator:      *db.dal.freelist,
+		write:                  write,
+		holdsGroupGate:         false,
+		closed:                 false,
+		once:                   sync.Once{},
+		finishOnce:             sync.Once{},
+		db:                     db,
 	}
 }
 
@@ -131,17 +135,6 @@ func (tx *Tx) currentError() error {
 	tx.errMu.Lock()
 	defer tx.errMu.Unlock()
 	return tx.stickyErr
-}
-
-func (tx *Tx) allocatePage() (*Page, error) {
-	pageNums, err := tx.allocatePageNumbers(1)
-	if err != nil {
-		return nil, err
-	}
-	return &Page{
-		PageNumber: pageNums[0],
-		Data:       make([]byte, tx.db.dal.meta.pageSize),
-	}, nil
 }
 
 func (tx *Tx) allocatePageNumbers(count int) ([]uint64, error) {
@@ -302,9 +295,23 @@ func (tx *Tx) deletePage(pageNum uint64) {
 }
 
 func (tx *Tx) releaseAllocatedPages() {
+	f := tx.db.dal.freelist
 	if err := tx.db.dal.ReleasePages(tx.allocatedPageNums); err != nil {
-		logger.Error("failed to release allocated pages", "page_count", len(tx.allocatedPageNums), "error", err)
+		tx.db.setFatalErr(fmt.Errorf("rollback allocations: %w", err))
+		return
 	}
+	// All high-water allocations belong to this exclusive writer. Undo their
+	// allocation rather than introducing free pages absent from persisted state.
+	if f.currentPage > tx.originalAllocator.currentPage {
+		count := f.currentPage - tx.originalAllocator.currentPage
+		if err := f.removeReleasedRange(tx.originalAllocator.currentPage+1, int(count)); err != nil {
+			tx.db.setFatalErr(fmt.Errorf("rollback high-water allocation: %w", err))
+			return
+		}
+		f.currentPage = tx.originalAllocator.currentPage
+	}
+	f.dirty = tx.originalAllocator.dirty || f.maxPages != tx.originalAllocator.maxPages
+	f.dirtyExtentIndex = tx.originalAllocator.dirtyExtentIndex
 }
 
 func cloneFreelist(src *Freelist) *Freelist {
@@ -354,6 +361,7 @@ func (tx *Tx) Rollback() {
 	}()
 
 	tx.db.dal.meta.root = tx.originalMetaRoot
+	tx.db.dal.meta.commitSequence = tx.originalCommitSequence
 	tx.dirtyNodes = nil
 	tx.dirtyPages = nil
 	tx.dirtyBuckets = nil
@@ -416,9 +424,11 @@ func (tx *Tx) Commit() (err error) {
 		}
 		if err != nil {
 			if checkpointDurable {
+				err = errors.Join(ErrCommitUncertain, err)
 				tx.db.setFatalErr(fmt.Errorf("durable commit requires recovery: %w", err))
 			} else {
 				tx.db.dal.meta.root = tx.originalMetaRoot
+				tx.db.dal.meta.commitSequence = tx.originalCommitSequence
 				if freelistSnapshot != nil {
 					tx.db.dal.freelist = freelistSnapshot
 				}
@@ -646,6 +656,12 @@ func (tx *Tx) commitGroupPolicy(commitStats *CommitPhaseStats, collectStats bool
 }
 
 func (tx *Tx) materializeCommitPages() ([]*Page, error) {
+	if tx.db.dal.meta.dbVersion >= 4 {
+		if tx.db.dal.meta.commitSequence == ^uint64(0) {
+			return nil, fmt.Errorf("database commit sequence exhausted")
+		}
+		tx.db.dal.meta.commitSequence++
+	}
 	if err := tx.db.dal.ReleasePages(tx.pagesToDelete); err != nil {
 		return nil, err
 	}
@@ -677,7 +693,7 @@ func (tx *Tx) materializeCommitPages() ([]*Page, error) {
 	for _, page := range freelistPages {
 		pagesByNum[page.PageNumber] = page
 	}
-	if tx.db.dal.meta.root != tx.originalMetaRoot {
+	if tx.db.dal.meta.root != tx.originalMetaRoot || tx.db.dal.meta.commitSequence != tx.originalCommitSequence {
 		metaPage, err := buildMetaPageAt(metaPageNumber, tx.db.dal.meta.pageSize, tx.db.dal.meta)
 		if err != nil {
 			return nil, err

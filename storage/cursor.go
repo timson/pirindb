@@ -158,7 +158,9 @@ func (cursor *Cursor) currentKV() ([]byte, []byte) {
 		cursor.setErr(err)
 		return nil, nil
 	}
-	return cloneBytes(item.Key), value
+	key := make([]byte, len(item.Key))
+	copy(key, item.Key)
+	return key, value
 }
 
 func (cursor *Cursor) firstPosition() bool {

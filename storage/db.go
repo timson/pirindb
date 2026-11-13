@@ -57,11 +57,12 @@ type DBStat struct {
 	TxN           int                    // total number of started read transactions
 }
 
-func Open(path string, opts *Options) (*DB, error) {
+func Open(path string, opts *Options) (*DB, error) { return openWithFS(path, opts, osStorageFS{}) }
+func openWithFS(path string, opts *Options, fs storageFS) (*DB, error) {
 	if opts == nil {
 		opts = DefaultOptions()
 	}
-	dal, err := NewDal(path, opts)
+	dal, err := newDalWithFS(path, opts, fs)
 	if err != nil {
 		return nil, err
 	}
@@ -158,6 +159,10 @@ func (db *DB) BeginE(write bool) (*Tx, error) {
 	db.activeTx.Add(1)
 	db.lifecycleMu.RUnlock()
 
+	if write && !db.dal.pageChecksums && !db.dal.opts.AllowLegacyRecovery {
+		db.activeTx.Done()
+		return nil, fmt.Errorf("%w: legacy v0.2 is read-only; export into a new database or explicitly enable legacy migration writes", ErrLegacyRecovery)
+	}
 	if write {
 		if db.dal.opts.SyncPolicy == SyncPolicyGroup {
 			db.groupGate.RLock()

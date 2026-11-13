@@ -23,7 +23,7 @@ Before creating a release tag, run the repository's validation gates:
 - transfer-decoder fuzzing;
 - CRD regeneration, Kustomize rendering, and shell/client-helper checks;
 - disposable kind E2E tests using the production images, including authentication, data preservation, scale-up, ordered drain, and operator restarts;
-- the manual four-hour `cluster-soak` workflow.
+- a local four-hour cluster soak (`SOAK_DURATION_SECONDS=14400 make soak-cluster`).
 
 Local unit tests and helper tests do not qualify the container deployment or replace the multi-hour soak. The current container E2E and soak require a fresh successful run before release.
 

@@ -193,7 +193,11 @@ func postDBTransferJob(t *testing.T, ts *httptest.Server, endpoint string, paylo
 	body, err := json.Marshal(payload)
 	require.NoError(t, err)
 
-	resp, err := http.Post(ts.URL+endpoint, "application/json", bytes.NewReader(body))
+	request, err := http.NewRequest(http.MethodPost, ts.URL+endpoint, bytes.NewReader(body))
+	require.NoError(t, err)
+	request.Header.Set("Authorization", "Bearer test-database-admin")
+	request.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(request)
 	require.NoError(t, err)
 	defer func() {
 		_ = resp.Body.Close()
@@ -210,7 +214,10 @@ func waitForDBTransferJob(t *testing.T, ts *httptest.Server, jobID string) dbTra
 
 	var last dbTransferJobResponse
 	require.Eventually(t, func() bool {
-		resp, err := http.Get(ts.URL + "/api/v1/db/jobs/" + jobID)
+		request, err := http.NewRequest(http.MethodGet, ts.URL+"/api/v1/db/jobs/"+jobID, nil)
+		require.NoError(t, err)
+		request.Header.Set("Authorization", "Bearer test-database-admin")
+		resp, err := http.DefaultClient.Do(request)
 		require.NoError(t, err)
 		defer func() {
 			_ = resp.Body.Close()

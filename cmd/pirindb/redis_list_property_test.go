@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"math/rand"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -12,7 +13,7 @@ import (
 
 func openRedisListPropertyDB(t *testing.T) *storage.DB {
 	t.Helper()
-	path := storage.TempFileName(".db")
+	path := filepath.Join(t.TempDir(), "test.db")
 	opts := storage.DefaultOptions().
 		WithSyncPolicy(storage.SyncPolicyJournal).
 		WithCheckpointTxThreshold(1024)

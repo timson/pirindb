@@ -24,6 +24,7 @@ func setupTestServer(t *testing.T) (*Server, string, string) {
 			LogLevel: "ERROR",
 		},
 		DB: &DatabaseConfig{
+			AdminToken: "test-database-admin", BackupDirectory: os.TempDir(), RestoreEnabled: true,
 			Filename:               filename,
 			SyncPolicy:             "strict",
 			CheckpointTxThreshold:  64,

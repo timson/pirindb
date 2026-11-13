@@ -2,6 +2,7 @@ package orm
 
 import (
 	"errors"
+	"path/filepath"
 	"sort"
 	"testing"
 
@@ -101,7 +102,9 @@ func TestFindRangeAndNe(t *testing.T) {
 }
 
 func TestSaveAutoPKAndReindexOnUpdate(t *testing.T) {
-	db, _ := storage.CreateTestDB(t)
+	db, err := storage.Open(filepath.Join(t.TempDir(), "test.db"), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
 	o := New(db)
 
 	u := &User{Login: "nora", Age: 21, City: "Haifa"}
@@ -191,7 +194,9 @@ func TestTypedFindOne(t *testing.T) {
 }
 
 func setupORMWithUsers(t *testing.T) (*ORM, []*User) {
-	db, _ := storage.CreateTestDB(t)
+	db, err := storage.Open(filepath.Join(t.TempDir(), "test.db"), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
 	o := New(db)
 
 	users := []*User{

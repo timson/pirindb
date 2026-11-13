@@ -93,6 +93,9 @@ func clusterTransferChunkMaxRecords(cfg *Config) int {
 }
 
 type DatabaseConfig struct {
+	AdminToken             string `mapstructure:"admin_token"`
+	BackupDirectory        string `mapstructure:"backup_directory"`
+	RestoreEnabled         bool   `mapstructure:"restore_enabled"`
 	Filename               string `mapstructure:"filename" validate:"required"`
 	SyncPolicy             string `mapstructure:"sync_policy" validate:"required,oneof=strict journal group"`
 	CheckpointTxThreshold  int    `mapstructure:"checkpoint_tx_threshold" validate:"required,min=1"`
@@ -113,6 +116,9 @@ func initDefaults() {
 	viper.SetDefault("server.port", 4321)
 	viper.SetDefault("db.filename", "pirin.db")
 	viper.SetDefault("db.sync_policy", "strict")
+	viper.SetDefault("db.admin_token", "")
+	viper.SetDefault("db.backup_directory", "")
+	viper.SetDefault("db.restore_enabled", false)
 	viper.SetDefault("db.checkpoint_tx_threshold", 64)
 	viper.SetDefault("db.group_commit_tx_threshold", 16)
 	viper.SetDefault("db.group_commit_window_ms", 1)

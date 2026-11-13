@@ -736,6 +736,16 @@ func BuildFreelistPages(dal *Dal, f *Freelist) ([]*Page, error) {
 	if err = ensureFreelistPageCapacity(dal, f, recordCount); err != nil {
 		return nil, err
 	}
+	// Growing the chain can consume a released page. Serialize the final free
+	// set, excluding the page that has just become freelist storage.
+	recordCount = len(f.releasedExtents)
+	if f.legacyPageRecords {
+		legacyPages, err = legacyReleasedPages(f)
+		if err != nil {
+			return nil, err
+		}
+		recordCount = len(legacyPages)
+	}
 
 	dirtyFromPage := 1
 	if f.legacyPageRecords || f.persistedState == nil {

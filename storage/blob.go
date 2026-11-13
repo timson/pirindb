@@ -1,4 +1,3 @@
-// Package storage
 package storage
 
 import (
@@ -345,13 +344,6 @@ func SaveBlobFromReader(tx *Tx, r io.Reader, dataLen int64) (_ uint64, returnErr
 		return 0, ErrCorruptedBlob
 	}
 	return startPageNum, nil
-}
-
-func decodeBlobHeader(startPage *Page) (int, int, error) {
-	if startPage == nil {
-		return 0, 0, fmt.Errorf("%w: blob page is nil", ErrCorruptedBlob)
-	}
-	return decodeBlobHeaderForSize(startPage, len(startPage.Data)-pageChecksumSize)
 }
 
 func decodeBlobHeaderForSize(startPage *Page, usablePageSize int) (int, int, error) {

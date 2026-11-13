@@ -58,4 +58,4 @@ Depth 16 delivered about 17.5 times the depth-1 throughput in this setup, exceed
 
 The opt-in release-scale gate is available as `make scale-redis`. On the same machine it created one million one-field hashes in 49.43 seconds (20,231 keys/s), kept the physical bucket count unchanged after the first 1,000 keys, measured `INFO` p95 at 57.8 us, and passed `DB.Check()`.
 
-The expanded five-minute local soak completed 40 consecutive iterations covering expiry, migration/restart, group-policy restart, large COW operations, generation/exact-key GC, logical integrity, Bloom, TopK, randomized B-tree operations, and freelist checks. The manually dispatched CI workflow defaults to a four-hour run.
+The expanded five-minute local soak completed 40 consecutive iterations covering expiry, migration/restart, group-policy restart, large COW operations, generation/exact-key GC, logical integrity, Bloom, TopK, randomized B-tree operations, and freelist checks. Run a longer local campaign with `SOAK_DURATION_SECONDS=14400 make soak-redis`.

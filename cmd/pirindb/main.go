@@ -68,6 +68,7 @@ func main() {
 		},
 	}
 
+	rootCmd.AddCommand(newRestoreCommand())
 	initDefaults()
 	setupFlags(rootCmd)
 

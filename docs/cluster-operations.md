@@ -80,7 +80,7 @@ bash hack/kind-e2e.sh
 
 The kind gate writes and verifies string, list, hash, zset, Bloom, TopK, and TTL data; rejects an anonymous mutation; restarts the operator during both directions; drains 4→2 one ordinal at a time; and scales 2→3 again.
 
-Run the multi-hour add/drain/write/restart leak gate manually or from the `cluster-soak` workflow:
+Run the multi-hour add/drain/write/restart leak gate locally:
 
 ```bash
 SOAK_DURATION_SECONDS=14400 make soak-cluster

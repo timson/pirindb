@@ -3,12 +3,11 @@ package storage
 import (
 	"errors"
 	"fmt"
-	"github.com/gofrs/flock"
+
 	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
 )
 
 const (
@@ -17,34 +16,49 @@ const (
 )
 
 type Dal struct {
-	file              *os.File
-	osPageSize        uint64
-	maxPages          uint64
-	size              uint64
-	MinFillPercent    float32
-	MaxFillPercent    float32
-	freelist          *Freelist
-	meta              *Meta
-	fileLock          *flock.Flock
-	txLogLock         *flock.Flock
-	txLog             *TxLog
-	opts              *Options
-	beforeSetPageHook func(p *Page) error
-	pendingJournal    map[uint64]*Page
-	pendingJournalTxN int
-	pageOverlay       map[uint64]*Page
-	recoveryPending   bool
-	pageChecksums     bool
-	metaNeedsRepair   bool
-	metaRepairPage    uint64
-	nodeCache         *nodeCache
+	fs                    storageFS
+	path                  string
+	file                  storageFile
+	osPageSize            uint64
+	maxPages              uint64
+	size                  uint64
+	MinFillPercent        float32
+	MaxFillPercent        float32
+	freelist              *Freelist
+	meta                  *Meta
+	fileLock              storageLock
+	txLogLock             storageLock
+	txLog                 *TxLog
+	opts                  *Options
+	beforeSetPageHook     func(p *Page) error
+	pendingJournal        map[uint64]*Page
+	pendingJournalTxN     int
+	pageOverlay           map[uint64]*Page
+	recoveryPending       bool
+	recoverySequenceFloor uint64
+	pageChecksums         bool
+	metaNeedsRepair       bool
+	metaRepairPage        uint64
+	nodeCache             *nodeCache
 }
 
-func NewDal(path string, opts *Options) (*Dal, error) {
+func NewDal(path string, opts *Options) (*Dal, error) { return newDalWithFS(path, opts, osStorageFS{}) }
+func newDalWithFS(path string, opts *Options, fs storageFS) (*Dal, error) {
 	effectiveOpts := cloneOptions(opts)
 	if effectiveOpts.TxLogPath == "" {
-		ext := filepath.Ext(path)
-		effectiveOpts.TxLogPath = strings.TrimSuffix(path, ext) + ".tlog"
+		effectiveOpts.TxLogPath = path + ".tlog"
+		legacyPath := path[:len(path)-len(filepath.Ext(path))] + ".tlog"
+		if legacyPath != effectiveOpts.TxLogPath {
+			_, newErr := fs.Stat(effectiveOpts.TxLogPath)
+			_, oldErr := fs.Stat(legacyPath)
+			if newErr == nil && oldErr == nil {
+				return nil, fmt.Errorf("%w: both legacy and current journal paths exist; select TxLogPath explicitly", ErrInvalidOptions)
+			}
+			_, existingDBErr := fs.Stat(path)
+			if os.IsNotExist(newErr) && oldErr == nil && existingDBErr == nil {
+				effectiveOpts.TxLogPath = legacyPath
+			}
+		}
 	}
 	dbPath, pathErr := filepath.Abs(path)
 	if pathErr != nil {
@@ -59,7 +73,7 @@ func NewDal(path string, opts *Options) (*Dal, error) {
 	}
 
 	fileExists := false
-	if _, statErr := os.Stat(path); statErr == nil {
+	if _, statErr := fs.Stat(path); statErr == nil {
 		fileExists = true
 		logger.Debug("database file already exists", "path", path)
 	} else if !os.IsNotExist(statErr) {
@@ -67,11 +81,11 @@ func NewDal(path string, opts *Options) (*Dal, error) {
 	}
 	txLogExists := false
 	var txLogSize int64
-	if txLogInfo, statErr := os.Stat(effectiveOpts.TxLogPath); statErr == nil {
+	if txLogInfo, statErr := fs.Stat(effectiveOpts.TxLogPath); statErr == nil {
 		txLogExists = true
 		txLogSize = txLogInfo.Size()
 		if fileExists {
-			if dbInfo, dbStatErr := os.Stat(path); dbStatErr == nil && os.SameFile(dbInfo, txLogInfo) {
+			if dbInfo, dbStatErr := fs.Stat(path); dbStatErr == nil && os.SameFile(dbInfo, txLogInfo) {
 				return nil, fmt.Errorf("%w: database and transaction log refer to the same file", ErrInvalidOptions)
 			}
 		}
@@ -82,7 +96,7 @@ func NewDal(path string, opts *Options) (*Dal, error) {
 		return nil, fmt.Errorf("%w: refusing to create a database while non-empty transaction log %s exists", ErrRecoveryRequired, effectiveOpts.TxLogPath)
 	}
 
-	fileLock := flock.New(path)
+	fileLock := fs.Lock(path)
 	locked, lockErr := fileLock.TryLock()
 	if lockErr != nil {
 		return nil, fmt.Errorf("could not lock database file %s: %w", path, lockErr)
@@ -91,7 +105,7 @@ func NewDal(path string, opts *Options) (*Dal, error) {
 		return nil, fmt.Errorf("database file %s is already locked", path)
 	}
 
-	file, openErr := os.OpenFile(path, os.O_RDWR|os.O_CREATE, effectiveOpts.FileMode)
+	file, openErr := fs.OpenFile(path, os.O_RDWR|os.O_CREATE, effectiveOpts.FileMode)
 	if openErr != nil {
 		_ = fileLock.Unlock()
 		return nil, fmt.Errorf("could not open dal: %w", openErr)
@@ -100,7 +114,7 @@ func NewDal(path string, opts *Options) (*Dal, error) {
 		_ = file.Close()
 		_ = fileLock.Unlock()
 		if !fileExists {
-			_ = os.Remove(path)
+			_ = fs.Remove(path)
 		}
 	}
 	fileInfo, statErr := file.Stat()
@@ -110,11 +124,18 @@ func NewDal(path string, opts *Options) (*Dal, error) {
 	}
 
 	meta := NewMeta(effectiveOpts.PageSize)
+	if !fileExists {
+		meta.databaseID = newDatabaseID()
+	}
 	if fileExists {
 		meta, statErr = ReadMetaHeader(file)
 		if statErr != nil {
-			cleanupEarly()
-			return nil, fmt.Errorf("could not bootstrap metadata: %w", statErr)
+			identity, identityErr := readDatabaseIdentity(file)
+			if identityErr != nil {
+				cleanupEarly()
+				return nil, fmt.Errorf("could not bootstrap metadata: %w", statErr)
+			}
+			meta = identity
 		}
 		effectiveOpts.PageSize = meta.pageSize
 	}
@@ -144,7 +165,7 @@ func NewDal(path string, opts *Options) (*Dal, error) {
 		return nil, fmt.Errorf("%w: database contains fewer than %d pages", ErrCorruptedMeta, minimumPageCount)
 	}
 
-	txLogLock := flock.New(effectiveOpts.TxLogPath)
+	txLogLock := fs.Lock(effectiveOpts.TxLogPath)
 	txLogLocked, txLogLockErr := txLogLock.TryLock()
 	if txLogLockErr != nil {
 		cleanupEarly()
@@ -154,17 +175,19 @@ func NewDal(path string, opts *Options) (*Dal, error) {
 		cleanupEarly()
 		return nil, fmt.Errorf("transaction log %s is already locked", effectiveOpts.TxLogPath)
 	}
-	tlog := NewTxLog(effectiveOpts.TxLogPath, 0600, pageSize)
+	tlog := newTxLogWithFS(effectiveOpts.TxLogPath, 0600, pageSize, fs)
 	if tlog.openErr != nil {
 		_ = txLogLock.Unlock()
 		cleanupEarly()
 		if !txLogExists {
-			_ = os.Remove(effectiveOpts.TxLogPath)
+			_ = fs.Remove(effectiveOpts.TxLogPath)
 		}
 		return nil, fmt.Errorf("could not open transaction log: %w", tlog.openErr)
 	}
 
 	dal := &Dal{
+		fs:             fs,
+		path:           dbPath,
 		fileLock:       fileLock,
 		file:           file,
 		meta:           meta,
@@ -187,10 +210,10 @@ func NewDal(path string, opts *Options) (*Dal, error) {
 		if cleanup {
 			_ = dal.Close()
 			if !fileExists {
-				_ = os.Remove(path)
+				_ = fs.Remove(path)
 			}
 			if !txLogExists {
-				_ = os.Remove(effectiveOpts.TxLogPath)
+				_ = fs.Remove(effectiveOpts.TxLogPath)
 			}
 		}
 	}()
@@ -206,6 +229,54 @@ func NewDal(path string, opts *Options) (*Dal, error) {
 	logger.Info("open database file", "path", path, "size", fileSize,
 		"page_size", pageSize, "tx_log", effectiveOpts.TxLogPath)
 
+	if fileExists && meta.dbVersion >= 4 {
+		identity, err := readDatabaseIdentity(file, pageSize)
+		if err != nil {
+			return nil, err
+		}
+		if identity.databaseID != meta.databaseID {
+			return nil, ErrJournalIdentity
+		}
+		dal.recoverySequenceFloor = identity.commitSequence
+	}
+	if err := dal.validateJournalIdentity(); err != nil {
+		return nil, err
+	}
+	var recoveryMeta *Meta
+	var recoveryMetaFlags uint8
+	tlog.validateRecoveryPage = func(page *Page) error {
+		if page.PageNumber >= dal.maxPages {
+			return fmt.Errorf("journal page outside database")
+		}
+		if err := verifyPageData(page.Data, dal.pageChecksums); err != nil {
+			return err
+		}
+		if page.PageNumber == metaPageNumber || (dal.pageChecksums && page.PageNumber == metaMirrorPageNumber) {
+			recovered := NewMeta(0)
+			if err := recovered.Deserialize(page.Data); err != nil {
+				return err
+			}
+			if recoveryMeta != nil && *recoveryMeta != *recovered {
+				return fmt.Errorf("%w: journal metadata copies disagree", ErrCorruptedMeta)
+			}
+			recoveryMeta = recovered
+			if page.PageNumber == metaPageNumber {
+				recoveryMetaFlags |= 1
+			} else {
+				recoveryMetaFlags |= 2
+			}
+			if recovered.databaseID != meta.databaseID || recovered.pageSize != pageSize || (recovered.dbVersion >= 4 && recovered.commitSequence != tlog.header.commitSequence) {
+				return ErrJournalIdentity
+			}
+		}
+		return nil
+	}
+	tlog.validateRecoveryComplete = func() error {
+		if tlog.header.databaseID != ([16]byte{}) && recoveryMetaFlags != 3 {
+			return fmt.Errorf("%w: identity-bound journal requires both metadata images", ErrCorruptedMeta)
+		}
+		return nil
+	}
 	if fileExists {
 		if effectiveOpts.EnableRecovery {
 			recoveredPages := 0
@@ -225,9 +296,7 @@ func NewDal(path string, opts *Options) (*Dal, error) {
 				}
 				logger.Info("tx log applied", "recovered_pages", recoveredPages)
 			}
-			if clearErr := tlog.Clear(); clearErr != nil {
-				return nil, fmt.Errorf("could not clear tx log: %w", clearErr)
-			}
+
 		} else if active, activeErr := tlog.HasActiveJournal(); activeErr != nil {
 			return nil, fmt.Errorf("could not inspect transaction log: %w", activeErr)
 		} else {
@@ -249,6 +318,11 @@ func NewDal(path string, opts *Options) (*Dal, error) {
 		dal.freelist = freelist
 		if dal.meta.root > dal.freelist.currentPage || dal.freelist.containsReleasedPage(dal.meta.root) || dal.freelist.isFreelistStoragePage(dal.meta.root) {
 			return nil, fmt.Errorf("%w: catalog root %d is not a live data page", ErrCorruptedMeta, dal.meta.root)
+		}
+		if effectiveOpts.EnableRecovery {
+			if err := tlog.Clear(); err != nil {
+				return nil, fmt.Errorf("clear verified recovered journal: %w", err)
+			}
 		}
 		if (dal.metaNeedsRepair || dal.freelist.dirty) && !dal.recoveryPending {
 			if dal.metaNeedsRepair {
@@ -293,11 +367,40 @@ func NewDal(path string, opts *Options) (*Dal, error) {
 		}
 	}
 	if !fileExists || !txLogExists {
-		if syncErr := syncParentDirectories(path, effectiveOpts.TxLogPath); syncErr != nil {
+		if syncErr := syncDirectories(fs, path, effectiveOpts.TxLogPath); syncErr != nil {
 			return nil, syncErr
 		}
 	}
 
+	if !dal.recoveryPending && dal.pageChecksums {
+		if dal.meta.databaseID == ([16]byte{}) {
+			dal.meta.databaseID = newDatabaseID()
+			dal.meta.dbVersion = 4
+			mirror, err := buildMetaPageAt(metaMirrorPageNumber, pageSize, dal.meta)
+			if err != nil {
+				return nil, err
+			}
+			if err = dal.SetPage(mirror); err != nil {
+				return nil, err
+			}
+			if err = dal.Sync(); err != nil {
+				return nil, err
+			}
+			primary, err := buildMetaPageAt(metaPageNumber, pageSize, dal.meta)
+			if err != nil {
+				return nil, err
+			}
+			if err = dal.SetPage(primary); err != nil {
+				return nil, err
+			}
+			if err = dal.Sync(); err != nil {
+				return nil, err
+			}
+		}
+		if err := tlog.bindInactiveDatabase(dal.meta.databaseID); err != nil {
+			return nil, err
+		}
+	}
 	cleanup = false
 	return dal, nil
 }
@@ -413,13 +516,7 @@ func (dal *Dal) mergeOverlayPages(pages []*Page) {
 	}
 }
 
-func (dal *Dal) overlayPages() []*Page {
-	pages := make([]*Page, 0, len(dal.pageOverlay))
-	for _, page := range dal.pageOverlay {
-		pages = append(pages, page)
-	}
-	return pages
-}
+func (dal *Dal) overlayPages() []*Page { return pageMapValues(dal.pageOverlay) }
 
 func (dal *Dal) resetOverlay() {
 	clear(dal.pageOverlay)
@@ -498,34 +595,6 @@ func (dal *Dal) expandAllocationToPages(requiredPages uint64) error {
 	// always address that page after a crash.
 	if err := dal.file.Sync(); err != nil {
 		return fmt.Errorf("sync expanded database file: %w", err)
-	}
-	return nil
-}
-
-func syncParentDirectories(paths ...string) error {
-	seen := make(map[string]struct{}, len(paths))
-	for _, path := range paths {
-		dir := filepath.Dir(path)
-		absDir, err := filepath.Abs(dir)
-		if err != nil {
-			return fmt.Errorf("resolve parent directory %s: %w", dir, err)
-		}
-		if _, exists := seen[absDir]; exists {
-			continue
-		}
-		seen[absDir] = struct{}{}
-		dirFile, err := os.Open(absDir)
-		if err != nil {
-			return fmt.Errorf("open parent directory %s: %w", absDir, err)
-		}
-		syncErr := dirFile.Sync()
-		closeErr := dirFile.Close()
-		if syncErr != nil {
-			return fmt.Errorf("sync parent directory %s: %w", absDir, syncErr)
-		}
-		if closeErr != nil {
-			return fmt.Errorf("close parent directory %s: %w", absDir, closeErr)
-		}
 	}
 	return nil
 }

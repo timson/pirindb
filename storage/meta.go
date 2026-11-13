@@ -3,7 +3,6 @@ package storage
 import (
 	"encoding/binary"
 	"fmt"
-	"os"
 )
 
 // Meta page map
@@ -20,7 +19,7 @@ const (
 	metaMirrorPageNumber = 2 // Reserved by the checksummed (v0.3+) format.
 	rootPageNumber       = 3
 	dbName               = "pirindb"
-	dbVersionMinor       = 3
+	dbVersionMinor       = 4
 	dbVersionMajor       = 0
 
 	metaPageSize               = UInt8Size
@@ -44,6 +43,8 @@ type Meta struct {
 	root               uint64
 	freelistPageNumber uint64
 	pageSize           uint64
+	databaseID         [16]byte
+	commitSequence     uint64
 }
 
 func NewMeta(pageSize uint64) *Meta {
@@ -79,6 +80,9 @@ func (m *Meta) Serialize(data []byte) error {
 	binary.LittleEndian.PutUint64(data[metaRootPageNumberOffset:], m.root)
 	binary.LittleEndian.PutUint64(data[metaFreelistPageNumberOffset:], m.freelistPageNumber)
 	binary.LittleEndian.PutUint64(data[metaPageSizeOffset:], m.pageSize)
+	if m.dbVersion&0xff >= 4 {
+		return writeMetadataIdentity(data, m)
+	}
 	return nil
 }
 
@@ -115,6 +119,17 @@ func (m *Meta) Deserialize(data []byte) error {
 	}
 	if m.freelistPageNumber != freelistPageNumber || m.freelistPageNumber == m.root {
 		return fmt.Errorf("%w: invalid freelist page %d", ErrCorruptedMeta, m.freelistPageNumber)
+	}
+	if m.dbVersion&0xff >= 4 && len(data) > metaHeaderSize {
+		identity, err := decodeMetadataIdentity(data)
+		if err != nil {
+			return err
+		}
+		if identity.pageSize != m.pageSize {
+			return fmt.Errorf("%w: identity page size mismatch", ErrCorruptedMeta)
+		}
+		m.databaseID = identity.databaseID
+		m.commitSequence = identity.commitSequence
 	}
 	return nil
 }
@@ -179,6 +194,15 @@ func ReadMeta(dal *Dal) (*Meta, error) {
 	}
 	if primaryErr == nil && mirrorErr == nil {
 		if *primary != *mirror {
+			if selected, ok := migrationMetadata(primary, mirror); ok {
+				dal.metaNeedsRepair = true
+				if selected == mirror {
+					dal.metaRepairPage = metaPageNumber
+				} else {
+					dal.metaRepairPage = metaMirrorPageNumber
+				}
+				return selected, nil
+			}
 			return nil, fmt.Errorf("%w: metadata copies disagree", ErrCorruptedMeta)
 		}
 		return primary, nil
@@ -205,7 +229,7 @@ func readMetaPage(dal *Dal, pageNum uint64) (*Meta, error) {
 	return m, nil
 }
 
-func ReadMetaHeader(file *os.File) (*Meta, error) {
+func ReadMetaHeader(file storageFile) (*Meta, error) {
 	if file == nil {
 		return nil, fmt.Errorf("%w: database file is nil", ErrCorruptedMeta)
 	}
@@ -221,6 +245,17 @@ func ReadMetaHeader(file *os.File) (*Meta, error) {
 					legacyCandidate = m
 				}
 			} else if fullPage := readMetaPageAt(file, 0, m.pageSize); fullPage != nil && verifyPageData(fullPage, true) == nil {
+				if err := m.Deserialize(fullPage); err != nil {
+					return nil, err
+				}
+				if mirror := readMetaPageAt(file, metaMirrorPageNumber, m.pageSize); mirror != nil && verifyPageData(mirror, true) == nil {
+					other := NewMeta(0)
+					if other.Deserialize(mirror) == nil {
+						if selected, ok := migrationMetadata(m, other); ok {
+							return selected, nil
+						}
+					}
+				}
 				return m, nil
 			}
 		}
@@ -256,7 +291,7 @@ func metadataTailIsZero(data []byte) bool {
 	return true
 }
 
-func readMetaPageAt(file *os.File, pageNum, pageSize uint64) []byte {
+func readMetaPageAt(file storageFile, pageNum, pageSize uint64) []byte {
 	if pageSize == 0 || pageNum > uint64(^uint64(0)>>1)/pageSize {
 		return nil
 	}
